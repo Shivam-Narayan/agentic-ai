@@ -14,17 +14,13 @@ from llama_index.core import Settings
 from llama_index.llms.gemini import Gemini
 from llama_index.embeddings.huggingface import HuggingFaceEmbedding
 import os
-from langchain_community.chat_models import ChatOllama
+from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_core.output_parsers import JsonOutputParser
 from langchain_core.prompts import PromptTemplate
 
 
-from langchain_groq import ChatGroq
 
 
-
-
-os.environ["GROQ_API_KEY"] = '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'
 os.environ["TAVILY_API_KEY"] = "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"
 
 # Search
@@ -41,18 +37,18 @@ local_llm= "llama3.2:1b-instruct-q4_K_M"
 
 
 # Set environment variables
-os.environ['GOOGLE_API_KEY'] = 'AIzaSyC-ASsI6zwI9UiDcR9xqEH7SyeHl2MS8HY'
+os.environ['GOOGLE_API_KEY'] = 'AQ.Ab8RN6IJtnMVryerLVLpypfd1BmgwI5bVek303KUNs8BWz1vPA'
 
 # Set embedding model
 Settings.embed_model = HuggingFaceEmbedding(model_name="BAAI/bge-small-en-v1.5")
  
 # Set LLM model
 
-Settings.llm = Gemini(model_name="models/gemini-1.5-pro-002",temperature=0.0)
+Settings.llm = Gemini(model_name="models/gemini-pro-latest",temperature=0.0)
 
 
 # Rebuild storage context
-storage_context = StorageContext.from_defaults(persist_dir="E:/KtAgentUsingLanggraph/indexing_beacon_docx")
+storage_context = StorageContext.from_defaults(persist_dir="./indexing_data")
  
 # Load index
 index = load_index_from_storage(storage_context)
@@ -69,13 +65,11 @@ retriever = index.as_retriever()
 # Retrieval Grader
 
 
-llm = ChatOllama(model=local_llm, temperature=0)
-'''llm = ChatGroq(
-    model="llama3-8b-8192",
+llm = ChatGoogleGenerativeAI(
+    model="gemini-2.5-flash-lite",
     temperature=0,
-    max_tokens=None,
-    timeout=None,
-    max_retries=2,)'''
+    google_api_key=os.environ['GOOGLE_API_KEY'],
+)
 
 prompt = PromptTemplate(
     template="""<|begin_of_text|><|start_header_id|>system<|end_header_id|> You are a grader assessing relevance 
@@ -181,7 +175,6 @@ answer_grader = prompt | llm | JsonOutputParser()
 
 # Router
 
-from langchain_community.chat_models import ChatOllama
 from langchain_core.output_parsers import JsonOutputParser
 from langchain_core.prompts import PromptTemplate
 import time
@@ -335,11 +328,18 @@ def web_search(state):
 
     print("---WEB SEARCH---")
     question = state["question"]
-    documents = state["documents"]  #documents = state.get("documents", []) 
+    documents = state.get("documents", [])
 
     # Web search
     docs = web_search_tool.invoke({"query": question})
-    web_results = "\n".join([d["content"] for d in docs])
+    # Handle both old format (list of dicts) and new format (list of strings)
+    if docs and isinstance(docs, list):
+        if isinstance(docs[0], dict):
+            web_results = "\n".join([d.get("content", str(d)) for d in docs])
+        else:
+            web_results = "\n".join([str(d) for d in docs])
+    else:
+        web_results = str(docs)
     web_results = Document(page_content=web_results)
     if documents is not None:
         documents.append(web_results)
@@ -388,7 +388,7 @@ def route_question(state):
             
     except Exception as e:
         print(f"Error in routing: {e}")
-        return "websearch"  # Default to web search on error
+        return "vectorstore"  # Default to vectorstore on error
 
 
 def decide_to_generate(state):
