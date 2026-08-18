@@ -6,7 +6,7 @@ import base64
 import os
 from streamlit_float import *
 from audio_recorder_streamlit import audio_recorder
-from retriever import get_rag_chain,get_embeddings,get_local_llm
+from tests.test_agents import get_rag_chain,get_embeddings,get_local_llm
 from langchain_community.vectorstores import Chroma
 from langchain.document_loaders import PyPDFLoader
 from langchain.text_splitter import RecursiveCharacterTextSplitter
