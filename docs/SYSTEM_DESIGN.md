@@ -45,13 +45,11 @@ Sets up the runtime environment and external tools:
 - loads the persisted vector index
 - creates the web search tool
 
-### prompts.py
-Holds reusable prompt templates for:
-- retrieval grading
-- answer generation
-- hallucination grading
-- answer usefulness grading
-- question routing
+### chains.py
+LangChain layer: prompt templates, Gemini LLM, Tavily search, and grading/generation chains.
+
+### rag.py
+LlamaIndex layer: build the index, load the vector store, and retrieve documents.
 
 ### workflow.py
 Defines the LangGraph workflow and the nodes that implement each step.
@@ -59,10 +57,10 @@ Defines the LangGraph workflow and the nodes that implement each step.
 This is the most important file for understanding how the project runs.
 
 ### app.py
-A small entry point that creates the agent and runs it on a question.
+FastAPI entry point. Validates the question and invokes LangGraph.
 
 ### streamlit_app.py
-The interactive UI for asking questions. It is simplified to call the same workflow and display answers.
+User-facing chat UI. Sends questions to FastAPI `/ask`.
 
 ## How the LangGraph workflow works
 
@@ -80,9 +78,9 @@ The workflow in this project follows this path:
 5. `web_search`: call the external search tool and append results to documents.
 6. `generate`: build an answer using the retrieved context.
 7. `grade_generation_v_documents_and_question`: validate the answer with two graders.
-8. `rewrite_query` (Conditional): if the answer is not useful, rewrite the user's question before looping back to web search to prevent infinite loops.
+8. `rewrite_query`: if the answer is not useful or not grounded, rewrite the question and loop back to `route_question` (the first node).
 
-The graph can loop back if the answer is not grounded or not useful, up to a strict `MAX_RETRIES` limit to ensure graceful failure.
+The graph follows the LangGraph pattern: Start → nodes → edges → conditional branch → End, or a loop back to the first node. Loops stop at `MAX_RETRIES`.
 
 ## How hallucinator-grader and answer-grader work
 

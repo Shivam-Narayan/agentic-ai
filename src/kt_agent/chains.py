@@ -1,14 +1,29 @@
+"""LangChain layer: prompts, LLM, tools, and chains."""
+
+import logging
+import os
+from functools import lru_cache
+
+from langchain_community.tools.tavily_search import TavilySearchResults
+from langchain_core.output_parsers import StrOutputParser
 from langchain_core.prompts import PromptTemplate
+from langchain_google_genai import ChatGoogleGenerativeAI
 from pydantic import BaseModel, Field
+
+from .config import require_runtime_keys
+
+logger = logging.getLogger(__name__)
 
 
 class GraderOutput(BaseModel):
     """Binary score for grading."""
+
     score: str = Field(description="Binary score 'yes' or 'no'")
 
 
 class RouterOutput(BaseModel):
     """Route decision for the question."""
+
     datasource: str = Field(description="Datasource to route to: 'vectorstore' or 'web_search'")
 
 
@@ -79,3 +94,40 @@ REWRITE_PROMPT = PromptTemplate(
     Here is the initial question: \n\n {question} \n Formulate an improved question. <|eot_id|><|start_header_id|>assistant<|end_header_id|>""",
     input_variables=["question"],
 )
+
+
+@lru_cache(maxsize=1)
+def get_llm() -> ChatGoogleGenerativeAI:
+    require_runtime_keys()
+    return ChatGoogleGenerativeAI(
+        model="gemini-2.5-flash-lite",
+        temperature=0,
+        google_api_key=os.environ["GOOGLE_API_KEY"],
+    )
+
+
+@lru_cache(maxsize=1)
+def get_web_search_tool() -> TavilySearchResults:
+    require_runtime_keys()
+    return TavilySearchResults(k=3)
+
+
+class LangChainTools:
+    def __init__(self) -> None:
+        llm = get_llm()
+        structured_grader = llm.with_structured_output(GraderOutput)
+        structured_router = llm.with_structured_output(RouterOutput)
+
+        self.web_search_tool = get_web_search_tool()
+        self.retrieval_grader = RETRIEVAL_GRADER_PROMPT | structured_grader
+        self.rag_chain = GENERATOR_PROMPT | llm | StrOutputParser()
+        self.hallucination_grader = HALLUCINATION_GRADER_PROMPT | structured_grader
+        self.answer_grader = ANSWER_GRADER_PROMPT | structured_grader
+        self.question_router = ROUTER_PROMPT | structured_router
+        self.question_rewriter = REWRITE_PROMPT | llm | StrOutputParser()
+        logger.info("LangChain LLM, tools, and prompts ready")
+
+
+@lru_cache(maxsize=1)
+def get_chains() -> LangChainTools:
+    return LangChainTools()

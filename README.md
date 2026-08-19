@@ -1,6 +1,20 @@
 # KT Agent using LangGraph
 
-This repository contains a production-ready knowledge-transfer assistant built with LangGraph, LlamaIndex, LangChain, and Streamlit. The system is designed to answer questions about a domain-specific knowledge base using retrieval-augmented generation (RAG), and it can fall back to web search when the question is outside the indexed scope.
+This repository contains a knowledge-transfer assistant with a layered stack:
+
+```text
+User (Streamlit)
+   ↓
+FastAPI
+   ↓
+LangGraph orchestration
+   ↓
+LangChain (LLM + tools + prompts)
+   ↓
+LlamaIndex (data / RAG)
+   ↓
+Vector store (indexing_data; Postgres/pgvector can replace this)
+```
 
 ## What the system does
 
@@ -9,7 +23,7 @@ This repository contains a production-ready knowledge-transfer assistant built w
 - Routes questions between vector retrieval and web search
 - Generates grounded answers using an LLM
 - Validates answer quality with LangGraph grader nodes enforcing structured Pydantic outputs
-- Exposes the experience through a Streamlit UI
+- Exposes FastAPI `/ask` and a Streamlit chat UI that calls it
 - Silently recovers from transient LLM/Search API errors using Tenacity retry logic
 
 ## How it works
@@ -22,9 +36,11 @@ This repository contains a production-ready knowledge-transfer assistant built w
 
 ## Why these technologies
 
-- **LangGraph**: defines a graph-based decision workflow with nodes and conditionals.
-- **LangChain**: manages prompts, model calls, and structured output parsing.
-- **LlamaIndex**: builds and loads an embedding-based search index from documents.
+- **FastAPI**: HTTP API and input validation.
+- **LangGraph**: graph-based orchestration (classify, retrieve, search, generate).
+- **LangChain**: LLM, prompts, tools, and structured output.
+- **LlamaIndex**: document ingestion and RAG retrieval.
+- **Vector store**: persisted embeddings in `indexing_data/`.
 
 ## Project structure
 
@@ -33,36 +49,30 @@ kt-agent-using-langgraph/
 ├── src/                    
 │   └── kt_agent/
 │       ├── __init__.py
-│       ├── config.py       # Configuration and environment setups
-│       ├── indexing.py     # LlamaIndex ingestion logic
-│       ├── prompts.py      # LLM Prompts with Pydantic structured models
-│       └── workflow.py     # LangGraph StateGraph logic with Retry resilience
-├── data/                   # Raw documents (e.g., docx, pdf files)
-├── indexing_data/          # Persisted Vector DB
-├── tests/                  
-│   └── test_agents.py      # Script for testing individual components
-├── app.py                  # CLI Entry point for the LangGraph agent
-├── streamlit_app.py        # Streamlit-based UI for document Q&A
+│       ├── config.py       # Environment and logging
+│       ├── chains.py       # LangChain (LLM, tools, prompts)
+│       ├── rag.py          # LlamaIndex (index + retrieve)
+│       ├── schemas.py      # API request/response models
+│       └── workflow.py     # LangGraph orchestration
+├── data/
+├── indexing_data/          # Vector database files
+├── tests/
+├── app.py                  # FastAPI
+├── streamlit_app.py        # User UI (calls FastAPI)
 ├── requirements.txt
 └── README.md
 ```
 
 ## Architecture summary
 
-The solution follows a layered architecture:
+The solution follows this layered architecture:
 
-1. **Ingestion layer** (`src/kt_agent/indexing.py`)
-   - loads source documents from `data/`
-   - splits them into chunks
-   - creates embeddings and stores them in `indexing_data/`
-
-2. **Reasoning layer** (`src/kt_agent/workflow.py`)
-   - routes the question
-   - retrieves context from the vector index or web search
-   - generates and evaluates the answer
-
-3. **Presentation layer** (`app.py`, `streamlit_app.py`)
-   - provides a CLI or UI for document upload and question answering
+1. **User** (`streamlit_app.py`) — chat UI
+2. **FastAPI** (`app.py`) — `/ask` validation and HTTP
+3. **LangGraph** (`workflow.py`) — orchestration
+4. **LangChain** (`chains.py`) — LLM, tools, prompts
+5. **LlamaIndex** (`rag.py`) — RAG
+6. **Vector store** (`indexing_data/`) — persisted embeddings
 
 ## Setup
 
@@ -83,18 +93,13 @@ The solution follows a layered architecture:
 4. Create the index (Run this once before starting the app):
 
    ```bash
-   python src/kt_agent/indexing.py
+   python -m src.kt_agent.rag
    ```
 
-5. Run the workflow or UI:
+5. Start FastAPI, then Streamlit:
 
    ```bash
-   python app.py
-   ```
-
-   or
-
-   ```bash
+   uvicorn app:app --reload --port 8000
    streamlit run streamlit_app.py
    ```
 

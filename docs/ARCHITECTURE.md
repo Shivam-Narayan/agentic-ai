@@ -43,19 +43,12 @@ The index is persisted in `indexing_data`, which means the system can reload it 
 ## High-level architecture
 
 ```mermaid
-flowchart LR
-    U[User] --> UI[Streamlit UI]
-    UI --> WF[LangGraph workflow]
-    WF --> R[Router]
-    R -->|vectorstore| RET[Retriever]
-    R -->|web search| WS[Web search tool]
-    RET --> GR[Relevance grader]
-    GR -->|relevant| GEN[Generator]
-    GR -->|not relevant| WS
-    WS --> GEN
-    GEN --> QA[Quality graders]
-    QA -->|good| UI
-    QA -->|needs retry| WF
+flowchart TD
+    U[User / Streamlit] --> API[FastAPI]
+    API --> LG[LangGraph orchestration]
+    LG --> LC[LangChain LLM + tools + prompts]
+    LC --> LI[LlamaIndex data / RAG]
+    LI --> VS[Vector store]
 ```
 
 ## Project layers
@@ -68,7 +61,7 @@ This layer builds the document index. It:
 - creates embeddings with Hugging Face
 - saves the index to `indexing_data`
 
-This work is done by `indexing.py` and uses LlamaIndex to persist the vector store.
+This work is done by `rag.py` and uses LlamaIndex to persist the vector store.
 
 ### 2. Retrieval and reasoning layer
 

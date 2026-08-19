@@ -1,17 +1,43 @@
-from src.kt_agent.workflow import KnowledgeTransferAgent
+import logging
+
+from fastapi import FastAPI, HTTPException
+
+from src.kt_agent.config import setup_logging
+from src.kt_agent.schemas import QuestionRequest, QuestionResponse
+from src.kt_agent.workflow import aask
+
+setup_logging()
+logger = logging.getLogger(__name__)
+
+app = FastAPI(
+    title="LangGraph KT Assistant",
+    version="1.0.0",
+)
 
 
-def main() -> None:
-    agent = KnowledgeTransferAgent()
-    question = "What is the tech stack used in the project, explain in detail"
-    final_output = None
+@app.get("/health")
+async def health() -> dict[str, str]:
+    return {"status": "ok"}
 
-    for output in agent.run(question):
-        final_output = output
 
-    print("\nFinal answer:")
-    print(final_output.get("generation", "") if final_output else "")
+@app.post("/ask", response_model=QuestionResponse)
+async def ask_question(request: QuestionRequest) -> QuestionResponse:
+    try:
+        logger.info("Received question: %s", request.question)
+        result = await aask(request.question)
+        return QuestionResponse(
+            answer=result.get("generation", ""),
+            datasource=result.get("datasource"),
+        )
+    except Exception as exc:
+        logger.exception("Failed to process question")
+        raise HTTPException(
+            status_code=500,
+            detail="Failed to process request",
+        ) from exc
 
 
 if __name__ == "__main__":
-    main()
+    import uvicorn
+
+    uvicorn.run("app:app", host="0.0.0.0", port=8000, reload=True)
