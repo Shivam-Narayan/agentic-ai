@@ -9,9 +9,8 @@ from langchain_core.documents import Document
 from llama_index.core import Settings, SimpleDirectoryReader, StorageContext, VectorStoreIndex, load_index_from_storage
 from llama_index.core.node_parser import SentenceSplitter
 from llama_index.embeddings.huggingface import HuggingFaceEmbedding
-from llama_index.llms.gemini import Gemini
 
-from .config import DATA_DIR, INDEX_DIR, require_runtime_keys
+from .config import DATA_DIR, INDEX_DIR
 
 logger = logging.getLogger(__name__)
 
@@ -22,9 +21,9 @@ SOURCE_DOCUMENTS = [
 
 
 def configure_llama_index() -> None:
-    require_runtime_keys()
+    """Embeddings only. Retrieval does not need a Gemini key."""
     Settings.embed_model = HuggingFaceEmbedding(model_name="BAAI/bge-small-en-v1.5")
-    Settings.llm = Gemini(model_name="models/gemini-pro-latest", temperature=0.0)
+    Settings.llm = None
 
 
 @lru_cache(maxsize=1)
@@ -42,16 +41,23 @@ def retrieve_documents(question: str) -> List[Document]:
     return [Document(page_content=node.node.text) for node in nodes]
 
 
-def build_index(document_paths: List[Path] | None = None) -> None:
+def build_index(document_paths: List[Path] | None = None, extra_documents: list | None = None) -> None:
     configure_llama_index()
     document_paths = document_paths or SOURCE_DOCUMENTS
 
     existing_files = [path for path in document_paths if path.exists()]
-    if not existing_files:
-        raise FileNotFoundError("No source documents were found for indexing.")
+    
+    documents = []
+    if existing_files:
+        loader = SimpleDirectoryReader(input_files=[str(path) for path in existing_files])
+        documents.extend(loader.load_data())
+        
+    if extra_documents:
+        documents.extend(extra_documents)
 
-    loader = SimpleDirectoryReader(input_files=[str(path) for path in existing_files])
-    documents = loader.load_data()
+    if not documents:
+        raise ValueError("No source documents were found for indexing.")
+
     text_splitter = SentenceSplitter(chunk_size=512, chunk_overlap=50)
     Settings.text_splitter = text_splitter
 

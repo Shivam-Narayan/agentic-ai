@@ -1,109 +1,232 @@
-# KT Agent using LangGraph
+# KT Agent — LangGraph + LlamaIndex + FastAPI
 
-This repository contains a knowledge-transfer assistant with a layered stack:
+> An enterprise-grade **Knowledge Transfer Assistant** built on a modern agentic architecture.  
+> The agent dynamically decides whether to answer from its own knowledge, search company documents, query a live database, or look up the web — all in a single ReAct loop.
 
-```text
-User (Streamlit)
-   ↓
-FastAPI
-   ↓
-LangGraph orchestration
-   ↓
-LangChain (LLM + tools + prompts)
-   ↓
-LlamaIndex (data / RAG)
-   ↓
-Vector store (indexing_data; Postgres/pgvector can replace this)
-```
+---
 
-## What the system does
+## What it does
 
-- Ingests and indexes project-related documents
-- Retrieves relevant chunks from a persisted vector store
-- Routes questions between vector retrieval and web search
-- Generates grounded answers using an LLM
-- Validates answer quality with LangGraph grader nodes enforcing structured Pydantic outputs
-- Exposes FastAPI `/ask` and a Streamlit chat UI that calls it
-- Silently recovers from transient LLM/Search API errors using Tenacity retry logic
+- Answers general questions directly via the LLM (no tools needed)
+- Searches **company documents** (PDFs, DOCX) via a local vector store
+- Queries a **company database** (SQLite today, Postgres-ready) for live structured data
+- Searches the **live web** via Tavily for real-time facts (weather, news, etc.)
+- Streams the result back through a FastAPI endpoint to a Streamlit chat UI
 
-## How it works
+---
 
-1. The user asks a question.
-2. The workflow decides whether to answer from local indexed documents or use web search.
-3. If local knowledge is used, the system retrieves relevant document chunks from the vector index.
-4. The LLM generates an answer using the retrieved context.
-5. The system grades the answer for grounding and usefulness before returning it.
+## Tech Stack
 
-## Why these technologies
+| Layer | Technology | Purpose |
+|---|---|---|
+| UI | Streamlit | Chat frontend |
+| API | FastAPI | HTTP `/ask` endpoint |
+| Orchestration | LangGraph | ReAct agent loop (Agent ↔ Tools) |
+| LLM | Groq / Gemini / Cohere | Dynamic LLM factory |
+| RAG | LlamaIndex + HuggingFace embeddings | Document ingestion & retrieval |
+| DB Tools | Python sqlite3 (MCP-compatible) | Structured data queries |
+| Web Search | Tavily | Real-time web search tool |
 
-- **FastAPI**: HTTP API and input validation.
-- **LangGraph**: graph-based orchestration (classify, retrieve, search, generate).
-- **LangChain**: LLM, prompts, tools, and structured output.
-- **LlamaIndex**: document ingestion and RAG retrieval.
-- **Vector store**: persisted embeddings in `indexing_data/`.
+---
 
-## Project structure
+## Project Structure
 
 ```text
 kt-agent-using-langgraph/
-├── src/                    
-│   └── kt_agent/
-│       ├── __init__.py
-│       ├── config.py       # Environment and logging
-│       ├── chains.py       # LangChain (LLM, tools, prompts)
-│       ├── rag.py          # LlamaIndex (index + retrieve)
-│       ├── schemas.py      # API request/response models
-│       └── workflow.py     # LangGraph orchestration
+├── src/
+│   └── agent/
+│       ├── __init__.py          # Exports: KnowledgeTransferAgent, aask, ask
+│       ├── config.py            # Env vars, paths, logging setup
+│       ├── chains.py            # Dynamic LLM factory (Groq/Gemini/Cohere)
+│       ├── rag.py               # LlamaIndex: index build + document retrieval
+│       ├── tools.py             # LangChain @tool: search_company_documents, search_web
+│       ├── mcp_client.py        # DB tools: list_tables, describe_table, query_database
+│       ├── workflow.py          # LangGraph ReAct loop (core agent)
+│       ├── schemas.py           # Pydantic models: QuestionRequest, QuestionResponse
+│       └── ingest_drive.py      # (Optional) Google Drive document ingestion
 ├── data/
-├── indexing_data/          # Vector database files
+│   ├── KT_document_from_a_real_client_project.docx
+│   ├── Knowledge_Transfer_Agent_Design_Plans.pdf
+│   └── company.db               # SQLite database (orders, employees, etc.)
+├── docs/
+│   ├── ARCHITECTURE.md
+│   └── SYSTEM_DESIGN.md
+├── indexing_data/               # Persisted LlamaIndex vector store
 ├── tests/
-├── app.py                  # FastAPI
-├── streamlit_app.py        # User UI (calls FastAPI)
+├── app.py                       # FastAPI entry point
+├── streamlit_app.py             # Streamlit chat UI
 ├── requirements.txt
+├── .env                         # API keys (never commit this)
 └── README.md
 ```
 
-## Architecture summary
+---
 
-The solution follows this layered architecture:
+## Quickstart for New Developers
 
-1. **User** (`streamlit_app.py`) — chat UI
-2. **FastAPI** (`app.py`) — `/ask` validation and HTTP
-3. **LangGraph** (`workflow.py`) — orchestration
-4. **LangChain** (`chains.py`) — LLM, tools, prompts
-5. **LlamaIndex** (`rag.py`) — RAG
-6. **Vector store** (`indexing_data/`) — persisted embeddings
+### 1. Prerequisites
 
-## Setup
+- Python 3.11+
+- At least **one LLM API key** (Groq recommended — free tier available)
+- A **Tavily API key** (free tier available at [tavily.com](https://tavily.com))
 
-1. Create and activate a Python environment.
-2. Install dependencies:
+### 2. Install dependencies
 
-   ```bash
-   pip install -r requirements.txt
-   ```
+```bash
+pip install -r requirements.txt
+```
 
-3. Create a `.env` file in the root directory and set the required environment variables:
+### 3. Configure environment variables
 
-   ```env
-   GOOGLE_API_KEY=your_google_api_key
-   TAVILY_API_KEY=your_tavily_api_key
-   ```
+Create a `.env` file in the project root:
 
-4. Create the index (Run this once before starting the app):
+```env
+# Pick at least ONE of the following LLM providers:
+GROQ_API_KEY=your_groq_api_key_here
+# GOOGLE_API_KEY=your_google_api_key_here
+# COHERE_API_KEY=your_cohere_api_key_here
 
-   ```bash
-   python -m src.kt_agent.rag
-   ```
+# Required for the web search tool:
+TAVILY_API_KEY=your_tavily_api_key_here
 
-5. Start FastAPI, then Streamlit:
+# Optional: force a specific provider when multiple keys are set
+# LLM_PROVIDER=groq   # Options: groq, google, cohere
 
-   ```bash
-   uvicorn app:app --reload --port 8000
-   streamlit run streamlit_app.py
-   ```
+# Optional: Google Drive folder for automatic document ingestion
+# GOOGLE_DRIVE_FOLDER_ID=your_folder_id_here
+```
+
+> **Priority order:** If multiple keys are set, the system picks `groq` → `google` → `cohere` unless `LLM_PROVIDER` is set.
+
+### 4. Build the vector index (run once)
+
+This reads the documents in `data/` and creates the persisted vector store in `indexing_data/`:
+
+```bash
+python -m src.agent.rag
+```
+
+### 5. Start the backend
+
+```bash
+python -m uvicorn app:app --host 0.0.0.0 --port 8000
+```
+
+> ⚠️ **Windows note:** Use `--host 0.0.0.0` (not `127.0.0.1`) and access via your machine's LAN IP (e.g., `http://192.168.x.x:8000`) to avoid Windows socket inheritance issues with old zombie processes. Set `KT_API_URL=http://192.168.x.x:8000` in your `.env` if needed.
+
+### 6. Start the frontend
+
+In a second terminal:
+
+```bash
+python -m streamlit run streamlit_app.py --server.port 8501
+```
+
+Open **http://localhost:8501** in your browser.
+
+---
+
+## How the Agent Works
+
+The agent follows the **ReAct (Reason + Act)** pattern:
+
+```
+User question
+    │
+    ▼
+┌─────────────┐
+│  Agent Node │◄────────────────────┐
+│  (LLM)      │                     │
+└──────┬──────┘                     │
+       │                            │
+  Tool needed?                      │
+  ┌────┴────┐                       │
+  │  YES    │  NO                   │
+  ▼         ▼                       │
+┌──────┐  [END]                     │
+│Tools │                            │
+│ Node │────── tool results ────────┘
+└──────┘
+```
+
+**The 4 tool paths:**
+
+| Question type | Tool called | Example |
+|---|---|---|
+| General knowledge | *(none — LLM answers directly)* | "What is Python?" |
+| Company documents | `search_company_documents` | "What is the Beacon project?" |
+| Company database | `query_company_database` | "Status of order #12345?" |
+| Live web | `search_web` | "Current weather in Bangalore?" |
+
+---
+
+## Adding New Capabilities
+
+### Add a new tool (e.g., Jira ticket lookup)
+
+1. Open `src/agent/tools.py`
+2. Define a new `@tool` function with a clear docstring (the LLM reads this to decide when to use it)
+3. Add it to the `local_tools` list in `src/agent/workflow.py`
+
+```python
+# tools.py
+@tool
+def get_jira_ticket(ticket_id: str) -> str:
+    """Look up the details of a Jira ticket by its ID (e.g. 'PROJ-123')."""
+    # ... your implementation
+    return f"Ticket {ticket_id}: ..."
+
+# workflow.py  — add it here:
+local_tools = [search_company_documents, search_web, get_jira_ticket]
+```
+
+### Add a new document source
+
+Place the file in `data/` then rebuild the index:
+
+```bash
+python -m src.agent.rag
+```
+
+### Switch LLM provider
+
+Change `LLM_PROVIDER` in `.env`:
+
+```env
+LLM_PROVIDER=google   # or groq, cohere
+```
+
+---
+
+## API Reference
+
+### `POST /ask`
+
+```json
+// Request
+{ "question": "What is the status of order #12345?" }
+
+// Response
+{
+  "answer": "Order #12345 is currently shipped and expected to arrive on 2026-08-25.",
+  "datasource": "database",
+  "tools_used": ["query_company_database"]
+}
+```
+
+`datasource` values: `direct_llm` · `company_docs` · `database` · `web_search` · `multiple`
+
+### `GET /health`
+
+```json
+{ "status": "ok" }
+```
+
+Interactive API docs: **http://localhost:8000/docs**
+
+---
 
 ## Documentation
 
-- [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)
-- [docs/SYSTEM_DESIGN.md](docs/SYSTEM_DESIGN.md)
+- [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) — System architecture and LangGraph flow
+- [docs/SYSTEM_DESIGN.md](docs/SYSTEM_DESIGN.md) — Component design and multi-LLM strategy

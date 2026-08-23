@@ -2,9 +2,9 @@ import logging
 
 from fastapi import FastAPI, HTTPException
 
-from src.kt_agent.config import setup_logging
-from src.kt_agent.schemas import QuestionRequest, QuestionResponse
-from src.kt_agent.workflow import aask
+from src.agent.config import setup_logging
+from src.agent.schemas import QuestionRequest, QuestionResponse
+from src.agent.workflow import aask
 
 setup_logging()
 logger = logging.getLogger(__name__)
@@ -28,6 +28,7 @@ async def ask_question(request: QuestionRequest) -> QuestionResponse:
         return QuestionResponse(
             answer=result.get("generation", ""),
             datasource=result.get("datasource"),
+            tools_used=result.get("tools_used") or [],
         )
     except Exception as exc:
         logger.exception("Failed to process question")

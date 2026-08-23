@@ -2,157 +2,239 @@
 
 ## Overview
 
-This system is a retrieval-augmented generation (RAG) assistant for knowledge transfer. It is designed to answer questions about project-specific documents while also falling back to web search when the question is outside the indexed domain.
+This system is an agentic Knowledge Transfer Assistant. Its job is to answer questions by intelligently routing them to the right data source — company documents, a structured database, the live web, or the LLM's own training knowledge — without any hard-coded routing logic.
 
-## What a beginner should know
+---
 
-The project builds a small AI pipeline that does three main things:
-1. Turn documents into searchable knowledge.
-2. Decide whether a question can be answered from that knowledge or needs web search.
-3. Generate a grounded answer and check whether the answer is good.
+## Component Design
 
-The main components are:
-- LangGraph: defines the workflow steps and decision paths.
-- LangChain: manages prompts, chains, and model output parsing.
-- LlamaIndex: builds and queries the vector search index.
+### `config.py` — Environment & Paths
 
-## Why these components are used
+Centralises all configuration in one place:
 
-### What is LangGraph?
-LangGraph is a graph-based orchestrator for AI workflows. In this project, it lets us define nodes (functions) and conditional edges (decisions) so the system can run a flexible reasoning process rather than one fixed script.
+```python
+DATA_DIR   = Path(__file__).parent.parent.parent / "data"
+INDEX_DIR  = Path(__file__).parent.parent.parent / "indexing_data"
+```
 
-The workflow is not just a single call to the model. It is a set of steps that can route, retry, and validate results.
+Validates on startup that:
+- At least one LLM API key is present (`GROQ_API_KEY`, `GOOGLE_API_KEY`, or `COHERE_API_KEY`)
+- `TAVILY_API_KEY` is present for web search
 
-### What is LangChain?
-LangChain provides the building blocks for prompts, parsers, and model calls. It is used here to:
-- define prompt templates
-- connect prompts to the LLM
-- parse JSON outputs from grading prompts
-- build the RAG generation chain
+---
 
-### What is LlamaIndex?
-LlamaIndex turns documents into an embedding-based vector index. The index stores semantic vectors so the system can retrieve the most relevant text chunks for a query.
+### `chains.py` — Dynamic LLM Factory
 
-This project uses LlamaIndex to load an existing index from disk and make it available to the retriever.
+Selects and initialises the LLM based on `.env` contents:
 
-## Core project components
+```python
+def get_llm():
+    if provider == "groq" or GROQ_API_KEY:
+        return ChatGroq(model="openai/gpt-oss-120b")
+    if provider == "google" or GOOGLE_API_KEY:
+        return ChatGoogleGenerativeAI(model="gemini-1.5-flash")
+    if provider == "cohere" or COHERE_API_KEY:
+        return ChatCohere(model="command-r-plus")
+```
 
-### config.py
-Sets up the runtime environment and external tools:
-- loads necessary environment variables
-- configures Hugging Face embeddings
-- configures Gemini as the LLM
-- loads the persisted vector index
-- creates the web search tool
+Priority: **Groq → Google → Cohere** (override with `LLM_PROVIDER=google` in `.env`).
 
-### chains.py
-LangChain layer: prompt templates, Gemini LLM, Tavily search, and grading/generation chains.
+The returned model implements LangChain's `BaseChatModel` interface so the rest of the codebase is vendor-agnostic.
 
-### rag.py
-LlamaIndex layer: build the index, load the vector store, and retrieve documents.
+> **Current model in use:** `openai/gpt-oss-120b` via Groq API — confirmed to support tool calling.
 
-### workflow.py
-Defines the LangGraph workflow and the nodes that implement each step.
+---
 
-This is the most important file for understanding how the project runs.
+### `rag.py` — Document Ingestion & Retrieval
 
-### app.py
-FastAPI entry point. Validates the question and invokes LangGraph.
+**Index building** (run once):
+```bash
+python -m src.agent.rag
+```
+- Reads documents from `data/` (PDF, DOCX)
+- Splits with `SentenceSplitter(chunk_size=512, chunk_overlap=50)`
+- Embeds with `BAAI/bge-small-en-v1.5` (local, no API key needed)
+- Persists the index to `indexing_data/`
 
-### streamlit_app.py
-User-facing chat UI. Sends questions to FastAPI `/ask`.
+**Retrieval at query time:**
+```python
+def retrieve_documents(question: str) -> List[Document]:
+    return get_vector_index().as_retriever().retrieve(question)
+```
 
-## How the LangGraph workflow works
+The vector index is loaded once via `@lru_cache` and reused for all requests.
 
-LangGraph lets us define:
-- nodes: individual processing steps such as retrieval, grading, generation, and search
-- a state dictionary: the shared data passed between nodes
-- conditional edges: decisions that choose the next node based on current state
+> **Note:** To add new documents, place them in `data/` and re-run `python -m src.agent.rag`.
 
-The workflow in this project follows this path:
+---
 
-1. `route_question`: decide whether to use the vector store or web search.
-2. `retrieve`: fetch documents from the persisted index when vector search is chosen.
-3. `grade_documents`: inspect each retrieved document and keep only relevant ones.
-4. `decide_to_generate`: if a relevant document exists, continue to generation; otherwise use web search.
-5. `web_search`: call the external search tool and append results to documents.
-6. `generate`: build an answer using the retrieved context.
-7. `grade_generation_v_documents_and_question`: validate the answer with two graders.
-8. `rewrite_query`: if the answer is not useful or not grounded, rewrite the question and loop back to `route_question` (the first node).
+### `tools.py` — Local Agent Tools
 
-The graph follows the LangGraph pattern: Start → nodes → edges → conditional branch → End, or a loop back to the first node. Loops stop at `MAX_RETRIES`.
+Defines two tools for the LangGraph agent:
 
-## How hallucinator-grader and answer-grader work
+| Tool | Trigger | Implementation |
+|---|---|---|
+| `search_company_documents` | Questions about company/project | Calls `retrieve_documents()` from `rag.py` |
+| `search_web` | Real-time facts, news, weather | Calls Tavily via `get_web_search_tool()` |
 
-This project uses two separate grading steps after the model generates an answer.
+The `@tool` docstring is critical — it is literally sent to the LLM to help it decide when to use the tool:
 
-### Hallucination grader
-The hallucination grader asks:
-- "Is this answer supported by the documents?"
+```python
+@tool
+def search_company_documents(query: str) -> str:
+    """Search indexed company / project documents (vector store)."""
+```
 
-It receives:
-- the retrieved document text
-- the model-generated answer
+---
 
-If the answer is not grounded, the workflow will retry or use web search.
+### `mcp_client.py` — Database Tools (MCP-Compatible)
 
-### Answer grader
-The answer grader asks:
-- "Does this answer actually resolve the user question?"
+Provides three tools for querying the company SQLite database.
 
-It receives:
-- the generated answer
-- the original user question
+The `mcp_server_context()` is an `asynccontextmanager` that yields a list of LangChain tools. This mirrors the interface of a real **MCP (Model Context Protocol)** server, making it easy to replace the SQLite implementation with a real MCP server (e.g., connecting to Postgres) without changing `workflow.py`.
 
-If the answer is not useful, the workflow can fall back to a different path.
+```python
+@asynccontextmanager
+async def mcp_server_context() -> AsyncGenerator[List[BaseTool], None]:
+    yield [list_database_tables, describe_database_table, query_company_database]
+```
 
-## What the nodes create
+| Tool | Purpose |
+|---|---|
+| `list_database_tables` | Shows the agent what tables exist |
+| `describe_database_table` | Shows column names and types for a table |
+| `query_company_database` | Runs a read-only SELECT query |
 
-Each workflow node builds or updates the shared state:
-- `retrieve` produces `documents`
-- `grade_documents` filters `documents` and may set `web_search`
-- `web_search` appends search results to `documents`
-- `generate` produces `generation`
-- `grade_generation_v_documents_and_question` returns a final quality decision
+> **Safety:** Only `SELECT` queries are allowed. Any other SQL is rejected before execution.
 
-This lets the system keep a clear trace of how the answer was built.
+---
 
-## What this project is teaching you
+### `workflow.py` — The LangGraph Agent
 
-If you want to create a similar system from scratch, the main lessons are:
-- separate knowledge ingestion from query-time reasoning
-- use embeddings and a vector index for semantic search
-- keep the question-answering step grounded in retrieved text
-- build explicit decision logic with a workflow engine
-- validate generated answers with additional grading prompts
+This is the heart of the system. It builds a `StateGraph` with two nodes:
 
-## Practical building blocks from scratch
+```python
+class AgentState(TypedDict):
+    messages: Annotated[list, add_messages]   # full message history
 
-1. prepare documents and build an index with LlamaIndex
-2. create prompt templates with LangChain
-3. wrap the model calls in a workflow using LangGraph
-4. add tools for web search and fallback behavior
-5. validate outputs with grader prompts
-6. expose the system through a simple UI like Streamlit
+def build_graph(dynamic_tools: list):
+    tool_node = ToolNode(dynamic_tools)
 
-## Integration points
+    def agent_node(state):
+        llm = get_llm().bind_tools(dynamic_tools)
+        response = llm.invoke(state["messages"])
+        return {"messages": [response]}
 
-### External services
-- Google Gemini: used for LLM reasoning and grading prompts
-- Hugging Face embeddings: used for semantic retrieval
-- Tavily search: used as a fallback when vector search is not enough
+    builder = StateGraph(AgentState)
+    builder.add_node("agent", agent_node)
+    builder.add_node("tools", tool_node)
+    builder.add_edge(START, "agent")
+    builder.add_conditional_edges("agent", should_continue, {"tools": "tools", END: END})
+    builder.add_edge("tools", "agent")
+    return builder.compile()
+```
 
-### Local files
-- `indexing_data`: stored vector index and metadata
+**`should_continue`:** Routes to `tools` if the LLM emitted `tool_calls`, otherwise to `END`.
 
-## Deployment notes
+**`parse_result`:** Inspects the final message history to determine which tools were called and sets the `datasource` field accordingly.
 
-The project is now fully structured for production use:
-- environment configuration is centralized via `config.py` and `.env` files.
-- `src/kt_agent` serves as a clean Python package for the workflow logic.
-- Tenacity error handling prevents transient API issues from crashing the application.
-- Self-RAG infinite loops are strictly mitigated with a query-rewriting and retry-limiting node design.
+**`aask(question)`:** The async entry point called by FastAPI:
+```python
+async def aask(question: str) -> dict:
+    local_tools = [search_company_documents, search_web]
+    async with mcp_server_context() as mcp_tools:
+        all_tools = local_tools + mcp_tools
+        graph = build_graph(all_tools)
+        result = await graph.ainvoke({"messages": [HumanMessage(content=question)]})
+        return parse_result(result)
+```
 
-## Summary
+---
 
-This project demonstrates a production-grade RAG assistant. It connects document search, routing, query rewriting, answer generation, and strict Pydantic grading inside a fault-tolerant graph workflow.
+### `app.py` — FastAPI Backend
+
+Thin wrapper that exposes the agent over HTTP:
+
+```
+POST /ask   →  QuestionRequest(question) → aask() → QuestionResponse(answer, datasource, tools_used)
+GET  /health → {"status": "ok"}
+GET  /docs   → Swagger UI
+```
+
+---
+
+### `streamlit_app.py` — Chat Frontend
+
+- Renders chat history with `st.chat_message`
+- Injects CSS to normalise markdown heading sizes inside chat bubbles
+- Shows a caption after each AI message indicating which tool was used (`datasource`)
+- Sidebar buttons for sample questions across all 4 answer paths
+- Connects to FastAPI via `KT_API_URL` env var (defaults to `http://192.168.88.6:8000`)
+
+---
+
+## Multi-LLM Strategy
+
+The system uses LangChain's `BaseChatModel` interface to remain vendor-agnostic. All three providers are tested and working with tool-calling:
+
+| Provider | Model | Notes |
+|---|---|---|
+| Groq | `openai/gpt-oss-120b` | **Default.** Fast, free tier, confirmed tool calling ✅ |
+| Google | `gemini-1.5-flash` | Requires `GOOGLE_API_KEY` |
+| Cohere | `command-r-plus` | Requires `COHERE_API_KEY`, strong RAG performance |
+
+**To switch:**
+```env
+LLM_PROVIDER=google
+GOOGLE_API_KEY=your_key_here
+```
+
+---
+
+## Data Flow: End-to-End
+
+```
+User types "Status of order #12345?"
+    │
+    ▼
+Streamlit POST → FastAPI /ask
+    │
+    ▼
+aask("Status of order #12345?")
+    │
+    ├─ Opens mcp_server_context() → gets 3 DB tools
+    ├─ Combines with local tools → 5 tools total
+    ├─ Builds LangGraph
+    │
+    ▼
+Agent Node: LLM reads question + 5 tool schemas
+    → Decides to call query_company_database("SELECT * FROM orders WHERE id=12345")
+    │
+    ▼
+Tool Node: Executes query_company_database → returns CSV row
+    │
+    ▼
+Agent Node: LLM reads DB result → generates natural language answer
+    │
+    ▼
+parse_result() → datasource="database", tools_used=["query_company_database"]
+    │
+    ▼
+FastAPI returns QuestionResponse
+    │
+    ▼
+Streamlit renders answer + "Tool: query_company_database" caption
+```
+
+---
+
+## Known Limitations & Future Work
+
+| Limitation | Recommended Solution |
+|---|---|
+| Vector store is file-based | Replace with Postgres + pgvector |
+| Database is SQLite | Connect a real MCP server to Postgres/MySQL |
+| No authentication on `/ask` | Add API key middleware or OAuth |
+| Single-user session state | Add Redis-backed session management |
+| No streaming responses | Implement SSE with `graph.astream()` |
+| Google Drive sync is manual | Add a scheduled cron job calling `ingest_drive.py` |

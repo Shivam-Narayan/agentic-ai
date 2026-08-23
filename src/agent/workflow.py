@@ -1,278 +1,109 @@
-import logging
-from functools import lru_cache
-from typing import List, Literal
+"""LangGraph: true agentic tool calling architecture."""
 
-from langchain_core.documents import Document
+import logging
+from typing import Annotated
+
+from langchain_core.messages import HumanMessage
 from langgraph.graph import END, START, StateGraph
-from tenacity import retry, stop_after_attempt, wait_exponential
+from langgraph.graph.message import add_messages
+from langgraph.prebuilt import ToolNode
 from typing_extensions import TypedDict
 
-from .chains import get_chains
-from .rag import retrieve_documents
+from .chains import get_llm
+from .mcp_client import mcp_server_context
+from .tools import search_company_documents, search_web
 
-MAX_RETRIES = 3
 logger = logging.getLogger(__name__)
 
-Datasource = Literal["vectorstore", "websearch"]
-GradeDecision = Literal["useful", "not useful", "not supported", "max_retries"]
-GenerateOrSearch = Literal["generate", "websearch"]
+
+class AgentState(TypedDict):
+    messages: Annotated[list, add_messages]
 
 
-# --------------------------------------------------
-# 4. LangGraph State (global state)
-# --------------------------------------------------
-
-class AgentState(TypedDict, total=False):
-    question: str
-    retries: int
-    datasource: Datasource
-    documents: List[Document]
-    generation: str
-    web_search: Literal["Yes", "No"]
-    error: str
+def should_continue(state: AgentState):
+    last_message = state["messages"][-1]
+    return "tools" if getattr(last_message, "tool_calls", None) else END
 
 
-# --------------------------------------------------
-# 5. Node - Classify / route question
-# --------------------------------------------------
+def build_graph(dynamic_tools: list):
+    tool_node = ToolNode(dynamic_tools)
+    
+    def agent_node(state: AgentState) -> dict:
+        llm = get_llm().bind_tools(dynamic_tools)
+        response = llm.invoke(state["messages"])
+        return {"messages": [response]}
+        
+    builder = StateGraph(AgentState)
+    builder.add_node("agent", agent_node)
+    builder.add_node("tools", tool_node)
 
-@retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=10))
-def classify_question(state: AgentState) -> AgentState:
-    question = state["question"]
-    logger.info("Classifying question")
+    # 1. User asks a question -> goes straight to the Agent
+    builder.add_edge(START, "agent")
+    
+    # 2. Agent evaluates "Need a tool?"
+    # If the LLM outputted tool calls, it routes to 'tools'.
+    # If it didn't (e.g., generating final answer), it routes to END.
+    builder.add_conditional_edges("agent", should_continue, {"tools": "tools", END: END})
+    
+    # 3. After the tools finish running, pass the tool result back to the Agent
+    # so the LLM can read the data and generate the final answer to the user.
+    builder.add_edge("tools", "agent")
 
-    try:
-        output = get_chains().question_router.invoke({"question": question})
-        datasource = output.datasource.lower()
-        if datasource in {"web_search", "websearch"}:
-            datasource = "websearch"
-        else:
-            datasource = "vectorstore"
-    except Exception:
-        logger.exception("Question classification failed; defaulting to vectorstore")
-        datasource = "vectorstore"
-
-    logger.info("Category selected: %s", datasource)
-    return {"datasource": datasource}
-
-
-# --------------------------------------------------
-# 6. Node - Retrieve context
-# --------------------------------------------------
-
-@retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=10))
-def retrieve_context(state: AgentState) -> AgentState:
-    question = state["question"]
-    logger.info("Retrieving context for: %s", question)
-
-    documents = retrieve_documents(question)
-    return {"documents": documents, "question": question}
+    return builder.compile()
 
 
-# --------------------------------------------------
-# 7. Node - Grade retrieved documents
-# --------------------------------------------------
+def parse_result(result: dict) -> dict:
+    messages = result["messages"]
+    answer = messages[-1].content
 
-@retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=10))
-def grade_documents(state: AgentState) -> AgentState:
-    question = state["question"]
-    documents = list(state.get("documents") or [])
-    filtered_docs: List[Document] = []
-
-    logger.info("Grading %s retrieved documents", len(documents))
-
-    for doc in documents:
-        output = get_chains().retrieval_grader.invoke(
-            {"question": question, "document": doc.page_content}
-        )
-        if output.score.lower() == "yes":
-            filtered_docs.append(doc)
-
-    web_search: Literal["Yes", "No"] = "Yes" if not filtered_docs else "No"
-    logger.info("Relevant documents: %s; web_search=%s", len(filtered_docs), web_search)
-    return {"documents": filtered_docs, "question": question, "web_search": web_search}
-
-
-# --------------------------------------------------
-# 8. Node - Web search
-# --------------------------------------------------
-
-@retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=10))
-def web_search(state: AgentState) -> AgentState:
-    question = state["question"]
-    documents = list(state.get("documents") or [])
-    logger.info("Running web search for: %s", question)
-
-    docs = get_chains().web_search_tool.invoke({"query": question})
-
-    if docs and isinstance(docs, list):
-        if isinstance(docs[0], dict):
-            web_results = "\n".join(d.get("content", str(d)) for d in docs)
-        else:
-            web_results = "\n".join(str(d) for d in docs)
-    else:
-        web_results = str(docs)
-
+    tools_used = []
+    datasource = "direct_llm"
+    
+    for m in messages:
+        if m.type == "tool":
+            tools_used.append(m.name)
+            if m.name == "search_company_documents":
+                datasource = "company_docs"
+            elif m.name == "query-database" or m.name == "list-tables" or m.name == "read-query":
+                datasource = "database"
+            elif m.name == "search_web":
+                datasource = "web_search"
+                
+    if len(tools_used) > 1:
+        datasource = "multiple"
+        
     return {
-        "documents": documents + [Document(page_content=web_results)],
-        "question": question,
+        "generation": answer,
+        "datasource": datasource,
+        "tools_used": tools_used,
     }
 
 
-# --------------------------------------------------
-# 9. Node - Generate answer
-# --------------------------------------------------
-
-@retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=10))
-def generate_answer(state: AgentState) -> AgentState:
-    question = state["question"]
-    documents = list(state.get("documents") or [])
-    retries = state.get("retries", 0)
-    context = "\n\n".join(doc.page_content for doc in documents)
-
-    logger.info("Generating answer (attempt %s)", retries + 1)
-
-    generation = get_chains().rag_chain.invoke({"context": context, "question": question})
-    return {
-        "documents": documents,
-        "question": question,
-        "generation": generation,
-        "retries": retries + 1,
-    }
+async def aask(question: str) -> dict:
+    local_tools = [search_company_documents, search_web]
+    
+    async with mcp_server_context() as mcp_tools:
+        all_tools = local_tools + mcp_tools
+        graph = build_graph(all_tools)
+        result = await graph.ainvoke({"messages": [HumanMessage(content=question)]})
+        return parse_result(result)
 
 
-# --------------------------------------------------
-# 10. Node - Rewrite query (loop)
-# --------------------------------------------------
-
-@retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=10))
-def rewrite_query(state: AgentState) -> AgentState:
-    question = state["question"]
-    documents = list(state.get("documents") or [])
-    logger.info("Rewriting question for retry")
-
-    better_question = get_chains().question_rewriter.invoke({"question": question})
-    return {"documents": documents, "question": better_question}
-
-
-# --------------------------------------------------
-# 11. Routing logic (conditional edges, not nodes)
-# --------------------------------------------------
-
-def route_question(state: AgentState) -> Literal["retrieve", "websearch"]:
-    if state.get("datasource") == "websearch":
-        return "websearch"
-    return "retrieve"
-
-
-def decide_to_generate(state: AgentState) -> GenerateOrSearch:
-    if state.get("web_search") == "Yes":
-        return "websearch"
-    return "generate"
-
-
-def grade_generation(state: AgentState) -> GradeDecision:
-    retries = state.get("retries", 0)
-    if retries >= MAX_RETRIES:
-        logger.warning("Max retries reached; completing workflow")
-        return "max_retries"
-
-    documents = list(state.get("documents") or [])
-    generation = state["generation"]
-    documents_text = "\n\n".join(doc.page_content for doc in documents)
-    chains = get_chains()
-
-    hallucination_output = chains.hallucination_grader.invoke(
-        {"documents": documents_text, "generation": generation}
-    )
-    if hallucination_output.score.lower() != "yes":
-        logger.info("Answer not grounded; looping")
-        return "not supported"
-
-    answer_output = chains.answer_grader.invoke(
-        {"question": state["question"], "generation": generation}
-    )
-    if answer_output.score.lower() == "yes":
-        logger.info("Answer accepted")
-        return "useful"
-
-    logger.info("Answer not useful; looping")
-    return "not useful"
-
-
-# --------------------------------------------------
-# 12. Build LangGraph
-# --------------------------------------------------
-
-def build_graph():
-    graph = StateGraph(AgentState)
-
-    graph.add_node("classify", classify_question)
-    graph.add_node("retrieve", retrieve_context)
-    graph.add_node("grade_documents", grade_documents)
-    graph.add_node("websearch", web_search)
-    graph.add_node("generate", generate_answer)
-    graph.add_node("rewrite_query", rewrite_query)
-
-    graph.add_edge(START, "classify")
-
-    graph.add_conditional_edges(
-        "classify",
-        route_question,
-        {
-            "retrieve": "retrieve",
-            "websearch": "websearch",
-        },
-    )
-
-    graph.add_edge("retrieve", "grade_documents")
-
-    graph.add_conditional_edges(
-        "grade_documents",
-        decide_to_generate,
-        {
-            "generate": "generate",
-            "websearch": "websearch",
-        },
-    )
-
-    graph.add_edge("websearch", "generate")
-
-    graph.add_conditional_edges(
-        "generate",
-        grade_generation,
-        {
-            "useful": END,
-            "max_retries": END,
-            "not useful": "rewrite_query",
-            "not supported": "rewrite_query",
-        },
-    )
-
-    graph.add_edge("rewrite_query", "classify")
-
-    return graph.compile()
-
-
-@lru_cache(maxsize=1)
-def get_app_graph():
-    logger.info("Compiling LangGraph workflow")
-    return build_graph()
-
-
-def ask(question: str) -> AgentState:
-    return get_app_graph().invoke({"question": question, "retries": 0})
-
-
-async def aask(question: str) -> AgentState:
-    return await get_app_graph().ainvoke({"question": question, "retries": 0})
+def ask(question: str) -> dict:
+    # FastAPI's async def ask_question calls aask, so we don't strictly need a synchronous ask here anymore
+    # but we can implement it using asyncio.run if needed.
+    import asyncio
+    return asyncio.run(aask(question))
 
 
 class KnowledgeTransferAgent:
-    """Compatibility wrapper around the compiled graph."""
-
     def __init__(self) -> None:
-        self.graph = get_app_graph()
+        pass
 
-    def run(self, question: str):
-        return self.graph.stream({"question": question, "retries": 0})
+    async def run(self, question: str):
+        local_tools = [search_company_documents, search_web]
+        async with mcp_server_context() as mcp_tools:
+            all_tools = local_tools + mcp_tools
+            graph = build_graph(all_tools)
+            async for s in graph.astream({"messages": [HumanMessage(content=question)]}):
+                yield s

@@ -35,7 +35,7 @@ docx2txt==0.9
 durationpy==0.10
 emoji==2.15.0
 entrypoints==0.4
-fastapi==0.128.0
+fastapi==0.141.1
 filelock==3.32.0
 filetype==1.2.0
 flatbuffers==25.12.19
@@ -182,7 +182,7 @@ spacy-legacy==3.0.12
 spacy-loggers==1.0.5
 SQLAlchemy==2.0.51
 srsly==2.5.3
-starlette==1.3.1
+starlette>=1.3.1
 streamlit==1.60.0
 streamlit-float==0.4.0
 sympy==1.14.0
@@ -219,3 +219,10 @@ wrapt==2.3.0
 xxhash==3.8.1
 yarl==1.24.5
 zstandard==0.25.0
+langchain-groq
+langchain-cohere
+llama-index-readers-google
+google-auth-oauthlib
+google-api-python-client
+mcp
+langchain-mcp-adapters

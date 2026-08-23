@@ -10,6 +10,8 @@ ROOT_DIR = Path(__file__).resolve().parent.parent.parent
 INDEX_DIR = ROOT_DIR / "indexing_data"
 DATA_DIR = ROOT_DIR / "data"
 
+DRIVE_FOLDER_ID = os.getenv("GOOGLE_DRIVE_FOLDER_ID")
+
 logger = logging.getLogger(__name__)
 
 
@@ -28,5 +30,10 @@ def require_env_var(name: str) -> str:
 
 
 def require_runtime_keys() -> None:
-    require_env_var("GOOGLE_API_KEY")
     require_env_var("TAVILY_API_KEY")
+    if not any([
+        os.getenv("GOOGLE_API_KEY"),
+        os.getenv("GROQ_API_KEY"),
+        os.getenv("COHERE_API_KEY")
+    ]):
+        raise RuntimeError("At least one of GOOGLE_API_KEY, GROQ_API_KEY, or COHERE_API_KEY must be configured in .env")
