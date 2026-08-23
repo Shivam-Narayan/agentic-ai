@@ -8,9 +8,10 @@ __pycache__/
 venv/
 env/
 
-# Environment variables
+# Environment variables (Secrets)
 .env
 .env.*
+*.env
 
 # Django
 db.sqlite3
@@ -43,4 +44,4 @@ dist/
 
 # Node
 node_modules/
-npm-debug.log*.env
+npm-debug.log*
