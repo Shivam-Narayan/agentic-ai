@@ -1,351 +1,426 @@
-import tempfile
-import traceback
+"""Streamlit chat UI for the CTE Knowledge Transfer Assistant.
 
-import streamlit as st
-import base64
+Features:
+- Multi-turn conversation memory (session_id per browser tab)
+- Source citations shown under each AI answer
+- Plotly charts rendered inline when the agent generates one
+- Tool badge showing which tool(s) were used
+- Sidebar: document upload with auto-indexing, sample questions, session controls
+"""
+
+import io
 import os
-from streamlit_float import *
-from audio_recorder_streamlit import audio_recorder
-from retriever import get_rag_chain,get_embeddings,get_local_llm
-from langchain_community.vectorstores import Chroma
-from langchain.document_loaders import PyPDFLoader
-from langchain.text_splitter import RecursiveCharacterTextSplitter
-from langchain_community.document_loaders import TextLoader
-from langchain.text_splitter import CharacterTextSplitter
-from langchain_community.document_loaders import PyPDFLoader
-from langchain_community.document_loaders import Docx2txtLoader
-from langchain_community.document_loaders import UnstructuredPowerPointLoader
-from langchain_community.document_loaders import UnstructuredWordDocumentLoader
-from langchain_community.document_loaders.csv_loader import CSVLoader
-from langchain.retrievers.document_compressors import LLMChainFilter
-from langchain.retrievers import ContextualCompressionRetriever
-from langchain.retrievers.document_compressors import LLMChainExtractor
-from io import BytesIO
-from IPython.display import Audio, display
-from podcastfy.client import generate_podcast
-import vertexai 
-from google.cloud import aiplatform
-from langchain.docstore.document import Document
-from langchain.embeddings import HuggingFaceEmbeddings
-embedding_function = HuggingFaceEmbeddings(model_name="BAAI/bge-small-en-v1.5")
+import uuid
 
-os.environ['GOOGLE_APPLICATION_CREDENTIALS']= 'my_service_account2.json'
-os.environ['GEMINI_API_KEY']='AIzaSyC-ASsI6zwI9UiDcR9xqEH7SyeHl2MS8HY'
+import httpx
+import streamlit as st
+from dotenv import load_dotenv
 
-import vertexai 
+load_dotenv()  # load KT_API_URL and other vars from .env
 
-PROJECT_ID = "sixth-module-394805"  # @param {type:"string"}
-vertexai.init(project=PROJECT_ID, location="us-central1")
+# ── Config ──────────────────────────────────────────────────────────────────
+API_URL = os.getenv("KT_API_URL", "http://localhost:8000")
+REQUEST_TIMEOUT = 180.0  # seconds — LLM + tool calls can be slow on first run
 
+# ── Sample questions for every tool path ────────────────────────────────────
+SAMPLE_QUESTIONS: dict[str, list[str]] = {
+    "💬 Direct LLM": [
+        "What is a vector database?",
+        "Explain the difference between SQL and NoSQL.",
+    ],
+    "📄 Company Documents": [
+        "What is the Beacon project?",
+        "What tech stack is used in the project?",
+        "Summarise the KT document",
+        "Extract the project name, start date, and owner from the documents",
+    ],
+    "🗄️ Company Database": [
+        "List all tables in the database",
+        "What is the status of order #10001?",
+        "Show me the top 5 customers by order count as a bar chart",
+    ],
+    "🌐 Live Web": [
+        "What is the current USD to INR exchange rate?",
+        "Latest news about LangChain",
+    ],
+    "🧮 Calculator": [
+        "What is 15% of 85000?",
+        "Calculate (250 + 300) * 12 / 100",
+    ],
+    "📊 Charts": [
+        "Show monthly sales as a bar chart: Jan=1200, Feb=1500, Mar=1100, Apr=1800",
+        "Plot a pie chart: Engineering=40, Sales=25, Marketing=20, HR=15",
+    ],
+}
 
+# ── Datasource display config ────────────────────────────────────────────────
+ROUTE_CONFIG: dict[str, dict] = {
+    "direct_llm":  {"icon": "💬", "label": "LLM answered directly",         "color": "#6c757d"},
+    "company_docs":{"icon": "📄", "label": "Company documents",              "color": "#0d6efd"},
+    "database":    {"icon": "🗄️", "label": "Company database",               "color": "#198754"},
+    "web_search":  {"icon": "🌐", "label": "Live web search",                "color": "#fd7e14"},
+    "calculation": {"icon": "🧮", "label": "Calculator",                     "color": "#6f42c1"},
+    "chart":       {"icon": "📊", "label": "Chart generated",                "color": "#20c997"},
+    "multiple":    {"icon": "🔀", "label": "Multiple tools used",            "color": "#dc3545"},
+}
 
+# ── Helpers ──────────────────────────────────────────────────────────────────
 
-
-float_init()
-
-def initialize_session_state():
-    if "messages" not in st.session_state:
-        st.session_state.messages = [{"role": "assistant", "content_eng": "Hello! I am your personal CTE KT assistant. Which project do you need help with?"}]
-    if "stop_audio" not in st.session_state:
-        st.session_state.stop_audio = False
-    if "user_query_eng" not in st.session_state:
-        st.session_state.user_query_eng = ""
-    if "widget" not in st.session_state:
-        st.session_state.widget = ""
-
-def submit():
-    st.session_state.user_query_eng = st.session_state.widget
-    st.session_state.widget = ''  # Clear the input after submission
-
-def autoplay_audio(file_path:str):
-    with open(file_path,'rb') as f:
-        data = f.read()
-    b64 = base64.b64encode(data).decode('utf-8')
-
-    md = f"""<audio autoplay>                                       
-    <source src= "data: audio/mp3;base64,{b64}" type="audio/mp3">
-    </audio>
-    """
-
-    st.markdown(md,unsafe_allow_html=True)
-
-def pretty_print_docs(docs):
-    """Displays loaded documents in a structured format"""
-    print(
-        f"\n{'-' * 100}\n".join(
-            [f"Document {i+1}:\n\n" + d.page_content for i, d in enumerate(docs)]
-        )
-    )
-
-def generate_embedding_and_vector(texts):
-    """
-    Creates text embeddings using Vertex AI/HuggingFace embeddings and builds a Chroma vector index
-
-    Args:
-        texts: A list of text chunks
-
-    Returns:
-        A Chroma vector index ready for similarity search
-    """
-    vector_index = Chroma.from_texts(texts,get_embeddings()).as_retriever()  #vertex_embeddings
-    return vector_index
-
-def generate_embeddings_and_vector(texts):
-    """Generate vector store from texts"""
-    if texts and isinstance(texts[0], str):
-        # Convert strings to Document objects if needed
-        texts = [Document(page_content=text) for text in texts]
-    vector_index = Chroma.from_documents(
-        documents=texts, 
-        embedding=embedding_function,  #get_embeddings()
-        persist_directory="./chroma_db"
-    )
-    return vector_index
-
-def get_similar_documents(vector_index, search_query):
-    """
-    Finds documents semantically relevant to a query using the vector index
-
-    Args:
-        vector_index: The Chroma vector index to search within
-        search_query: The user's search query
-
-    Returns:
-        A list of relevant documents
-    """
-    docs = vector_index.get_relevant_documents(search_query)
-    return docs
-
-def process_file(fileobj, search_query):
-    """
-    Loads a supported document, extracts its text content, and generates an answer to a provided query based on the document.
-
-    Args:
-        fileobj: A file-like object representing the document.
-        search_query: The user's question about the document.
-
-    Returns:
-        A text string containing the answer, or "Failed to load the document" if an error occurs.
-    """
-
-    file_path = fileobj.name
-    filename, file_extension = os.path.splitext(file_path)
-
-    if file_extension == '.txt':
-        loader = TextLoader(file_path)
-        documents = loader.load()
-
-        text_splitter = CharacterTextSplitter(chunk_size=1500, chunk_overlap=200)
-        context = "\n\n".join(str(p.page_content) for p in documents)
-        texts = text_splitter.split_text(context)
-
-    elif file_extension == '.pdf':
-        loader = PyPDFLoader(file_path)
-        documents = loader.load_and_split()
-
-        text_splitter = CharacterTextSplitter(chunk_size=1500, chunk_overlap=200)
-        context = "\n\n".join(str(p.page_content) for p in documents)
-        texts = text_splitter.split_text(context)
-
-    elif file_extension in ['.pptx', '.ppt']:
-        loader = UnstructuredPowerPointLoader(file_path)
-        documents = loader.load_and_split()
-
-        text_splitter = CharacterTextSplitter(chunk_size=1500, chunk_overlap=200)
-        context = "\n\n".join(str(p.page_content) for p in documents)
-        texts = text_splitter.split_text(context)
-
-    elif file_extension in ['.docx', '.doc']:
-        loader = UnstructuredWordDocumentLoader(file_path)
-        documents = loader.load_and_split()
-
-        text_splitter = CharacterTextSplitter(chunk_size=1500, chunk_overlap=200)
-        context = "\n\n".join(str(p.page_content) for p in documents)
-        texts = text_splitter.split_text(context)
-
-    elif file_extension == '.csv':
-        loader = CSVLoader(file_path)
-        documents = loader.load()
-        texts = [str(p.page_content) for p in documents]
-
-    else:
-        return "Unsupported file type"
-
-    if len(texts) > 0:
-        vector_index = generate_embeddings_and_vector(texts)
-
-        llm = get_local_llm()
-        _filter = LLMChainFilter.from_llm(llm)
-        compression_retriever = ContextualCompressionRetriever(
-            base_compressor=_filter,base_retriever = vector_index.as_retriever()
-        )
-
-        compressed_docs = compression_retriever.get_relevant_documents(search_query)
-        context_text = [i.page_content for i in compressed_docs]
-        response_text = get_rag_chain().invoke({"context": context_text, "question": search_query})
-        
-        pretty_print_docs(compressed_docs)
-        return response_text
-
-    else:
-        return "Failed to load the document"
-
-def embed_audio_streamlit(audio_file):
-    """
-    Embed and play an audio file in Streamlit
-    
-    Args:
-        audio_file (str): Path to the audio file
-    """
-    with open(audio_file, 'rb') as audio_bytes:
-        st.audio(audio_bytes.read(), format='audio/mp3')
-
-# Initialize session state
-initialize_session_state()
-
-# Main Streamlit app
-st.title("    CTE Knowledge Transfer Assistant 🤖    ")
-
-# Chat history display
-for message in st.session_state.messages:
-    with st.chat_message(message['role']):
-        st.write(message['content_eng'])
-
-# Floating footer container
-footer_container = st.container()
-with footer_container:
-    col1, col2, col3 = st.columns([4, 1, 1])  # Adjusted column widths
-    with col1:
-        st.text_input("Type your query here...")
-    with col2:
-        audio_bytes = audio_recorder(text='', recording_color="#e8b62c",
-    neutral_color="#6aa36f", icon_size="3x")
-    with col3:
-        stop_button = st.button("Stop Audio")
-
-# Handle stop button
-if stop_button:
-    st.session_state.stop_audio = True
-
-# Main processing logic
-if (audio_bytes or st.session_state.user_query_eng) and not st.session_state.stop_audio:
-    if audio_bytes:
-        print('entering the audio bytes...')
-        with st.spinner("Transcribing..."):
-            webm_file_path = "temp_audio.mp3"
-            with open(webm_file_path, "wb") as f:
-                f.write(audio_bytes)
-
-            # Note: Transcription function is missing - need to implement this
-            # For now, I'll leave a placeholder
-            transcript_eng = ""  # Replace with actual transcription logic
-
-            if transcript_eng:
-                st.session_state.messages.append({"role": "user", "content_eng": transcript_eng})
-                with st.chat_message("user"):
-                    st.write(transcript_eng)
-                os.remove(webm_file_path)
-
-    '''elif st.session_state.user_query_eng:
-        print('entering the user input...')
-        st.session_state.messages.append({"role": "user", "content_eng": st.session_state.user_query_eng})
-        with st.chat_message("user"):
-            st.write(st.session_state.user_query_eng)'''
-
-
-#Process the assistant response
-#if st.session_state.user_query_eng and st.session_state.messages[-1]["role"] == "user" and not st.session_state.stop_audio:
-
-    
-
-    # Sidebar for document upload and querying
-st.sidebar.header("Document Query")
-
-# File uploader with a unique key
-uploaded_file = st.sidebar.file_uploader(
-    "Upload your document", 
-    type=['txt', 'pdf', 'pptx', 'ppt', 'docx', 'doc', 'csv'],
-    key="document_upload_sidebar_unique"
-)
-
-# Text input for query with a unique key
-file_query = st.sidebar.text_input(
-    "Enter your query about the document:", 
-    key="widget",on_change=submit
-)
-
-# Process document if both file and query are present
-if uploaded_file is not None and file_query:
+def _fetch_documents() -> list[dict]:
+    """Return the list of indexed documents from the backend, or [] on error."""
     try:
-        # Expanded error handling and logging
-        st.sidebar.info(f"Processing document: {uploaded_file.name}")
-        
-        # Save the uploaded file to a temporary location
-        temp_file_path = os.path.join(tempfile.gettempdir(), uploaded_file.name)
-        with open(temp_file_path, 'wb') as f:
-            f.write(uploaded_file.getbuffer())
+        r = httpx.get(f"{API_URL.rstrip('/')}/documents", timeout=8)
+        r.raise_for_status()
+        return r.json().get("documents", [])
+    except Exception:
+        return []
 
-        # Use the process_file function
-        with st.spinner("Processing document..."):
-            document_response = process_file(uploaded_file, file_query)
-            
-            # Display response in sidebar
-            st.sidebar.success("Document query processed successfully!")
-            
-            # Display response in main area
-            st.write("Document Query Response:")
-            st.write(document_response)
 
-            # Append to session messages
-            st.session_state.messages.append({
-                "role": "assistant",
-                "content_eng": document_response
-            })
+def _upload_files(uploaded_files) -> dict:
+    """POST files to /upload and return the response JSON."""
+    files_payload = [
+        ("files", (f.name, io.BytesIO(f.read()), f.type or "application/octet-stream"))
+        for f in uploaded_files
+    ]
+    r = httpx.post(
+        f"{API_URL.rstrip('/')}/upload",
+        files=files_payload,
+        timeout=300,   # indexing large files can take a while
+    )
+    r.raise_for_status()
+    return r.json()
 
-    except Exception as e:
-        # Detailed error handling
-        st.sidebar.error(f"An error occurred: {str(e)}")
-        st.sidebar.error(f"Error details: {traceback.format_exc()}")
 
-# Process the assistant's response
-
-        
-
-st.session_state.user_query_eng = ""
-
-# Reset the stop_audio flag
-if st.session_state.stop_audio:
-    st.session_state.stop_audio = False
-
-# Podcast section
-uploaded_podcast_file = st.file_uploader(
-    "Upload your document for creating podcast", 
-    type=['txt', 'pdf', 'pptx', 'ppt', 'docx', 'doc', 'csv'],
-    key="document_upload_podcast"
+# ── Page setup ───────────────────────────────────────────────────────────────
+st.set_page_config(    page_title="KT Assistant",
+    page_icon="🤖",
+    layout="wide",
+    initial_sidebar_state="expanded",
 )
 
-if uploaded_podcast_file:
-    st.write(f"Uploaded file: **{uploaded_podcast_file.name}**")
-    
-    # Button to generate podcast
-    if st.button("Generate Podcast"):
-        with st.spinner("Generating podcast audio..."):
-            # Save the uploaded file to a temporary location
-            file_path = uploaded_podcast_file.name
-            with open(file_path, "wb") as f:
-                f.write(uploaded_podcast_file.getbuffer())
-            
-            try:
-                # Generate the podcast audio
-                audio_file = generate_podcast(urls=[file_path], tts_model="geminimulti")
-                
-                # Embed the audio in the app
-                st.write("Podcast Audio:")
-                embed_audio_streamlit(audio_file)
-                
-                st.success("Podcast generation completed!")
-            except Exception as e:
-                st.error(f"An error occurred: {str(e)}")
+# ── CSS ──────────────────────────────────────────────────────────────────────
+st.markdown("""
+<style>
+/* Normalise heading sizes inside chat bubbles */
+[data-testid="stChatMessageContent"] h1,
+[data-testid="stChatMessageContent"] h2,
+[data-testid="stChatMessageContent"] h3,
+[data-testid="stChatMessageContent"] h4 {
+    font-size: 1rem !important;
+    font-weight: 600 !important;
+    margin-top: 0.5rem !important;
+    margin-bottom: 0.2rem !important;
+}
+[data-testid="stChatMessageContent"] p,
+[data-testid="stChatMessageContent"] li {
+    font-size: 0.93rem;
+    line-height: 1.65;
+}
+/* Citation pill */
+.citation-pill {
+    display: inline-block;
+    background: #f0f4ff;
+    border: 1px solid #c9d8ff;
+    border-radius: 12px;
+    padding: 2px 10px;
+    font-size: 0.78rem;
+    color: #3a5bd9;
+    margin: 2px 3px 2px 0;
+}
+/* Tool badge */
+.tool-badge {
+    display: inline-block;
+    border-radius: 4px;
+    padding: 1px 8px;
+    font-size: 0.76rem;
+    font-weight: 600;
+    color: #fff;
+    margin-right: 4px;
+}
+/* Thin separator above citations */
+.citation-block {
+    border-top: 1px solid #e9ecef;
+    margin-top: 8px;
+    padding-top: 6px;
+}
+</style>
+""", unsafe_allow_html=True)
 
-# Float the footer container to the bottom
-footer_container.float("bottom: 0rem; color: white; background-color: #333; padding: 10px;")
+
+# ── Session state bootstrap ──────────────────────────────────────────────────
+if "session_id" not in st.session_state:
+    # Each browser tab gets its own UUID — gives true per-tab conversation memory
+    st.session_state.session_id = str(uuid.uuid4())
+
+if "messages" not in st.session_state:
+    st.session_state.messages = [
+        {
+            "role": "assistant",
+            "content": (
+                "Hi! I'm your **Knowledge Transfer Assistant**. Ask me anything:\n\n"
+                "- 📄 Questions about company documents (PDFs, Word, Excel)\n"
+                "- 🗄️ Database queries (orders, customers, employees...)\n"
+                "- 🌐 Live web facts (news, prices, weather)\n"
+                "- 🧮 Calculations and number crunching\n"
+                "- 📊 Data visualisation (charts from your data)\n\n"
+                "I remember the full conversation — feel free to ask follow-up questions!"
+            ),
+            "datasource": None,
+            "tools_used": [],
+            "citations": [],
+            "chart_data": None,
+        }
+    ]
+
+
+# ── Helper: render a single assistant message ────────────────────────────────
+def _render_assistant_message(msg: dict) -> None:
+    """Render answer text, tool badge, chart, and citations for one assistant turn."""
+    st.markdown(msg["content"])
+
+    datasource  = msg.get("datasource")
+    tools_used  = msg.get("tools_used") or []
+    citations   = msg.get("citations") or []
+    chart_data  = msg.get("chart_data")
+
+    # ── Inline chart ──────────────────────────────────────────────────────
+    if chart_data:
+        try:
+            import plotly.graph_objects as go
+            fig = go.Figure(chart_data)
+            st.plotly_chart(fig, use_container_width=True, key=f"chart_{id(msg)}")
+        except Exception as exc:
+            st.warning(f"Could not render chart: {exc}")
+
+    # ── Tool badge + tools list ───────────────────────────────────────────
+    if datasource:
+        cfg   = ROUTE_CONFIG.get(datasource, {"icon": "🔧", "label": datasource, "color": "#666"})
+        color = cfg["color"]
+        label = cfg["label"]
+        icon  = cfg["icon"]
+
+        badge_html = (
+            f'<span class="tool-badge" style="background:{color}">'
+            f'{icon} {label}</span>'
+        )
+        if tools_used:
+            tools_str = " · ".join(f"`{t}`" for t in tools_used)
+            st.markdown(
+                badge_html + f'<span style="font-size:0.78rem;color:#555"> {tools_str}</span>',
+                unsafe_allow_html=True,
+            )
+        else:
+            st.markdown(badge_html, unsafe_allow_html=True)
+
+    # ── Citations ─────────────────────────────────────────────────────────
+    if citations:
+        pills_html = "".join(
+            f'<span class="citation-pill" title="{c.get("detail","")}">'
+            f'📎 {c["source"]}</span>'
+            for c in citations
+        )
+        st.markdown(
+            f'<div class="citation-block">'
+            f'<span style="font-size:0.76rem;color:#888;font-weight:600">SOURCES </span>'
+            f'{pills_html}</div>',
+            unsafe_allow_html=True,
+        )
+
+
+# ── Sidebar ──────────────────────────────────────────────────────────────────
+with st.sidebar:
+    st.title("🤖 KT Assistant")
+    st.caption(f"Session `{st.session_state.session_id[:8]}…`")
+    st.divider()
+
+    # ── Document upload ───────────────────────────────────────────────────
+    st.markdown("### 📂 Upload Documents")
+    st.caption("PDF, DOCX, XLSX, CSV, TXT — dropped into `data/` and indexed automatically.")
+
+    uploaded = st.file_uploader(
+        label="Choose files",
+        type=["pdf", "docx", "doc", "xlsx", "xls", "csv", "txt"],
+        accept_multiple_files=True,
+        label_visibility="collapsed",
+    )
+
+    if uploaded:
+        if st.button("⬆️ Upload & Index", type="primary", use_container_width=True):
+            with st.spinner("Uploading and building index… this may take a minute."):
+                try:
+                    result = _upload_files(uploaded)
+                    saved    = result.get("saved", [])
+                    rejected = result.get("rejected", [])
+                    indexed  = result.get("indexed", [])
+
+                    if saved:
+                        st.success(
+                            f"✅ {len(saved)} file(s) uploaded and indexed:\n"
+                            + "\n".join(f"• {f}" for f in saved)
+                        )
+                    if rejected:
+                        st.warning(
+                            f"⚠️ {len(rejected)} file(s) skipped (unsupported format):\n"
+                            + "\n".join(f"• {f}" for f in rejected)
+                        )
+                    # Force the document list to refresh
+                    st.session_state.pop("docs_cache", None)
+
+                except httpx.ConnectError:
+                    st.error("Cannot reach the backend. Is FastAPI running?")
+                except Exception as exc:
+                    st.error(f"Upload failed: {exc}")
+
+    st.divider()
+
+    # ── Indexed documents list ────────────────────────────────────────────
+    st.markdown("### 📋 Indexed Documents")
+
+    # Cache the doc list in session state so it doesn't re-fetch on every keystroke
+    if "docs_cache" not in st.session_state:
+        st.session_state.docs_cache = _fetch_documents()
+
+    docs = st.session_state.docs_cache
+
+    if docs:
+        for doc in docs:
+            icon = {"PDF": "📄", "DOCX": "📝", "DOC": "📝",
+                    "XLSX": "📊", "XLS": "📊", "CSV": "📊", "TXT": "📃"}.get(doc["type"], "📎")
+            st.markdown(
+                f"{icon} **{doc['name']}** "
+                f"<span style='color:#888;font-size:0.78rem'>{doc['size_kb']} KB</span>",
+                unsafe_allow_html=True,
+            )
+    else:
+        st.caption("No documents indexed yet. Upload files above to get started.")
+
+    if st.button("🔄 Refresh list", use_container_width=True):
+        st.session_state.docs_cache = _fetch_documents()
+        st.rerun()
+
+    st.divider()
+
+    # ── Session controls ──────────────────────────────────────────────────
+    st.markdown("### 💬 Session")
+    col1, col2 = st.columns(2)
+    with col1:
+        if st.button("🗑️ Clear chat", use_container_width=True):
+            st.session_state.messages = []
+            try:
+                httpx.delete(
+                    f"{API_URL}/sessions/{st.session_state.session_id}/history",
+                    timeout=10,
+                )
+            except Exception:
+                pass
+            st.rerun()
+    with col2:
+        if st.button("🆕 New session", use_container_width=True):
+            st.session_state.session_id = str(uuid.uuid4())
+            st.session_state.messages   = []
+            st.rerun()
+
+    st.divider()
+
+    # ── Sample questions ──────────────────────────────────────────────────
+    st.markdown("### 💡 Try a sample question")
+    for group, questions in SAMPLE_QUESTIONS.items():
+        with st.expander(group, expanded=False):
+            for q in questions:
+                if st.button(q, key=f"sample_{q}", use_container_width=True):
+                    st.session_state.pending_question = q
+                    st.rerun()
+
+    st.divider()
+    st.markdown("**Backend**")
+    st.code(API_URL, language="text")
+    st.caption("Start: `uvicorn app:app --reload --port 8000`")
+
+
+# ── Main layout ──────────────────────────────────────────────────────────────
+st.title("CTE Knowledge Transfer Assistant 🤖")
+st.caption(
+    "Ask anything about company documents, databases, or the live web. "
+    "Charts, calculations, and source citations included."
+)
+
+# Render existing conversation history
+for msg in st.session_state.messages:
+    with st.chat_message(msg["role"]):
+        if msg["role"] == "assistant":
+            _render_assistant_message(msg)
+        else:
+            st.markdown(msg["content"])
+
+# ── Input handling ───────────────────────────────────────────────────────────
+prompt = (
+    st.session_state.pop("pending_question", None)
+    or st.chat_input("Ask a question…")
+)
+
+if not prompt:
+    st.stop()
+
+prompt = prompt.strip()
+if not prompt:
+    st.stop()
+
+# Show user message immediately
+st.session_state.messages.append({"role": "user", "content": prompt})
+with st.chat_message("user"):
+    st.markdown(prompt)
+
+# ── Call the FastAPI backend ─────────────────────────────────────────────────
+with st.chat_message("assistant"):
+    with st.spinner("Thinking…"):
+        answer     = ""
+        datasource = None
+        tools_used = []
+        citations  = []
+        chart_data = None
+
+        try:
+            response = httpx.post(
+                f"{API_URL.rstrip('/')}/ask",
+                json={
+                    "question":   prompt,
+                    "session_id": st.session_state.session_id,
+                },
+                timeout=REQUEST_TIMEOUT,
+            )
+            response.raise_for_status()
+            payload    = response.json()
+            answer     = payload.get("answer") or "I could not generate an answer."
+            datasource = payload.get("datasource")
+            tools_used = payload.get("tools_used") or []
+            citations  = payload.get("citations") or []
+            chart_data = payload.get("chart_data")
+
+        except httpx.ConnectError:
+            answer = (
+                "⚠️ **Cannot reach the backend.**\n\n"
+                f"Make sure FastAPI is running:\n```\nuvicorn app:app --reload --port 8000\n```\n"
+                f"Expected at: `{API_URL}`"
+            )
+        except httpx.TimeoutException:
+            answer = (
+                "⚠️ **Request timed out.** "
+                "The agent may still be processing — try asking again or "
+                "check the backend logs."
+            )
+        except Exception as exc:
+            answer = f"⚠️ **Unexpected error:** {exc}"
+
+    # Build the message dict so _render_assistant_message can use it
+    assistant_msg = {
+        "role":       "assistant",
+        "content":    answer,
+        "datasource": datasource,
+        "tools_used": tools_used,
+        "citations":  citations,
+        "chart_data": chart_data,
+    }
+    _render_assistant_message(assistant_msg)
+
+# Persist to session state so the message is re-rendered on the next rerun
+st.session_state.messages.append(assistant_msg)
