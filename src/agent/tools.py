@@ -55,21 +55,41 @@ def search_company_documents(query: str) -> str:
 @tool
 def search_web(query: str) -> str:
     """Search the live web for facts the LLM does not know (weather, news, current events, prices).
-    Always cite the URL source in your answer."""
+    Always cite the URL source in your answer. Do NOT quote dates from search snippets --
+    only quote the numeric/factual values and cite the source URL."""
     logger.info("Tool search_web: %s", query)
     from .chains import get_web_search_tool
 
-    docs = get_web_search_tool().invoke({"query": query})
-    if docs and isinstance(docs, list):
-        if isinstance(docs[0], dict):
-            parts = []
-            for d in docs:
-                url = d.get("url", "")
-                content = d.get("content", str(d))
+    raw = get_web_search_tool().invoke(query)
+
+    # TavilySearch returns {"results": [...], "answer": ..., ...}
+    if isinstance(raw, dict):
+        items = raw.get("results", [])
+        # Use Tavily's AI answer summary if available
+        tavily_answer = raw.get("answer") or ""
+        parts = []
+        if tavily_answer:
+            parts.append(f"Summary: {tavily_answer}")
+        for item in items:
+            url     = item.get("url", "")
+            content = item.get("content", "")
+            if url or content:
                 parts.append(f"[Source: {url}]\n{content}" if url else content)
-            return "\n\n".join(parts)
-        return "\n".join(str(d) for d in docs)
-    return str(docs)
+        return "\n\n".join(parts) if parts else str(raw)
+
+    # TavilySearchResults (legacy) returns a plain list
+    if isinstance(raw, list):
+        parts = []
+        for item in raw:
+            if isinstance(item, dict):
+                url     = item.get("url", "")
+                content = item.get("content", str(item))
+            else:
+                url, content = "", str(item)
+            parts.append(f"[Source: {url}]\n{content}" if url else content)
+        return "\n\n".join(parts) if parts else str(raw)
+
+    return str(raw)
 
 
 # ---------------------------------------------------------------------------

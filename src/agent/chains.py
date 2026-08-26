@@ -4,7 +4,6 @@ import logging
 import os
 from functools import lru_cache
 
-from langchain_community.tools.tavily_search import TavilySearchResults
 from langchain_core.language_models.chat_models import BaseChatModel
 
 from .config import require_runtime_keys
@@ -39,6 +38,7 @@ def get_llm() -> BaseChatModel:
 
 
 @lru_cache(maxsize=1)
-def get_web_search_tool() -> TavilySearchResults:
+def get_web_search_tool():
     require_runtime_keys()
-    return TavilySearchResults(k=3)
+    from langchain_tavily import TavilySearch
+    return TavilySearch(max_results=5)

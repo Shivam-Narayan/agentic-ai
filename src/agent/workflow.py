@@ -3,6 +3,7 @@
 import json
 import logging
 import re
+from datetime import datetime
 from typing import Annotated
 
 from langchain_core.messages import HumanMessage, SystemMessage
@@ -29,43 +30,58 @@ logger = logging.getLogger(__name__)
 # Drives citation behaviour and sets the agent's persona.
 # ---------------------------------------------------------------------------
 
-SYSTEM_PROMPT = """You are the CTE Knowledge Transfer Assistant -- an expert at helping
+def _build_system_prompt() -> str:
+    now = datetime.now()
+    date_str = now.strftime("%A, %d %B %Y")   # e.g. "Wednesday, 26 August 2026"
+    time_str = now.strftime("%H:%M")
+    return f"""You are the CTE Knowledge Transfer Assistant -- an expert at helping
 team members find information about company projects, documents, databases, and data.
 
-CRITICAL CONSTRAINTS (violating these causes system failure):
+CURRENT DATE AND TIME: {date_str}, {time_str} (server local time)
+Always use the date and day above when answering questions about today's date or day.
+Never guess or infer the day of the week from your training data.
 
-1. NO REDUNDANT TOOL CALLS -- You must NEVER call the same tool more than once per user
-   question. The first search result contains enough information to answer. Examples of
-   FORBIDDEN behavior:
-   - Calling search_company_documents("Shivam skills") then search_company_documents("Shivam profile")
-   - Calling search_company_documents again after already receiving results
-   - Re-searching with slightly different wording to "find more"
+WHEN TO USE TOOLS vs ANSWER DIRECTLY:
 
-   CORRECT behavior: Call search_company_documents ONCE with a good query, then write
-   your answer directly from those results. Do NOT call any tool a second time.
+Answer DIRECTLY from your own knowledge (NO tools needed) when the question is about:
+- General technology concepts: "What is a vector database?", "Explain RAG", "What is Python?"
+- Programming, software engineering, or AI/ML concepts
+- Definitions, explanations, how-things-work questions
+- Today's date or day of the week (use the CURRENT DATE AND TIME above)
+- Anything that doesn't reference a specific internal document, person, or company data
 
-2. SINGLE TOOL PER STEP -- Call exactly ONE tool per reasoning step. Wait for the result.
+Use tools ONLY when the question refers to:
+- A specific internal document, file, or uploaded content ("Shivam's resume", "the KT doc")
+- Company-specific data, projects, or people
+- A live web fact (prices, news, current events)
+- A calculation or chart request
 
-3. STOP AFTER ONE SEARCH -- After receiving search results, your next message must be
-   your final answer to the user. Never call another search tool after getting results.
+CRITICAL CONSTRAINTS:
 
-4. TOOL SELECTION GUIDE:
-   - User asks about a person/document/topic -> use search_company_documents ONCE
-   - User asks for a full document summary -> use summarise_document ONCE
-   - User asks to extract specific fields -> use extract_structured_data ONCE
-   - User asks to search the web -> use search_web ONCE
-   - User asks for a calculation -> use calculate ONCE
-   - User asks for a chart -> use generate_chart ONCE
+1. NO REDUNDANT TOOL CALLS -- NEVER call the same tool more than once per question.
+   Call a search tool ONCE, get the result, then write your final answer. Do not
+   re-search with different wording.
 
-RULES YOU MUST ALWAYS FOLLOW:
-5. CITATIONS -- Always cite your sources:
-   - For document answers: mention the exact filename (e.g. "According to handbook.docx...")
-   - For database answers: show the SQL query you used in a code block
-   - For web answers: include the URL
-   - For calculations: show the expression and result
-6. ACCURACY -- Never guess numbers. Use the `calculate` tool for all arithmetic.
-7. MEMORY -- You have access to the full conversation history. Use it to answer
-   follow-up questions without calling tools again.
+2. SINGLE TOOL PER STEP -- Call exactly ONE tool per reasoning step.
+
+3. STOP AFTER ONE SEARCH -- After receiving tool results, your next message must be
+   your final answer. Never call another search tool after getting results.
+
+TOOL SELECTION GUIDE (only when a tool is actually needed):
+- Internal document/person/file question -> search_company_documents ONCE
+- "Summarise [filename]" -> summarise_document ONCE
+- "Extract [fields] from [doc]" -> extract_structured_data ONCE
+- Live web fact -> search_web ONCE
+- Math calculation -> calculate ONCE
+- Chart/graph request -> generate_chart ONCE
+
+RULES:
+- Always cite sources for document/database/web answers (filename, SQL, URL)
+- For web search results: quote the VALUE from the source (price, rate, number) and cite
+  the URL. Do NOT repeat dates shown inside snippets -- just say "as of the latest data"
+  unless the source explicitly states today's date
+- Never guess numbers -- use calculate tool for arithmetic
+- Use conversation history for follow-up questions without re-calling tools
 """
 
 
@@ -110,12 +126,18 @@ def build_graph(dynamic_tools: list):
 
     def agent_node(state: AgentState) -> dict:
         llm = get_llm().bind_tools(dynamic_tools, parallel_tool_calls=False)
-        messages_with_system = [SystemMessage(content=SYSTEM_PROMPT)] + state["messages"]
+        messages_with_system = [SystemMessage(content=_build_system_prompt())] + state["messages"]
         response = llm.invoke(messages_with_system)
 
         # --- Deduplication guard: block repeated tool calls at code level ---
         if getattr(response, "tool_calls", None):
             already_used = _get_previous_tool_calls(state["messages"])
+            search_call_count = sum(
+                1 for k in already_used
+                if k.startswith("search_company_documents::")
+            )
+
+            blocked = False
             filtered_calls = []
             for tc in response.tool_calls:
                 name = tc.get("name", "")
@@ -128,12 +150,8 @@ def build_graph(dynamic_tools: list):
                 )
                 key = f"{name}::{query.lower().strip()}"
 
-                # Block if: same tool+query used before, OR search_company_documents
-                # called more than once total (regardless of query variation)
-                search_call_count = sum(
-                    1 for k in already_used
-                    if k.startswith("search_company_documents::")
-                )
+                # Block if exact same call already used, OR if search_company_documents
+                # has already been called at least once this turn
                 is_redundant_search = (
                     name == "search_company_documents" and search_call_count >= 1
                 )
@@ -141,15 +159,33 @@ def build_graph(dynamic_tools: list):
                 if key in already_used or is_redundant_search:
                     logger.warning(
                         "Dedup guard: blocked redundant tool call %s(%s). "
-                        "Forcing final answer.",
+                        "Forcing direct answer.",
                         name, query
                     )
-                    # Strip tool_calls so the agent returns its answer directly
-                    response.tool_calls = []
+                    blocked = True
                     break
                 filtered_calls.append(tc)
 
-            if response.tool_calls:
+            if blocked:
+                # Strip all tool calls and force a direct answer by re-invoking
+                # with an explicit instruction appended
+                response.tool_calls = []
+                if not response.content or not str(response.content).strip():
+                    # Content is empty — re-invoke without tools to get a real answer
+                    logger.info("Dedup guard: re-invoking LLM for direct answer")
+                    bare_llm = get_llm()
+                    direct_messages = messages_with_system + [
+                        SystemMessage(
+                            content=(
+                                "You have already searched the documents. "
+                                "Now write your final answer directly to the user "
+                                "based on the search results in the conversation above. "
+                                "Do NOT call any more tools."
+                            )
+                        )
+                    ]
+                    response = bare_llm.invoke(direct_messages)
+            elif filtered_calls != response.tool_calls:
                 response.tool_calls = filtered_calls
 
         return {"messages": [response]}
@@ -267,7 +303,16 @@ def _extract_chart(messages: list) -> dict | None:
 
 def parse_result(result: dict) -> dict:
     messages = result["messages"]
-    answer = messages[-1].content
+
+    # Walk backwards to find the last non-empty AI response
+    answer = ""
+    for msg in reversed(messages):
+        if msg.type == "ai" and msg.content and str(msg.content).strip():
+            answer = str(msg.content).strip()
+            break
+
+    if not answer:
+        answer = "I was unable to generate an answer. Please try rephrasing your question."
 
     tools_used: list[str] = []
     datasources: set[str] = set()

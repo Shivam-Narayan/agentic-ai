@@ -353,10 +353,10 @@ for msg in st.session_state.messages:
             st.markdown(msg["content"])
 
 # ── Input handling ───────────────────────────────────────────────────────────
-prompt = (
-    st.session_state.pop("pending_question", None)
-    or st.chat_input("Ask a question…")
-)
+# Always call st.chat_input on every render — Streamlit hides it permanently
+# if it is skipped even once (which happened when pending_question short-circuited the `or`).
+typed_input = st.chat_input("Ask a question…")
+prompt = st.session_state.pop("pending_question", None) or typed_input
 
 if not prompt:
     st.stop()
