@@ -188,7 +188,7 @@ def _get_previous_tool_calls(messages: list) -> set[str]:
 # The graph loops  agent -> tools -> agent  until the LLM stops calling tools.
 # ---------------------------------------------------------------------------
 
-def build_graph(dynamic_tools: list):
+def build_graph(dynamic_tools: list, checkpointer=None):
     """
     Compile and return the LangGraph agent graph.
 
@@ -314,9 +314,11 @@ def build_graph(dynamic_tools: list):
     # After tool execution: always go back to the agent for the next step
     builder.add_edge("tools", "agent")
 
-    # checkpointer=None means no persistent memory between separate requests
-    # (session memory is handled at the FastAPI layer via _sessions dict)
-    return builder.compile(checkpointer=None)
+    # checkpointer is injected from outside (SqliteSaver in production,
+    # None for unit tests). When a checkpointer is present, LangGraph
+    # persists the full message history keyed by thread_id — the caller
+    # passes {"configurable": {"thread_id": session_id}} at invoke time.
+    return builder.compile(checkpointer=checkpointer)
 
 
 # ---------------------------------------------------------------------------
@@ -523,43 +525,50 @@ LOCAL_TOOLS = [
 # Public entry points
 # ---------------------------------------------------------------------------
 
-async def aask(question: str, history: list | None = None) -> dict:
+async def aask(question: str, session_id: str = "default",
+               checkpointer=None, history: list | None = None) -> dict:
     """
     Primary async entry point — called by the FastAPI /ask endpoint.
 
-    Flow:
-      1. Prepend conversation history so the agent has multi-turn memory.
-      2. Discover MCP tools (SQLite/Postgres database tools) for this request.
-      3. Combine local tools + MCP tools and build the graph.
-      4. Run the graph (agent <-> tools loop) until a final answer is produced.
-      5. Parse and return a structured response dict.
+    Memory strategy:
+      - If a checkpointer is provided, LangGraph persists and reloads the full
+        message history automatically using session_id as the thread_id.
+        The caller does NOT need to pass history manually.
+      - If no checkpointer (tests / CLI), falls back to the old history list.
 
     Args:
-        question: The user's current message.
-        history:  Prior LangChain message objects (HumanMessage / AIMessage)
-                  from the session store. Pass None or [] for a fresh session.
+        question:     The user's current message.
+        session_id:   Session identifier — used as LangGraph thread_id.
+        checkpointer: SqliteSaver (or any LangGraph checkpointer) instance.
+        history:      Legacy fallback — prior LangChain message objects.
+                      Ignored when a checkpointer is provided.
     """
-    prior_messages = history or []
-
     async with mcp_server_context() as mcp_tools:
-        # Combine static local tools with dynamic database tools from MCP
         all_tools = LOCAL_TOOLS + mcp_tools
-        graph = build_graph(all_tools)
+        graph = build_graph(all_tools, checkpointer=checkpointer)
 
-        initial_state = {
-            "messages": prior_messages + [HumanMessage(content=question)]
+        # When using the checkpointer, LangGraph loads prior messages
+        # automatically from the SQLite DB — we only send the new question.
+        # Without checkpointer, prepend the manually managed history.
+        if checkpointer is not None:
+            initial_state = {"messages": [HumanMessage(content=question)]}
+        else:
+            prior_messages = history or []
+            initial_state = {"messages": prior_messages + [HumanMessage(content=question)]}
+
+        # thread_id tells the checkpointer which conversation to load/save.
+        # recursion_limit=8 caps the agent loop to prevent runaway API usage.
+        config = {
+            "configurable": {"thread_id": session_id},
+            "recursion_limit": 8,
         }
 
-        # recursion_limit=8 caps the agent loop to at most 8 steps
-        # (prevents runaway loops from burning through rate limits)
-        result = await graph.ainvoke(
-            initial_state,
-            config={"recursion_limit": 8},
-        )
+        result = await graph.ainvoke(initial_state, config=config)
         return parse_result(result)
 
 
-def ask(question: str, history: list | None = None) -> dict:
+def ask(question: str, session_id: str = "default",
+        checkpointer=None, history: list | None = None) -> dict:
     """
     Synchronous wrapper around aask — used by CLI scripts and unit tests.
 
@@ -567,7 +576,8 @@ def ask(question: str, history: list | None = None) -> dict:
     event loop). Use aask() directly in FastAPI route handlers.
     """
     import asyncio
-    return asyncio.run(aask(question, history))
+    return asyncio.run(aask(question, session_id=session_id,
+                            checkpointer=checkpointer, history=history))
 
 
 class KnowledgeTransferAgent:

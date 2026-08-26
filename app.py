@@ -1,17 +1,17 @@
 """FastAPI backend for the KT Agent.
 
-Session memory is stored in-process (dict keyed by session_id).
-For multi-worker deployments replace SessionStore with a Redis-backed store.
+Conversation memory is handled by LangGraph's SqliteSaver checkpointer.
+Each session_id maps to a LangGraph thread — history is persisted in
+memory_store/conversations.db and survives server restarts.
 """
 
 import logging
-from collections import defaultdict
 from pathlib import Path
 from typing import Any
 
 from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.responses import JSONResponse
-from langchain_core.messages import AIMessage, HumanMessage
+from langgraph.checkpoint.sqlite import SqliteSaver
 
 from src.agent.config import DATA_DIR, setup_logging
 from src.agent.rag import SUPPORTED_EXTENSIONS, _discover_documents, rebuild_index
@@ -21,6 +21,23 @@ from src.agent.workflow import aask
 setup_logging()
 logger = logging.getLogger(__name__)
 
+# ---------------------------------------------------------------------------
+# LangGraph SQLite checkpointer
+#
+# Persists the full message history for every session_id to a local SQLite
+# database. LangGraph reloads it automatically on the next request with the
+# same session_id — no manual history management needed.
+# ---------------------------------------------------------------------------
+
+_MEMORY_DIR = Path(__file__).parent / "memory_store"
+_MEMORY_DIR.mkdir(exist_ok=True)
+
+# SqliteSaver.from_conn_string returns a context manager.
+# We enter it once at module load time and keep it open for the
+# lifetime of the server process.
+_checkpointer_ctx = SqliteSaver.from_conn_string(str(_MEMORY_DIR / "conversations.db"))
+_checkpointer = _checkpointer_ctx.__enter__()
+
 app = FastAPI(
     title="KT Knowledge Transfer Assistant",
     description=(
@@ -29,39 +46,6 @@ app = FastAPI(
     ),
     version="2.0.0",
 )
-
-# ---------------------------------------------------------------------------
-# In-memory session store
-# Stores the raw LangChain message objects (HumanMessage / AIMessage) per session.
-# Each list element is a dict: {"role": "human"|"ai", "content": str}
-# We store plain dicts so they survive JSON serialisation for the /history endpoint,
-# and reconstruct LangChain message objects when passing to aask().
-# ---------------------------------------------------------------------------
-
-_sessions: dict[str, list[dict[str, str]]] = defaultdict(list)
-
-MAX_HISTORY_TURNS = 20   # keep last 20 exchanges (40 messages) per session
-
-
-def _get_lc_history(session_id: str) -> list:
-    """Return the stored session as LangChain message objects."""
-    lc_messages = []
-    for msg in _sessions[session_id]:
-        if msg["role"] == "human":
-            lc_messages.append(HumanMessage(content=msg["content"]))
-        else:
-            lc_messages.append(AIMessage(content=msg["content"]))
-    return lc_messages
-
-
-def _append_to_session(session_id: str, question: str, answer: str) -> None:
-    """Append the latest exchange and trim to MAX_HISTORY_TURNS."""
-    store = _sessions[session_id]
-    store.append({"role": "human", "content": question})
-    store.append({"role": "ai",    "content": answer})
-    # Keep only the last MAX_HISTORY_TURNS * 2 messages
-    if len(store) > MAX_HISTORY_TURNS * 2:
-        _sessions[session_id] = store[-(MAX_HISTORY_TURNS * 2):]
 
 
 # ---------------------------------------------------------------------------
@@ -100,8 +84,11 @@ async def ask_question(request: QuestionRequest) -> QuestionResponse:
     logger.info("[session=%s] question: %s", session_id, question)
 
     try:
-        history = _get_lc_history(session_id)
-        result  = await aask(question, history=history)
+        result = await aask(
+            question,
+            session_id=session_id,
+            checkpointer=_checkpointer,
+        )
     except Exception as exc:
         logger.exception("[session=%s] agent failed", session_id)
         raise HTTPException(status_code=500, detail="Agent failed to process the request.") from exc
@@ -111,9 +98,6 @@ async def ask_question(request: QuestionRequest) -> QuestionResponse:
     tools_used = result.get("tools_used") or []
     raw_cits   = result.get("citations") or []
     chart_data = result.get("chart_data")
-
-    # Persist this exchange for future turns
-    _append_to_session(session_id, question, answer)
 
     citations = [
         Citation(source=c["source"], detail=c.get("detail", ""))
@@ -136,35 +120,64 @@ async def ask_question(request: QuestionRequest) -> QuestionResponse:
 
 @app.get("/sessions/{session_id}/history", tags=["memory"])
 async def get_session_history(session_id: str) -> dict[str, Any]:
-    """Return the conversation history for a session.
+    """Return the conversation history for a session from the SQLite checkpointer."""
+    try:
+        # Load the latest checkpoint for this thread
+        config = {"configurable": {"thread_id": session_id}}
+        state = _checkpointer.get(config)
+        if state is None:
+            return {"session_id": session_id, "turn_count": 0, "messages": []}
 
-    Useful for debugging or pre-populating a UI on page reload.
-    """
-    history = _sessions.get(session_id, [])
-    return {
-        "session_id": session_id,
-        "turn_count": len(history) // 2,
-        "messages":   history,
-    }
+        messages = state.get("channel_values", {}).get("messages", [])
+        # Convert LangChain message objects to plain dicts for JSON response
+        history = []
+        for msg in messages:
+            if hasattr(msg, "type"):
+                role = "human" if msg.type == "human" else "ai"
+                content = msg.content if isinstance(msg.content, str) else str(msg.content)
+                history.append({"role": role, "content": content})
+
+        # Count only human+ai pairs (exclude system/tool messages)
+        turns = sum(1 for m in history if m["role"] == "human")
+        return {"session_id": session_id, "turn_count": turns, "messages": history}
+    except Exception:
+        return {"session_id": session_id, "turn_count": 0, "messages": []}
 
 
 @app.delete("/sessions/{session_id}/history", tags=["memory"])
 async def clear_session_history(session_id: str) -> dict[str, str]:
-    """Clear the conversation history for a session (start fresh)."""
-    _sessions.pop(session_id, None)
-    logger.info("Cleared session: %s", session_id)
+    """Clear the conversation history for a session by writing an empty checkpoint."""
+    try:
+        # Write a blank checkpoint to effectively reset the thread
+        from langgraph.checkpoint.base import CheckpointMetadata
+        config = {"configurable": {"thread_id": session_id}}
+        empty_checkpoint = {
+            "v": 1,
+            "ts": "",
+            "id": session_id,
+            "channel_values": {"messages": []},
+            "channel_versions": {},
+            "versions_seen": {},
+            "pending_sends": [],
+        }
+        _checkpointer.put(config, empty_checkpoint, CheckpointMetadata(), {})
+        logger.info("Cleared session: %s", session_id)
+    except Exception as exc:
+        logger.warning("Could not clear session %s: %s", session_id, exc)
     return {"status": "cleared", "session_id": session_id}
 
 
 @app.get("/sessions", tags=["memory"])
 async def list_sessions() -> dict[str, Any]:
-    """List all active sessions and their message counts."""
-    return {
-        "sessions": [
-            {"session_id": sid, "message_count": len(msgs)}
-            for sid, msgs in _sessions.items()
-        ]
-    }
+    """List all sessions stored in the SQLite checkpointer."""
+    try:
+        sessions = []
+        for config, *_ in _checkpointer.list({}):
+            tid = config.get("configurable", {}).get("thread_id", "unknown")
+            sessions.append({"session_id": tid})
+        return {"sessions": sessions}
+    except Exception:
+        return {"sessions": []}
 
 
 # ---------------------------------------------------------------------------
