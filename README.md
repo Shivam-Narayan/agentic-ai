@@ -122,7 +122,9 @@ pip install -r requirements.txt
 
 ### Step 3 — Create your `.env` file
 
-Create a file called `.env` in the project root (same folder as `app.py`):
+Create a file called `.env` in the project root (same folder as `app.py`).
+
+Copy the template below exactly — do not leave the `KT_API_URL` commented out:
 
 ```env
 # ── LLM Provider (pick at least ONE) ──────────────────────────────────────
@@ -137,13 +139,18 @@ GROQ_API_KEY=your_groq_api_key_here
 # ── Web Search (required) ──────────────────────────────────────────────────
 TAVILY_API_KEY=your_tavily_api_key_here
 
+# ── API URL (IMPORTANT — must match the port FastAPI runs on) ─────────────
+KT_API_URL=http://localhost:8000
+
 # ── Optional overrides ────────────────────────────────────────────────────
 # Force a specific LLM even when multiple keys are present:
 # LLM_PROVIDER=groq          # Options: groq, google, cohere
 
-# API URL used by Streamlit to talk to FastAPI:
-# KT_API_URL=http://localhost:8000
+# Optional: Google Drive folder sync (for ingest_drive.py)
+# GOOGLE_DRIVE_FOLDER_ID=your_drive_folder_id_here
 ```
+
+> **Important:** `KT_API_URL` must match the port FastAPI is running on (default `8000`). If Streamlit shows "Cannot reach the backend", this is the first thing to check.
 
 > If you have multiple LLM keys, the system auto-selects in this order: **Groq → Google → Cohere**. Set `LLM_PROVIDER` to override.
 
@@ -192,13 +199,15 @@ The interactive API docs are at: http://localhost:8000/docs
 
 ### Step 7 — Start the chat UI
 
-Open a second terminal and run:
+Open a **second terminal** (keep the FastAPI terminal from Step 6 running) and run:
 
 ```bash
 python -m streamlit run streamlit_app.py
 ```
 
 Open **http://localhost:8501** in your browser.
+
+> **Both processes must run at the same time** — FastAPI on port 8000 and Streamlit on port 8501. If you close the FastAPI terminal, Streamlit will show "Cannot reach the backend."
 
 ---
 
@@ -358,8 +367,12 @@ Check that your `.env` file exists and has at least one of `GROQ_API_KEY`, `GOOG
 **Index is stale after adding new files**  
 Re-run `python -m src.agent.rag` to rebuild the index, or use the Upload button in the Streamlit sidebar.
 
-**Streamlit cannot connect to the API**  
-Make sure the FastAPI server is running and that `KT_API_URL` in `.env` matches the address (default: `http://localhost:8000`).
+**"Cannot reach the backend. Is FastAPI running?"**  
+Two things to check in order:
+1. Make sure FastAPI is actually running (`python -m uvicorn app:app --host 0.0.0.0 --port 8000 --reload`) in a separate terminal
+2. Check that `KT_API_URL` in your `.env` is set to `http://localhost:8000` — not commented out and not pointing to the wrong port. This is the most common cause of this error.
+
+After fixing `.env`, restart Streamlit (`Ctrl+C` then `python -m streamlit run streamlit_app.py`) so it picks up the new value.
 
 **Charts not rendering**  
 Run: `pip install plotly`

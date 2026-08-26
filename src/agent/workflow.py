@@ -25,28 +25,47 @@ from .tools import (
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
-# System prompt — injected at the start of every agent invocation.
+# System prompt -- injected at the start of every agent invocation.
 # Drives citation behaviour and sets the agent's persona.
 # ---------------------------------------------------------------------------
 
-SYSTEM_PROMPT = """You are the CTE Knowledge Transfer Assistant — an expert at helping
+SYSTEM_PROMPT = """You are the CTE Knowledge Transfer Assistant -- an expert at helping
 team members find information about company projects, documents, databases, and data.
 
+CRITICAL CONSTRAINTS (violating these causes system failure):
+
+1. NO REDUNDANT TOOL CALLS -- You must NEVER call the same tool more than once per user
+   question. The first search result contains enough information to answer. Examples of
+   FORBIDDEN behavior:
+   - Calling search_company_documents("Shivam skills") then search_company_documents("Shivam profile")
+   - Calling search_company_documents again after already receiving results
+   - Re-searching with slightly different wording to "find more"
+
+   CORRECT behavior: Call search_company_documents ONCE with a good query, then write
+   your answer directly from those results. Do NOT call any tool a second time.
+
+2. SINGLE TOOL PER STEP -- Call exactly ONE tool per reasoning step. Wait for the result.
+
+3. STOP AFTER ONE SEARCH -- After receiving search results, your next message must be
+   your final answer to the user. Never call another search tool after getting results.
+
+4. TOOL SELECTION GUIDE:
+   - User asks about a person/document/topic -> use search_company_documents ONCE
+   - User asks for a full document summary -> use summarise_document ONCE
+   - User asks to extract specific fields -> use extract_structured_data ONCE
+   - User asks to search the web -> use search_web ONCE
+   - User asks for a calculation -> use calculate ONCE
+   - User asks for a chart -> use generate_chart ONCE
+
 RULES YOU MUST ALWAYS FOLLOW:
-1. CITATIONS — Always cite your sources:
+5. CITATIONS -- Always cite your sources:
    - For document answers: mention the exact filename (e.g. "According to handbook.docx...")
    - For database answers: show the SQL query you used in a code block
    - For web answers: include the URL
    - For calculations: show the expression and result
-2. ACCURACY — Never guess numbers. Use the `calculate` tool for all arithmetic.
-3. CHARTS — When presenting tabular or numeric results, proactively offer to generate
-   a chart using the `generate_chart` tool. If the user asks for a chart, always use it.
-4. EXTRACTION — When asked to pull specific fields or facts from a document, use
-   the `extract_structured_data` tool rather than quoting manually.
-5. SUMMARIES — When asked for an overview or summary of a whole document, use the
-   `summarise_document` tool rather than relying only on vector search.
-6. MEMORY — You have access to the full conversation history. Use it to answer
-   follow-up questions without asking the user to repeat themselves.
+6. ACCURACY -- Never guess numbers. Use the `calculate` tool for all arithmetic.
+7. MEMORY -- You have access to the full conversation history. Use it to answer
+   follow-up questions without calling tools again.
 """
 
 
@@ -67,15 +86,72 @@ def should_continue(state: AgentState) -> str:
     return "tools" if getattr(last_message, "tool_calls", None) else END
 
 
+def _get_previous_tool_calls(messages: list) -> set[str]:
+    """Return a set of 'toolname::query' strings already used in this conversation."""
+    used = set()
+    for msg in messages:
+        if msg.type == "ai" and getattr(msg, "tool_calls", None):
+            for tc in msg.tool_calls:
+                name = tc.get("name", "")
+                args = tc.get("args", {})
+                # Build a key from name + primary argument
+                query = (
+                    args.get("query")
+                    or args.get("document_name")
+                    or args.get("expression")
+                    or ""
+                )
+                used.add(f"{name}::{query.lower().strip()}")
+    return used
+
+
 def build_graph(dynamic_tools: list):
     tool_node = ToolNode(dynamic_tools)
 
     def agent_node(state: AgentState) -> dict:
-        llm = get_llm().bind_tools(dynamic_tools)
-        # Always prepend the system prompt as the first message so it applies
-        # to every turn including follow-up questions in a multi-turn session.
+        llm = get_llm().bind_tools(dynamic_tools, parallel_tool_calls=False)
         messages_with_system = [SystemMessage(content=SYSTEM_PROMPT)] + state["messages"]
         response = llm.invoke(messages_with_system)
+
+        # --- Deduplication guard: block repeated tool calls at code level ---
+        if getattr(response, "tool_calls", None):
+            already_used = _get_previous_tool_calls(state["messages"])
+            filtered_calls = []
+            for tc in response.tool_calls:
+                name = tc.get("name", "")
+                args = tc.get("args", {})
+                query = (
+                    args.get("query")
+                    or args.get("document_name")
+                    or args.get("expression")
+                    or ""
+                )
+                key = f"{name}::{query.lower().strip()}"
+
+                # Block if: same tool+query used before, OR search_company_documents
+                # called more than once total (regardless of query variation)
+                search_call_count = sum(
+                    1 for k in already_used
+                    if k.startswith("search_company_documents::")
+                )
+                is_redundant_search = (
+                    name == "search_company_documents" and search_call_count >= 1
+                )
+
+                if key in already_used or is_redundant_search:
+                    logger.warning(
+                        "Dedup guard: blocked redundant tool call %s(%s). "
+                        "Forcing final answer.",
+                        name, query
+                    )
+                    # Strip tool_calls so the agent returns its answer directly
+                    response.tool_calls = []
+                    break
+                filtered_calls.append(tc)
+
+            if response.tool_calls:
+                response.tool_calls = filtered_calls
+
         return {"messages": [response]}
 
     builder = StateGraph(AgentState)
@@ -88,14 +164,14 @@ def build_graph(dynamic_tools: list):
     )
     builder.add_edge("tools", "agent")
 
-    return builder.compile()
+    return builder.compile(checkpointer=None)
 
 
 # ---------------------------------------------------------------------------
-# Result parsing — extracts datasource, citations, and chart data
+# Result parsing -- extracts datasource, citations, and chart data
 # ---------------------------------------------------------------------------
 
-# Maps tool name → datasource label
+# Maps tool name -> datasource label
 _TOOL_DATASOURCE = {
     "search_company_documents": "company_docs",
     "summarise_document":        "company_docs",
@@ -139,12 +215,10 @@ def _extract_citations(messages: list) -> list[dict]:
         content = msg.content or ""
 
         if name in ("search_company_documents", "search_web"):
-            # Extract [Source: <value>] markers from the tool output
             for match in re.finditer(r"\[Source:\s*(.+?)\]", content):
                 _add(match.group(1).strip())
 
         elif name in ("query_company_database", "query-database", "read-query"):
-            # The tool was called with a SQL argument — extract from the AIMessage above
             for ai_msg in messages:
                 if ai_msg.type == "ai" and getattr(ai_msg, "tool_calls", None):
                     for tc in ai_msg.tool_calls:
@@ -158,11 +232,9 @@ def _extract_citations(messages: list) -> list[dict]:
                                 _add("company database", sql.strip())
 
         elif name == "calculate":
-            # Content is "expression = result"
             _add("calculator", content.strip())
 
         elif name == "summarise_document":
-            # Content starts with "[Full text of <filename>"
             match = re.match(r"\[Full text of (.+?)\]", content)
             if match:
                 _add(match.group(1).strip())
@@ -170,7 +242,6 @@ def _extract_citations(messages: list) -> list[dict]:
                 _add("company documents")
 
         elif name == "extract_structured_data":
-            # Pull any [Source: ...] markers that rag.py embedded
             for match in re.finditer(r"\[Source:\s*(.+?)\]", content):
                 _add(match.group(1).strip())
 
@@ -258,12 +329,15 @@ async def aask(question: str, history: list | None = None) -> dict:
         initial_state = {
             "messages": prior_messages + [HumanMessage(content=question)]
         }
-        result = await graph.ainvoke(initial_state)
+        result = await graph.ainvoke(
+            initial_state,
+            config={"recursion_limit": 8},
+        )
         return parse_result(result)
 
 
 def ask(question: str, history: list | None = None) -> dict:
-    """Synchronous wrapper around aask — for scripts and tests."""
+    """Synchronous wrapper around aask -- for scripts and tests."""
     import asyncio
     return asyncio.run(aask(question, history))
 

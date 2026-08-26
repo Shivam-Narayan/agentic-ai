@@ -17,10 +17,13 @@ logger = logging.getLogger(__name__)
 # Supported file extensions — add more here if needed
 SUPPORTED_EXTENSIONS = {".pdf", ".docx", ".doc", ".xlsx", ".xls", ".csv", ".txt"}
 
+# Module-level embedding model — loaded once, reused for all queries
+_embed_model = HuggingFaceEmbedding(model_name="BAAI/bge-small-en-v1.5")
+
 
 def configure_llama_index() -> None:
-    """Embeddings only. Retrieval does not need a Gemini key."""
-    Settings.embed_model = HuggingFaceEmbedding(model_name="BAAI/bge-small-en-v1.5")
+    """Set HuggingFace embeddings and disable LLM for retrieval."""
+    Settings.embed_model = _embed_model
     Settings.llm = None
 
 
@@ -71,6 +74,24 @@ def _discover_documents(data_dir: Path = DATA_DIR) -> List[Path]:
     return found
 
 
+def _get_file_extractors() -> dict:
+    """Return explicit file extractors so LlamaIndex uses the correct parser per type."""
+    extractors = {}
+
+    # DOCX -- use DocxReader (backed by docx2txt) for clean text extraction
+    try:
+        from llama_index.readers.file import DocxReader
+        extractors[".docx"] = DocxReader()
+        extractors[".doc"] = DocxReader()
+    except ImportError:
+        pass  # fall back to LlamaIndex default
+
+    # PDF -- pypdf is already installed; LlamaIndex uses it by default
+    # CSV / TXT -- LlamaIndex handles these natively, no override needed
+
+    return extractors
+
+
 def build_index(document_paths: List[Path] | None = None, extra_documents: list | None = None) -> None:
     configure_llama_index()
 
@@ -83,8 +104,7 @@ def build_index(document_paths: List[Path] | None = None, extra_documents: list 
     if existing_files:
         loader = SimpleDirectoryReader(
             input_files=[str(path) for path in existing_files],
-            # unstructured handles xlsx/xls; pandas_csv handles csv
-            file_extractor=None,  # let LlamaIndex auto-detect based on extension
+            file_extractor=_get_file_extractors(),
         )
         documents.extend(loader.load_data())
 
