@@ -221,8 +221,9 @@ yarl==1.24.5
 zstandard==0.25.0
 langchain-groq
 langchain-cohere
-llama-index-readers-google
 google-auth-oauthlib
 google-api-python-client
 mcp
 langchain-mcp-adapters
+openpyxl==3.1.5
+plotly==5.24.1

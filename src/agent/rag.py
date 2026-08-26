@@ -14,10 +14,8 @@ from .config import DATA_DIR, INDEX_DIR
 
 logger = logging.getLogger(__name__)
 
-SOURCE_DOCUMENTS = [
-    DATA_DIR / "KT_document_from_a_real_client_project.docx",
-    DATA_DIR / "Knowledge_Transfer_Agent_Design_Plans.pdf",
-]
+# Supported file extensions — add more here if needed
+SUPPORTED_EXTENSIONS = {".pdf", ".docx", ".doc", ".xlsx", ".xls", ".csv", ".txt"}
 
 
 def configure_llama_index() -> None:
@@ -41,22 +39,63 @@ def retrieve_documents(question: str) -> List[Document]:
     return [Document(page_content=node.node.text) for node in nodes]
 
 
+def rebuild_index() -> list[str]:
+    """Rebuild the vector index from scratch and clear the lru_cache so the
+    next retrieve_documents() call loads the fresh index.
+
+    Returns the list of filenames that were indexed.
+    """
+    discovered = _discover_documents()
+    if not discovered:
+        raise ValueError(f"No supported documents found in {DATA_DIR}")
+
+    build_index(document_paths=discovered)
+
+    # Invalidate the cached index so the next query loads the new one
+    get_vector_index.cache_clear()
+    logger.info("lru_cache cleared — fresh index will be loaded on next query")
+
+    return [p.name for p in discovered]
+
+
+def _discover_documents(data_dir: Path = DATA_DIR) -> List[Path]:
+    """Discover all supported files in the data directory."""
+    found = [
+        p for p in data_dir.iterdir()
+        if p.is_file() and p.suffix.lower() in SUPPORTED_EXTENSIONS
+    ]
+    if found:
+        logger.info("Discovered %d document(s) in %s: %s", len(found), data_dir, [p.name for p in found])
+    else:
+        logger.warning("No supported documents found in %s", data_dir)
+    return found
+
+
 def build_index(document_paths: List[Path] | None = None, extra_documents: list | None = None) -> None:
     configure_llama_index()
-    document_paths = document_paths or SOURCE_DOCUMENTS
+
+    # Auto-discover all supported files from data/ when no explicit list is given
+    document_paths = document_paths or _discover_documents()
 
     existing_files = [path for path in document_paths if path.exists()]
-    
+
     documents = []
     if existing_files:
-        loader = SimpleDirectoryReader(input_files=[str(path) for path in existing_files])
+        loader = SimpleDirectoryReader(
+            input_files=[str(path) for path in existing_files],
+            # unstructured handles xlsx/xls; pandas_csv handles csv
+            file_extractor=None,  # let LlamaIndex auto-detect based on extension
+        )
         documents.extend(loader.load_data())
-        
+
     if extra_documents:
         documents.extend(extra_documents)
 
     if not documents:
-        raise ValueError("No source documents were found for indexing.")
+        raise ValueError(
+            f"No source documents were found. "
+            f"Place PDF, DOCX, XLSX, CSV, or TXT files in: {DATA_DIR}"
+        )
 
     text_splitter = SentenceSplitter(chunk_size=512, chunk_overlap=50)
     Settings.text_splitter = text_splitter
@@ -68,9 +107,15 @@ def build_index(document_paths: List[Path] | None = None, extra_documents: list 
 
 
 def main() -> None:
-    print("Building the document index...")
-    build_index()
-    print(f"Indexing complete. Vector store: {INDEX_DIR}")
+    print(f"Scanning {DATA_DIR} for documents...")
+    discovered = _discover_documents()
+    if not discovered:
+        print(f"No supported files found in {DATA_DIR}. Add PDF, DOCX, XLSX, CSV, or TXT files and re-run.")
+        return
+    print(f"Found {len(discovered)} file(s): {[p.name for p in discovered]}")
+    print("Building index...")
+    build_index(document_paths=discovered)
+    print(f"Done. Vector store saved to: {INDEX_DIR}")
 
 
 if __name__ == "__main__":
