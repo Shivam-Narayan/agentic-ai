@@ -280,7 +280,12 @@ def generate_chart(data_json: str, chart_type: str, title: str) -> str:
 
         if chart_type == "pie":
             y_vals = data_dict[y_cols[0]]
-            fig.add_trace(go.Pie(labels=x_vals, values=y_vals, name=y_cols[0]))
+            fig.add_trace(go.Pie(
+                labels=x_vals,
+                values=y_vals,
+                name=y_cols[0],
+                textfont=dict(color="white"),  # force all slice labels to white
+            ))
         elif chart_type == "scatter":
             for y_col in y_cols:
                 fig.add_trace(go.Scatter(

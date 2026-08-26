@@ -49,6 +49,11 @@ The key design principle: **there is no hard-coded routing**. The LLM itself rea
 │   │                       NO ──► END                        │   │
 │   └─────────────────────────────────────────────────────────┘   │
 │                                                                 │
+│   Deduplication guard in agent_node:                            │
+│   • blocks search_company_documents being called > once         │
+│   • prevents repeated identical tool+query pairs               │
+│   • re-invokes LLM without tools if response content is empty  │
+│                                                                 │
 │   Local tools (tools.py):                                       │
 │   ┌──────────────────────┐  ┌──────────────────────────────┐   │
 │   │ search_company_docs  │  │ summarise_document           │   │
@@ -77,7 +82,7 @@ The key design principle: **there is no hard-coded routing**. The LLM itself rea
         │ indexed from
 ┌───────────────────┐
 │   data/ folder    │
-│  *.pdf *.docx     │
+│  *.pdf *.docx     │  ← DocxReader (llama-index-readers-file)
 │  *.xlsx *.csv     │
 │  *.txt            │
 └───────────────────┘
@@ -89,54 +94,88 @@ The key design principle: **there is no hard-coded routing**. The LLM itself rea
 
 The entire agent is a two-node LangGraph `StateGraph`. There are no other nodes — no classifier, no pre-router, no if/else logic.
 
-```mermaid
-flowchart TD
-    U[User via Streamlit] --> API["FastAPI\nPOST /ask"]
-    API --> AASK["aask(question, history)\nworkflow.py"]
-
-    AASK --> BUILD["build_graph(all_tools)\nCreates fresh graph per request"]
-    BUILD --> START
-
-    subgraph Graph ["LangGraph StateGraph"]
-        START([START]) --> AGENT["Agent Node\nSystemMessage + history + LLM + bound tools"]
-        AGENT -- "tool_calls present" --> TOOLS["Tool Node\nExecutes Python function"]
-        TOOLS -- "ToolMessage appended to state" --> AGENT
-        AGENT -- "no tool_calls → final answer" --> ENDNODE([END])
-    end
-
-    TOOLS -.->|calls| RAG["search_company_documents\nrag.py → LlamaIndex vector store"]
-    TOOLS -.->|calls| SUMM["summarise_document\nrag.py → full document text"]
-    TOOLS -.->|calls| EXTRACT["extract_structured_data\nrag.py → field extraction"]
-    TOOLS -.->|calls| DB["query_company_database\nlist_database_tables\ndescribe_database_table\nmcp_client.py → SQLite"]
-    TOOLS -.->|calls| WEB["search_web\nchains.py → Tavily API"]
-    TOOLS -.->|calls| CALC["calculate\nSafe AST evaluator"]
-    TOOLS -.->|calls| CHART["generate_chart\nPlotly JSON figure"]
-
-    ENDNODE --> PARSE["parse_result()\nExtracts datasource, tools_used\ncitations, chart_data"]
-    PARSE --> RESP["QuestionResponse\nreturned to Streamlit"]
+```
+User question
+     │
+     ▼
+FastAPI POST /ask
+     │
+     ▼
+aask(question, history)   ← workflow.py
+     │
+     ▼
+build_graph(all_tools)    ← fresh graph per request
+     │
+     ▼
+┌────────────────────────────────────────────────────┐
+│               LangGraph StateGraph                 │
+│                                                    │
+│  START → Agent Node → tool_calls present?          │
+│              ▲               │                     │
+│              │         YES → Tool Node             │
+│              └───────────────┘                     │
+│                        NO → END                    │
+└────────────────────────────────────────────────────┘
+     │
+     ▼
+parse_result()   → answer, datasource, tools_used, citations, chart_data
+     │
+     ▼
+QuestionResponse → Streamlit
 ```
 
 ### Why two nodes?
 
-The LLM is not just the "brain" — it is also the router. It receives all tool schemas (auto-generated from their docstrings) alongside the user's question plus a system prompt and the full conversation history. It decides:
+The LLM is not just the "brain" — it is also the router. It receives all tool schemas (auto-generated from their docstrings) alongside the user's question, the system prompt, and the full conversation history. It decides:
 
 - **No tools needed** → emits a final answer text → graph goes to END
-- **One or more tools needed** → emits a `tool_calls` list → graph executes the tools, appends results to message history, and loops back to the agent
+- **Tool needed** → emits a `tool_calls` list → graph executes the tool, appends results to history, loops back
 
-This loop continues until the LLM stops calling tools and produces a final answer. Most questions resolve in 1–2 loops.
+The loop continues until the LLM stops calling tools and produces a final answer. Most questions resolve in 1–2 loops. The `recursion_limit=8` cap prevents runaway loops.
 
 ---
 
 ## The System Prompt
 
-Every agent invocation injects a `SystemMessage` as the first message. It defines the agent's persona and enforces key behaviours:
+Every agent invocation calls `_build_system_prompt()` which stamps the **live server date and time** into the prompt before injecting it as a `SystemMessage`. This ensures date/day-of-week questions are always accurate regardless of the LLM's training data cutoff.
 
+The prompt also enforces:
+
+- **Direct answers** — general knowledge questions (concepts, definitions) must be answered without calling any tools
+- **No redundant tool calls** — `search_company_documents` must be called at most once per question
 - **Citations** — always cite source filenames, SQL queries, or URLs
-- **Accuracy** — use the `calculate` tool for all arithmetic (never compute in the LLM head)
-- **Charts** — proactively offer charts when presenting tabular or numeric results
-- **Extraction** — use `extract_structured_data` for pulling specific fields from documents
-- **Summaries** — use `summarise_document` for overview/summary requests
-- **Memory** — use conversation history to handle follow-up questions
+- **Accuracy** — use the `calculate` tool for all arithmetic
+- **Web search caveats** — quote the value, not the date shown in snippets
+
+This is backed up at the code level by the **deduplication guard** (see below) — the prompt alone is not reliable enough.
+
+---
+
+## Deduplication Guard
+
+The LLM was observed calling `search_company_documents` 4+ times per question with slightly different queries ("Shivam skills", "Shivam profile", "Shivam", ...). Each call consumes a Groq API request, burning through the 30 RPM free-tier limit in seconds.
+
+The guard runs inside `agent_node` after every LLM response:
+
+```
+LLM response has tool_calls?
+        │
+       YES
+        │
+        ▼
+Count prior search_company_documents calls in message history
+        │
+        ├── count >= 1 → BLOCK: strip tool_calls, force direct answer
+        │
+        └── exact same tool+query already ran → BLOCK: strip tool_calls
+                │
+                ▼
+        Response content is empty?
+                │
+               YES → re-invoke LLM without tools to get a real answer
+```
+
+This is a code-level guarantee — the model cannot bypass it regardless of what the prompt says.
 
 ---
 
@@ -158,12 +197,12 @@ The LLM learns what each tool does from its **docstring**. Well-written docstrin
 
 ---
 
-## The 6 Answer Paths
+## The 7 Answer Paths
 
-Every API response includes a `datasource` field that tells you how the answer was produced:
+Every API response includes a `datasource` field:
 
 ```
-datasource = "direct_llm"     → LLM answered from training data, no tools used
+datasource = "direct_llm"     → LLM answered from training data / live date prompt
 datasource = "company_docs"   → search_company_documents / summarise_document / extract_structured_data
 datasource = "database"       → query_company_database was called
 datasource = "web_search"     → search_web was called
@@ -172,18 +211,18 @@ datasource = "chart"          → generate_chart was called
 datasource = "multiple"       → more than one tool category was used
 ```
 
-### Path 1 — Direct LLM
+### Path 1 — Direct LLM (including date/time)
 ```
-User: "What is a vector database?"
-LLM:  Answers directly — no tool_calls emitted
+User: "What is a vector database?"  OR  "What day is today?"
+LLM:  Answers directly — system prompt contains live date/time
 → datasource: "direct_llm"
 ```
 
 ### Path 2 — Company Documents (RAG)
 ```
-User: "What does the KT document say about deployment?"
-LLM:  Calls search_company_documents("deployment process")
-      Tool → LlamaIndex vector store → top 4 chunks with [Source: filename] markers
+User: "What are Shivam's technical skills?"
+LLM:  Calls search_company_documents("Shivam technical skills")
+      Tool → LlamaIndex vector store (indexed with DocxReader) → top 4 chunks
 LLM:  Synthesises answer, cites filename
 → datasource: "company_docs"
 ```
@@ -191,10 +230,9 @@ LLM:  Synthesises answer, cites filename
 ### Path 3 — Database
 ```
 User: "What is the status of order #12345?"
-LLM:  Calls list_database_tables() → sees "orders" table
-      Calls describe_database_table("orders") → sees column names
+LLM:  Calls list_database_tables() → calls describe_database_table("orders")
       Calls query_company_database("SELECT * FROM orders WHERE id = 12345")
-LLM:  Formats row as natural language, shows SQL in code block
+LLM:  Formats result, shows SQL in code block
 → datasource: "database"
 ```
 
@@ -202,8 +240,8 @@ LLM:  Formats row as natural language, shows SQL in code block
 ```
 User: "What is the current USD to INR exchange rate?"
 LLM:  Calls search_web("USD to INR exchange rate today")
-      → Tavily returns results with URLs
-LLM:  Extracts rate, cites URL
+      → TavilySearch returns structured results with URLs
+LLM:  Extracts rate value, cites source URL
 → datasource: "web_search"
 ```
 
@@ -211,7 +249,6 @@ LLM:  Extracts rate, cites URL
 ```
 User: "What is 15% of 85000?"
 LLM:  Calls calculate("85000 * 0.15") → "85000 * 0.15 = 12750"
-LLM:  Returns the result
 → datasource: "calculation"
 ```
 
@@ -219,7 +256,6 @@ LLM:  Returns the result
 ```
 User: "Show monthly sales as a bar chart: Jan=1200, Feb=1500"
 LLM:  Calls generate_chart(data_json='[...]', chart_type='bar', title='Monthly Sales')
-      → returns CHART_JSON::{plotly figure JSON}
 Streamlit: renders Plotly chart inline in the chat
 → datasource: "chart"
 ```
@@ -228,12 +264,12 @@ Streamlit: renders Plotly chart inline in the chat
 
 ## Conversation Memory
 
-The agent supports multi-turn conversation via `session_id`. FastAPI stores message history per session in `_sessions` (an in-memory dict). On each request:
+The agent supports multi-turn conversation via `session_id`. FastAPI stores message history per session in `_sessions` (in-memory dict). On each request:
 
-1. FastAPI calls `_get_lc_history(session_id)` to reconstruct prior `HumanMessage` / `AIMessage` objects
-2. `aask(question, history=history)` prepends the history before the new question in `AgentState`
-3. The agent node prepends `SystemMessage` to the full history on every turn
-4. After the answer, FastAPI calls `_append_to_session()` to store the new exchange
+1. FastAPI reconstructs prior `HumanMessage` / `AIMessage` objects
+2. `aask(question, history=history)` prepends history before the new question
+3. `_build_system_prompt()` is called fresh — date is always current
+4. After the answer, FastAPI stores the new exchange
 
 Session history is capped at 20 turns (40 messages) to stay within context limits.
 
@@ -241,7 +277,7 @@ Session history is capped at 20 turns (40 messages) to stay within context limit
 
 ## Citations
 
-Every response includes a `citations` list. The `_extract_citations()` function walks all `ToolMessage` objects in the final state and extracts:
+Every response includes a `citations` list. `_extract_citations()` walks all `ToolMessage` objects in the final state:
 
 | Tool | Citation source |
 |---|---|
@@ -249,11 +285,9 @@ Every response includes a `citations` list. The `_extract_citations()` function 
 | `search_web` | `[Source: url]` markers in tool output |
 | `query_company_database` | The SQL query used, shown as `detail` |
 | `calculate` | The expression and result |
-| `summarise_document` | The filename extracted from `[Full text of ...]` prefix |
+| `summarise_document` | The filename from `[Full text of ...]` prefix |
 | `extract_structured_data` | `[Source: filename]` markers |
 | `list_database_tables` / `describe_database_table` | `"schema lookup via <tool_name>"` |
-
-Citations are rendered in the Streamlit UI as clickable pills under each assistant message.
 
 ---
 
@@ -262,35 +296,32 @@ Citations are rendered in the Streamlit UI as clickable pills under each assista
 ### Vector Store (for documents)
 
 ```
-data/                          ← you put your files here
+data/                          ← put your files here
   ├── report.pdf
-  ├── handbook.docx
+  ├── handbook.docx            ← parsed by DocxReader (requires llama-index-readers-file)
   ├── catalog.xlsx
-  ├── sales.csv
   └── notes.txt
        │
-       │  python -m src.agent.rag  (run once to index)
+       │  python -m src.agent.rag  OR  POST /upload from Streamlit
        ▼
 indexing_data/                 ← auto-generated, do not edit
   ├── default__vector_store.json
   ├── docstore.json
   ├── index_store.json
-  ├── graph_store.json
-  └── image__vector_store.json
+  └── ...
 ```
 
 - **Supported formats:** PDF, DOCX, DOC, XLSX, XLS, CSV, TXT
+- **DOCX parsing:** `DocxReader` from `llama-index-readers-file` (backed by `docx2txt`)
 - **Embedding model:** `BAAI/bge-small-en-v1.5` — runs locally, no API key needed
 - **Chunk size:** 512 tokens, 50 token overlap
-- **Implementation:** LlamaIndex `VectorStoreIndex` with file-based persistence
-- **Loading:** `@lru_cache` — index is loaded from disk once per server process
+- **Cache invalidation:** `get_vector_index.cache_clear()` is called after every index rebuild, so new files are searchable immediately on the next query
 
 ### Company Database
 
 - **Location:** `data/company.db`
 - **Technology:** SQLite (swappable with Postgres via real MCP server)
 - **Access:** Read-only — `query_company_database` rejects any SQL that is not a `SELECT`
-- **Interface:** MCP-compatible `asynccontextmanager` in `mcp_client.py`
 
 ---
 
@@ -300,10 +331,10 @@ indexing_data/                 ← auto-generated, do not edit
 |---|---|---|
 | `streamlit_app.py` | UI | Chat interface, session state, datasource badges, citation pills, Plotly chart rendering, document upload, sidebar sample questions |
 | `app.py` | API | FastAPI — `/ask`, `/health`, `/upload`, `/documents`, `/sessions/*`, in-memory session store |
-| `workflow.py` | Agent | Builds the LangGraph, system prompt, agent node, tool node, routing, citation/chart extraction, result parsing |
-| `chains.py` | LLM | Factory: auto-selects Groq / Gemini / Cohere; provides Tavily tool |
+| `workflow.py` | Agent | Builds the LangGraph, dynamic system prompt with live date, deduplication guard, agent node, tool node, routing, citation/chart extraction, result parsing |
+| `chains.py` | LLM | Factory: auto-selects Groq / Gemini / Cohere; provides `TavilySearch` web tool |
 | `tools.py` | Tools | 6 local tools: `search_company_documents`, `summarise_document`, `extract_structured_data`, `search_web`, `calculate`, `generate_chart` |
-| `rag.py` | RAG | Auto-discovers files in `data/`, builds/loads LlamaIndex vector store |
+| `rag.py` | RAG | Auto-discovers files in `data/`, registers `DocxReader`, builds/loads LlamaIndex vector store |
 | `mcp_client.py` | DB | Three database tools behind an MCP-compatible `asynccontextmanager` |
 | `config.py` | Config | `DATA_DIR`, `INDEX_DIR` paths; env key validation |
 | `schemas.py` | Models | `QuestionRequest` (with `session_id`), `QuestionResponse` (with `citations`, `chart_data`) |
@@ -313,18 +344,18 @@ indexing_data/                 ← auto-generated, do not edit
 
 ## Multi-LLM Strategy
 
-The system is **vendor-agnostic at the agent level**. All LLM providers implement LangChain's `BaseChatModel` so `workflow.py` never references a specific provider.
-
 ```
 .env keys present         →  LLM selected
-──────────────────────────────────────────
-GROQ_API_KEY              →  Groq  (openai/gpt-oss-120b)   ← default
+──────────────────────────────────────────────────────────────
+GROQ_API_KEY              →  Groq  (openai/gpt-oss-20b)   ← default
 GOOGLE_API_KEY            →  Gemini (gemini-1.5-flash)
 COHERE_API_KEY            →  Cohere (command-r-plus)
 LLM_PROVIDER=google       →  forces Google regardless of other keys
 ```
 
-Priority order when multiple keys are present: **Groq → Google → Cohere**
+Priority order: **Groq → Google → Cohere**. All providers use LangChain's `BaseChatModel` — `workflow.py` never references a specific provider.
+
+> **Note on Groq rate limits:** The free tier allows 30 RPM. The deduplication guard and `parallel_tool_calls=False` keep most questions within 2–3 API calls.
 
 ---
 
@@ -335,16 +366,17 @@ Priority order when multiple keys are present: **Groq → Google → Cohere**
 | **LangGraph** | Stateful ReAct agent loop (two-node StateGraph) |
 | **LangChain** | `@tool` decorator, `ToolNode`, `BaseChatModel` interface |
 | **LlamaIndex** | Document ingestion, chunking, HuggingFace embeddings, persisted vector store |
+| **llama-index-readers-file** | `DocxReader` for proper Word document text extraction |
 | **FastAPI** | Async HTTP API with Pydantic request/response validation; in-memory session store |
 | **Streamlit** | Chat UI with session memory, datasource badges, citation pills, Plotly charts, document upload |
-| **Groq** | Default LLM — `openai/gpt-oss-120b`, fast free-tier, tool-calling support |
+| **Groq** | Default LLM — `openai/gpt-oss-20b`, fast free-tier, tool-calling support |
 | **Google Gemini** | Alternative LLM — `gemini-1.5-flash` |
-| **Cohere** | Alternative LLM — `command-r-plus`, strong at RAG tasks |
-| **Tavily** | Real-time web search API |
-| **HuggingFace** | `BAAI/bge-small-en-v1.5` local embedding model (no API key needed) |
+| **Cohere** | Alternative LLM — `command-r-plus` |
+| **langchain-tavily** | Real-time web search (`TavilySearch`) |
+| **HuggingFace** | `BAAI/bge-small-en-v1.5` local embedding model |
 | **Plotly** | Interactive chart generation and rendering |
 | **SQLite** | Company database — swappable to Postgres via MCP |
-| **openpyxl** | Excel file parsing (`.xlsx`, `.xls`) |
+| **docx2txt** | Underlying DOCX text extractor used by DocxReader |
 
 ---
 
@@ -368,7 +400,7 @@ No routing changes. The LLM starts using it automatically.
 
 ### Add a new document type
 
-Add the extension to `SUPPORTED_EXTENSIONS` in `src/agent/rag.py`:
+Add the extension to `SUPPORTED_EXTENSIONS` in `src/agent/rag.py` and register its reader in `_get_file_extractors()`:
 
 ```python
 SUPPORTED_EXTENSIONS = {".pdf", ".docx", ".doc", ".xlsx", ".xls", ".csv", ".txt", ".md"}

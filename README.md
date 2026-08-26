@@ -21,6 +21,7 @@ You ask a question in plain English. The agent figures out the best way to answe
 | "What is 15% of 85000?" | Uses a safe calculator — never guesses numbers |
 | "Show monthly sales as a bar chart" | Generates an interactive Plotly chart inline |
 | "What is the weather in Bangalore today?" | Searches the live web via Tavily |
+| "What day is today?" | Answers from the live server clock — always accurate |
 
 No manual routing. No dropdowns. The LLM reads the available tools and decides which one(s) to use.
 
@@ -52,16 +53,17 @@ The response always shows:
 | Agent loop | LangGraph (ReAct pattern) |
 | LLM | Groq (default) / Google Gemini / Cohere |
 | Document search | LlamaIndex + HuggingFace embeddings |
+| DOCX parsing | `llama-index-readers-file` (DocxReader) |
 | Charts | Plotly (rendered inline in chat) |
 | Database queries | Python sqlite3 (MCP-compatible interface) |
-| Web search | Tavily API |
+| Web search | Tavily API (`langchain-tavily`) |
 
 ---
 
 ## Project Structure
 
 ```
-kt-agent-using-langgraph/
+DataDialogue/
 │
 ├── app.py                        # FastAPI backend
 ├── streamlit_app.py              # Streamlit chat UI
@@ -79,11 +81,11 @@ kt-agent-using-langgraph/
 ├── src/
 │   └── agent/
 │       ├── config.py             # Paths and environment setup
-│       ├── chains.py             # LLM factory (Groq / Gemini / Cohere)
-│       ├── rag.py                # Document ingestion and search
+│       ├── chains.py             # LLM factory (Groq / Gemini / Cohere) + TavilySearch
+│       ├── rag.py                # Document ingestion, DocxReader fix, vector search
 │       ├── tools.py              # 6 local tools (search, summarise, extract, web, calc, chart)
 │       ├── mcp_client.py         # Database query tools (MCP-compatible)
-│       ├── workflow.py           # LangGraph agent — core logic, citations, chart parsing
+│       ├── workflow.py           # LangGraph agent — dedup guard, live date prompt, citations
 │       ├── schemas.py            # API request/response models
 │       └── ingest_drive.py       # Optional: sync from Google Drive
 │
@@ -117,6 +119,8 @@ Get your free API keys:
 ```bash
 pip install -r requirements.txt
 ```
+
+This includes `llama-index-readers-file` which is required for proper DOCX text extraction. Without it, Word documents are indexed as binary garbage and return no results.
 
 ---
 
@@ -207,7 +211,7 @@ python -m streamlit run streamlit_app.py
 
 Open **http://localhost:8501** in your browser.
 
-> **Both processes must run at the same time** — FastAPI on port 8000 and Streamlit on port 8501. If you close the FastAPI terminal, Streamlit will show "Cannot reach the backend."
+> **Both processes must run at the same time** — FastAPI on port 8000 and Streamlit on port 8501.
 
 ---
 
@@ -217,7 +221,7 @@ Once running, type any question in the chat box. Some examples:
 
 **Document questions:**
 - "Summarise the annual report"
-- "What does the employee handbook say about leave policy?"
+- "What are Shivam's technical skills?"
 - "Extract the project name, start date, and owner from the documents"
 
 **Database questions:**
@@ -237,6 +241,10 @@ Once running, type any question in the chat box. Some examples:
 - "What is the current USD to INR exchange rate?"
 - "Latest news about LangChain"
 
+**Date/time:**
+- "What day is today?"
+- "What is today's date?"
+
 **Follow-up questions (conversation memory):**
 - "What was the total from that last calculation?"
 - "Can you show that as a chart instead?"
@@ -245,12 +253,12 @@ Once running, type any question in the chat box. Some examples:
 
 ## Uploading Documents via the UI
 
-You don't need to manually copy files to `data/` and re-run the indexer. From the Streamlit sidebar:
+From the Streamlit sidebar:
 
 1. Click **Upload Documents** and select your files
-2. Click **Upload & Index**
+2. Click **⬆️ Upload & Index**
 3. The backend saves the files to `data/` and rebuilds the index automatically
-4. The document list refreshes to show the newly indexed files
+4. Ask questions about the newly uploaded content immediately
 
 ---
 
@@ -294,8 +302,6 @@ Restart the server.
 
 ### `POST /ask`
 
-Send a question, get an answer with full metadata.
-
 **Request:**
 ```json
 {
@@ -329,27 +335,15 @@ Send a question, get an answer with full metadata.
 | `chart` | A chart was generated |
 | `multiple` | More than one tool category was used |
 
-### `POST /upload`
+### Other endpoints
 
-Upload one or more documents. Files are saved to `data/` and the index is rebuilt automatically.
-
-### `GET /documents`
-
-List all documents currently indexed.
-
-### `GET /health`
-
-```json
-{ "status": "ok" }
-```
-
-### `GET /sessions/{session_id}/history`
-
-Returns the conversation history for a session.
-
-### `DELETE /sessions/{session_id}/history`
-
-Clears the conversation history for a session (start fresh).
+| Endpoint | Description |
+|---|---|
+| `POST /upload` | Upload documents — saved to `data/` and indexed automatically |
+| `GET /documents` | List all indexed documents |
+| `GET /health` | Liveness check — returns `{"status": "ok"}` |
+| `GET /sessions/{id}/history` | Conversation history for a session |
+| `DELETE /sessions/{id}/history` | Clear a session's history |
 
 ---
 
@@ -358,21 +352,27 @@ Clears the conversation history for a session (start fresh).
 **"No supported documents found in data/"**  
 Make sure your files are inside `data/` and have a supported extension (`.pdf`, `.docx`, `.xlsx`, `.csv`, `.txt`).
 
-**"ModuleNotFoundError: No module named 'openpyxl'"**  
-Run: `pip install openpyxl==3.1.5`
+**DOCX files return no results / binary garbage in index**  
+Run `pip install llama-index-readers-file` then rebuild the index with `python -m src.agent.rag`. This package provides `DocxReader` which is required for proper Word document text extraction.
+
+**Agent calls the same tool multiple times and hits rate limit (429)**  
+This is prevented by the deduplication guard in `workflow.py`. If you see repeated calls, check that the server reloaded the latest `workflow.py`.
 
 **"ValueError: No LLM API key found"**  
 Check that your `.env` file exists and has at least one of `GROQ_API_KEY`, `GOOGLE_API_KEY`, or `COHERE_API_KEY` set.
 
+**"ModuleNotFoundError: No module named 'openpyxl'"**  
+Run: `pip install openpyxl==3.1.5`
+
 **Index is stale after adding new files**  
-Re-run `python -m src.agent.rag` to rebuild the index, or use the Upload button in the Streamlit sidebar.
+Re-run `python -m src.agent.rag` to rebuild, or use the Upload button in the Streamlit sidebar. The `lru_cache` is cleared automatically after a rebuild so the new index loads on the next query.
 
 **"Cannot reach the backend. Is FastAPI running?"**  
-Two things to check in order:
-1. Make sure FastAPI is actually running (`python -m uvicorn app:app --host 0.0.0.0 --port 8000 --reload`) in a separate terminal
-2. Check that `KT_API_URL` in your `.env` is set to `http://localhost:8000` — not commented out and not pointing to the wrong port. This is the most common cause of this error.
+1. Make sure FastAPI is running (`python -m uvicorn app:app --host 0.0.0.0 --port 8000 --reload`)
+2. Check that `KT_API_URL=http://localhost:8000` is set in `.env` — not commented out
 
-After fixing `.env`, restart Streamlit (`Ctrl+C` then `python -m streamlit run streamlit_app.py`) so it picks up the new value.
+**Sample question chat input disappears after clicking**  
+This was a Streamlit rendering bug — fixed in `streamlit_app.py`. The chat input is now always rendered on every run.
 
 **Charts not rendering**  
 Run: `pip install plotly`
@@ -381,5 +381,5 @@ Run: `pip install plotly`
 
 ## Documentation
 
-- [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) — How the system is designed and how data flows through it
+- [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) — System architecture and data flow
 - [docs/SYSTEM_DESIGN.md](docs/SYSTEM_DESIGN.md) — Detailed component breakdown and design decisions
