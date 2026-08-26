@@ -47,13 +47,13 @@ SAMPLE_QUESTIONS: dict[str, list[str]] = {
 
 # ── Datasource config ─────────────────────────────────────────────────────────
 ROUTE_CONFIG: dict[str, dict] = {
-    "direct_llm":   {"icon": "💬", "label": "LLM",       "color": "#6366f1"},
-    "company_docs": {"icon": "📄", "label": "Documents",  "color": "#0ea5e9"},
-    "database":     {"icon": "🗄️", "label": "Database",   "color": "#10b981"},
-    "web_search":   {"icon": "🌐", "label": "Web Search", "color": "#f59e0b"},
-    "calculation":  {"icon": "🧮", "label": "Calculator", "color": "#8b5cf6"},
-    "chart":        {"icon": "📊", "label": "Chart",      "color": "#06b6d4"},
-    "multiple":     {"icon": "🔀", "label": "Multi-tool", "color": "#ef4444"},
+    "direct_llm":   {"icon": "✦",  "label": "Direct answer", "color": "#6366f1", "bg": "#1e1b4b"},
+    "company_docs": {"icon": "≡",  "label": "Documents",     "color": "#38bdf8", "bg": "#0c2340"},
+    "database":     {"icon": "◈",  "label": "Database",      "color": "#34d399", "bg": "#052e1c"},
+    "web_search":   {"icon": "↗",  "label": "Web search",    "color": "#a78bfa", "bg": "#1e1040"},
+    "calculation":  {"icon": "∑",  "label": "Calculator",    "color": "#c084fc", "bg": "#1e0b35"},
+    "chart":        {"icon": "◎",  "label": "Chart",         "color": "#22d3ee", "bg": "#042f3e"},
+    "multiple":     {"icon": "⊕",  "label": "Multi-tool",    "color": "#94a3b8", "bg": "#1e2536"},
 }
 
 # ── Page config ───────────────────────────────────────────────────────────────
@@ -238,74 +238,138 @@ button[kind="headerNoPadding"],
     box-shadow: 0 0 0 2px rgba(59,130,246,0.15) !important;
 }
 
-/* ── Tool badge ── */
+/* ── Tool badge — compact inline chip ── */
 .tool-badge {
     display: inline-flex;
     align-items: center;
-    gap: 4px;
+    gap: 5px;
     border-radius: 6px;
-    padding: 2px 10px;
+    padding: 3px 10px 3px 8px;
     font-size: 0.72rem;
     font-weight: 600;
-    color: #fff;
+    letter-spacing: 0.2px;
+    border: 1px solid transparent;
     margin-right: 6px;
-    letter-spacing: 0.3px;
+}
+.tool-badge .badge-icon {
+    font-size: 0.85rem;
+    line-height: 1;
 }
 
-/* ── Citation pill ── */
-.citation-pill {
-    display: inline-flex;
-    align-items: center;
-    gap: 4px;
-    background: #0f1a2e;
-    border: 1px solid #1e3a5f;
-    border-radius: 20px;
-    padding: 2px 10px;
-    font-size: 0.72rem;
-    color: #60a5fa;
-    margin: 2px 3px 2px 0;
-    cursor: default;
-    transition: background 0.15s;
-}
-.citation-pill:hover {
-    background: #162444;
-}
-
-/* ── Citation block ── */
-.citation-block {
-    border-top: 1px solid #1e2536;
-    margin-top: 10px;
-    padding-top: 8px;
-    display: flex;
-    align-items: center;
-    flex-wrap: wrap;
-    gap: 2px;
-}
-.citation-label {
+/* ── Tool name chip ── */
+.tool-name-chip {
     font-size: 0.68rem;
     color: #475569;
-    font-weight: 600;
-    letter-spacing: 0.5px;
-    text-transform: uppercase;
-    margin-right: 6px;
+    background: transparent;
+    border: none;
+    padding: 0;
+    font-family: 'Inter', sans-serif;
+    letter-spacing: 0.1px;
 }
 
-/* ── Meta row below answer ── */
+/* ── Meta row ── */
 .meta-row {
     display: flex;
     align-items: center;
-    gap: 8px;
-    margin-top: 8px;
-    flex-wrap: wrap;
+    gap: 6px;
+    margin-top: 10px;
+    padding-top: 8px;
+    border-top: 1px solid #1e2536;
 }
-.tool-name-chip {
+.meta-spacer { flex: 1; }
+
+/* ── Sources button — minimal icon button ── */
+.src-btn-wrap button {
+    background: transparent !important;
+    border: 1px solid #1e2d45 !important;
+    border-radius: 6px !important;
+    color: #475569 !important;
+    font-size: 0.7rem !important;
+    padding: 2px 8px !important;
+    min-height: 0 !important;
+    height: 24px !important;
+    line-height: 1 !important;
+    transition: all 0.15s !important;
+}
+.src-btn-wrap button:hover {
+    background: #0f1a2e !important;
+    border-color: #3b82f6 !important;
+    color: #60a5fa !important;
+}
+
+/* ── Sources panel ── */
+.sources-panel {
+    background: #13192a;
+    border: 1px solid #1e2d45;
+    border-radius: 14px;
+    padding: 0;
+    overflow: hidden;
+    height: fit-content;
+}
+.sources-panel-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 14px 16px 12px 16px;
+    border-bottom: 1px solid #1e2d45;
+}
+.sources-panel-title {
+    font-size: 0.82rem;
+    font-weight: 700;
+    color: #e2e8f0;
+    letter-spacing: -0.1px;
+}
+.sources-panel-body { padding: 14px 16px; }
+
+/* ── Source card ── */
+.source-card {
+    display: flex;
+    align-items: flex-start;
+    gap: 10px;
+    background: #0d1320;
+    border: 1px solid #1a2540;
+    border-radius: 10px;
+    padding: 10px 12px;
+    margin-bottom: 8px;
+    transition: border-color 0.15s;
+    text-decoration: none;
+}
+.source-card:hover { border-color: #2d4a7a; }
+.source-icon {
+    width: 28px; height: 28px;
+    background: #1a2540;
+    border-radius: 6px;
+    display: flex; align-items: center; justify-content: center;
+    font-size: 0.82rem;
+    flex-shrink: 0;
+    margin-top: 1px;
+}
+.source-content { flex: 1; min-width: 0; }
+.source-domain {
+    font-size: 0.72rem;
+    color: #60a5fa;
+    font-weight: 500;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+.source-detail {
     font-size: 0.68rem;
-    color: #64748b;
-    background: #0f1117;
-    border: 1px solid #1e2536;
-    border-radius: 4px;
-    padding: 1px 6px;
-    font-family: 'Courier New', monospace;
+    color: #374151;
+    margin-top: 2px;
+    font-family: monospace;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+.section-label {
+    font-size: 0.62rem;
+    font-weight: 700;
+    letter-spacing: 0.8px;
+    text-transform: uppercase;
+    color: #334155;
+    margin-bottom: 8px;
+    margin-top: 4px;
 }
 
 /* ── Sidebar section headers ── */
@@ -452,9 +516,18 @@ if "messages" not in st.session_state:
 if "backend_ok" not in st.session_state:
     st.session_state.backend_ok = _check_backend()
 
+if "sources_open" not in st.session_state:
+    st.session_state.sources_open = False
+
+if "active_sources" not in st.session_state:
+    st.session_state.active_sources = []
+
+if "active_tools" not in st.session_state:
+    st.session_state.active_tools = []
+
 
 # ── Render assistant message ──────────────────────────────────────────────────
-def _render_assistant_message(msg: dict) -> None:
+def _render_assistant_message(msg: dict, msg_index: int = 0) -> None:
     st.markdown(msg["content"])
 
     datasource = msg.get("datasource")
@@ -469,41 +542,60 @@ def _render_assistant_message(msg: dict) -> None:
             fig = go.Figure(chart_data)
             fig.update_layout(
                 paper_bgcolor="rgba(0,0,0,0)",
-                plot_bgcolor="#0f1117",
+                plot_bgcolor="#0d1320",
                 font_color="#cbd5e1",
             )
             st.plotly_chart(fig, use_container_width=True, key=f"chart_{id(msg)}")
         except Exception as exc:
             st.warning(f"Could not render chart: {exc}")
 
-    # Meta row — badge + tool chips
-    if datasource:
-        cfg   = ROUTE_CONFIG.get(datasource, {"icon": "🔧", "label": datasource, "color": "#666"})
-        badge = (
-            f'<span class="tool-badge" style="background:{cfg["color"]}">'
-            f'{cfg["icon"]} {cfg["label"]}</span>'
+    # Meta row — only if there's something to show
+    if datasource or citations:
+        cfg = ROUTE_CONFIG.get(datasource or "", {
+            "icon": "·", "label": datasource or "", "color": "#64748b", "bg": "#1e2536"
+        })
+
+        # Build the badge HTML
+        badge_html = (
+            f'<span class="tool-badge" style="'
+            f'color:{cfg["color"]};'
+            f'background:{cfg["bg"]};'
+            f'border-color:{cfg["color"]}22;">'
+            f'<span class="badge-icon">{cfg["icon"]}</span>'
+            f'{cfg["label"]}'
+            f'</span>'
         )
-        chips = "".join(
-            f'<span class="tool-name-chip">{t}</span>'
-            for t in tools_used
-        )
+
+        # Tool name (first tool, lowercase)
+        tool_label = ""
+        if tools_used:
+            tool_label = f'<span class="tool-name-chip">{tools_used[0]}</span>'
+
         st.markdown(
-            f'<div class="meta-row">{badge}{chips}</div>',
+            f'<div class="meta-row">{badge_html}{tool_label}</div>',
             unsafe_allow_html=True,
         )
 
-    # Citations
-    if citations:
-        pills = "".join(
-            f'<span class="citation-pill" title="{c.get("detail","")}">'
-            f'📎 {c["source"]}</span>'
-            for c in citations
-        )
-        st.markdown(
-            f'<div class="citation-block">'
-            f'<span class="citation-label">Sources</span>{pills}</div>',
-            unsafe_allow_html=True,
-        )
+        # Sources button — separate row, right-aligned, minimal
+        if citations:
+            is_active = (
+                st.session_state.sources_open and
+                st.session_state.active_sources == citations
+            )
+            btn_label = f"{'↙' if is_active else '↗'} {len(citations)} source{'s' if len(citations) != 1 else ''}"
+
+            st.markdown('<div class="src-btn-wrap">', unsafe_allow_html=True)
+            if st.button(btn_label, key=f"src_{msg_index}_{id(msg)}"):
+                if is_active:
+                    st.session_state.sources_open   = False
+                    st.session_state.active_sources = []
+                    st.session_state.active_tools   = []
+                else:
+                    st.session_state.sources_open   = True
+                    st.session_state.active_sources = citations
+                    st.session_state.active_tools   = tools_used
+                st.rerun()
+            st.markdown('</div>', unsafe_allow_html=True)
 
 
 # ── Sidebar ───────────────────────────────────────────────────────────────────
@@ -639,33 +731,137 @@ st.markdown("""
 </div>
 """, unsafe_allow_html=True)
 
-# Welcome card (only when no messages)
-if not st.session_state.messages:
-    st.markdown("""
-    <div class="welcome-card">
-        <div class="welcome-title">What can I help you with?</div>
-        <div style="font-size:0.82rem;color:#64748b;">
-            I can search your documents, query the database, run calculations,
-            generate charts, or look up live web data.
-        </div>
-        <div class="welcome-grid">
-            <div class="welcome-item">📄 Company documents &amp; reports</div>
-            <div class="welcome-item">🗄️ Database queries &amp; analytics</div>
-            <div class="welcome-item">🌐 Live web facts &amp; prices</div>
-            <div class="welcome-item">📊 Charts &amp; calculations</div>
-        </div>
-    </div>
-    """, unsafe_allow_html=True)
+# Layout: chat column + optional sources panel
+if st.session_state.sources_open:
+    chat_col, sources_col = st.columns([2, 1], gap="medium")
+else:
+    chat_col = st.container()
+    sources_col = None
 
-# Conversation history
-for msg in st.session_state.messages:
-    with st.chat_message(msg["role"], avatar="🧠" if msg["role"] == "assistant" else "👤"):
-        if msg["role"] == "assistant":
-            _render_assistant_message(msg)
-        else:
-            st.markdown(msg["content"])
+with chat_col:
+    # Welcome card (only when no messages)
+    if not st.session_state.messages:
+        st.markdown("""
+        <div class="welcome-card">
+            <div class="welcome-title">What can I help you with?</div>
+            <div style="font-size:0.82rem;color:#64748b;">
+                I can search your documents, query the database, run calculations,
+                generate charts, or look up live web data.
+            </div>
+            <div class="welcome-grid">
+                <div class="welcome-item">📄 Company documents &amp; reports</div>
+                <div class="welcome-item">🗄️ Database queries &amp; analytics</div>
+                <div class="welcome-item">🌐 Live web facts &amp; prices</div>
+                <div class="welcome-item">📊 Charts &amp; calculations</div>
+            </div>
+        </div>
+        """, unsafe_allow_html=True)
 
-# Input
+    # Conversation history
+    for i, msg in enumerate(st.session_state.messages):
+        with st.chat_message(msg["role"], avatar="🧠" if msg["role"] == "assistant" else "👤"):
+            if msg["role"] == "assistant":
+                _render_assistant_message(msg, msg_index=i)
+            else:
+                st.markdown(msg["content"])
+
+# Sources panel
+if sources_col is not None:
+    with sources_col:
+        # Panel header
+        hcol1, hcol2 = st.columns([5, 1])
+        with hcol1:
+            st.markdown(
+                '<div style="font-size:0.82rem;font-weight:700;color:#e2e8f0;'
+                'padding:4px 0 10px 0;letter-spacing:-0.1px;">Sources</div>',
+                unsafe_allow_html=True,
+            )
+        with hcol2:
+            if st.button("✕", key="close_sources"):
+                st.session_state.sources_open   = False
+                st.session_state.active_sources = []
+                st.session_state.active_tools   = []
+                st.rerun()
+
+        st.markdown(
+            '<div style="height:1px;background:#1e2d45;margin-bottom:14px;"></div>',
+            unsafe_allow_html=True,
+        )
+
+        # Tools used
+        if st.session_state.active_tools:
+            st.markdown(
+                '<div class="section-label">Tools used</div>',
+                unsafe_allow_html=True,
+            )
+            for t in st.session_state.active_tools:
+                cfg = ROUTE_CONFIG.get("web_search" if "web" in t else
+                                       "company_docs" if "document" in t or "summarise" in t or "extract" in t else
+                                       "database" if "database" in t or "table" in t else
+                                       "calculation" if t == "calculate" else
+                                       "chart" if t == "generate_chart" else "direct_llm", {})
+                color = cfg.get("color", "#64748b")
+                st.markdown(
+                    f'<div style="display:inline-flex;align-items:center;gap:6px;'
+                    f'background:#0d1320;border:1px solid #1a2540;border-radius:6px;'
+                    f'padding:4px 10px;margin-bottom:10px;margin-right:4px;">'
+                    f'<span style="width:6px;height:6px;background:{color};border-radius:50%;'
+                    f'flex-shrink:0;"></span>'
+                    f'<span style="font-size:0.72rem;color:#94a3b8;font-family:monospace;">{t}</span>'
+                    f'</div>',
+                    unsafe_allow_html=True,
+                )
+
+        # References
+        st.markdown(
+            '<div class="section-label">References</div>',
+            unsafe_allow_html=True,
+        )
+
+        for c in st.session_state.active_sources:
+            source = c.get("source", "")
+            detail = c.get("detail", "")
+            is_url = source.startswith("http")
+
+            if is_url:
+                try:
+                    from urllib.parse import urlparse
+                    parsed = urlparse(source)
+                    domain = parsed.netloc.replace("www.", "")
+                    path   = parsed.path[:40] + "…" if len(parsed.path) > 40 else parsed.path
+                except Exception:
+                    domain = source[:30]
+                    path   = ""
+
+                st.markdown(
+                    f'<a href="{source}" target="_blank" style="text-decoration:none;">'
+                    f'<div class="source-card">'
+                    f'<div class="source-icon">↗</div>'
+                    f'<div class="source-content">'
+                    f'<div class="source-domain">{domain}</div>'
+                    f'<div class="source-detail">{path}</div>'
+                    f'</div></div></a>',
+                    unsafe_allow_html=True,
+                )
+            else:
+                # File source
+                ext = source.rsplit(".", 1)[-1].upper() if "." in source else "FILE"
+                icon_map = {"PDF": "PDF", "DOCX": "DOC", "XLSX": "XLS", "CSV": "CSV", "TXT": "TXT"}
+                icon_label = icon_map.get(ext, "≡")
+                detail_str = detail[:80] if detail else ""
+
+                st.markdown(
+                    f'<div class="source-card" style="cursor:default;">'
+                    f'<div class="source-icon" style="font-size:0.6rem;font-weight:700;'
+                    f'color:#38bdf8;">{icon_label}</div>'
+                    f'<div class="source-content">'
+                    f'<div class="source-domain" style="color:#94a3b8;">{source}</div>'
+                    + (f'<div class="source-detail">{detail_str}</div>' if detail_str else "")
+                    + f'</div></div>',
+                    unsafe_allow_html=True,
+                )
+
+# ── Input ─────────────────────────────────────────────────────────────────────
 typed_input = st.chat_input("Ask anything…")
 prompt = st.session_state.pop("pending_question", None) or typed_input
 
@@ -678,57 +874,60 @@ if not prompt:
 
 # Show user message
 st.session_state.messages.append({"role": "user", "content": prompt})
-with st.chat_message("user", avatar="👤"):
-    st.markdown(prompt)
+with chat_col:
+    with st.chat_message("user", avatar="👤"):
+        st.markdown(prompt)
 
 # Call backend
-with st.chat_message("assistant", avatar="🧠"):
-    with st.spinner(""):
-        answer     = ""
-        datasource = None
-        tools_used = []
-        citations  = []
-        chart_data = None
+with chat_col:
+    with st.chat_message("assistant", avatar="🧠"):
+        with st.spinner(""):
+            answer     = ""
+            datasource = None
+            tools_used = []
+            citations  = []
+            chart_data = None
 
-        try:
-            response = httpx.post(
-                f"{API_URL.rstrip('/')}/ask",
-                json={"question": prompt, "session_id": st.session_state.session_id},
-                timeout=REQUEST_TIMEOUT,
-            )
-            response.raise_for_status()
-            payload    = response.json()
-            answer     = payload.get("answer") or "I could not generate an answer."
-            datasource = payload.get("datasource")
-            tools_used = payload.get("tools_used") or []
-            citations  = payload.get("citations") or []
-            chart_data = payload.get("chart_data")
-            st.session_state.backend_ok = True
+            try:
+                response = httpx.post(
+                    f"{API_URL.rstrip('/')}/ask",
+                    json={"question": prompt, "session_id": st.session_state.session_id},
+                    timeout=REQUEST_TIMEOUT,
+                )
+                response.raise_for_status()
+                payload    = response.json()
+                answer     = payload.get("answer") or "I could not generate an answer."
+                datasource = payload.get("datasource")
+                tools_used = payload.get("tools_used") or []
+                citations  = payload.get("citations") or []
+                chart_data = payload.get("chart_data")
+                st.session_state.backend_ok = True
 
-        except httpx.ConnectError:
-            st.session_state.backend_ok = False
-            answer = (
-                "⚠️ **Cannot reach the backend.**\n\n"
-                f"Make sure FastAPI is running:\n"
-                f"```\nuvicorn app:app --reload --port 8000\n```\n"
-                f"Expected at: `{API_URL}`"
-            )
-        except httpx.TimeoutException:
-            answer = (
-                "⚠️ **Request timed out.**\n\n"
-                "The agent is still processing — try asking again."
-            )
-        except Exception as exc:
-            answer = f"⚠️ **Unexpected error:** {exc}"
+            except httpx.ConnectError:
+                st.session_state.backend_ok = False
+                answer = (
+                    "⚠️ **Cannot reach the backend.**\n\n"
+                    f"Make sure FastAPI is running:\n"
+                    f"```\nuvicorn app:app --reload --port 8000\n```\n"
+                    f"Expected at: `{API_URL}`"
+                )
+            except httpx.TimeoutException:
+                answer = (
+                    "⚠️ **Request timed out.**\n\n"
+                    "The agent is still processing — try asking again."
+                )
+            except Exception as exc:
+                answer = f"⚠️ **Unexpected error:** {exc}"
 
-    assistant_msg = {
-        "role":       "assistant",
-        "content":    answer,
-        "datasource": datasource,
-        "tools_used": tools_used,
-        "citations":  citations,
-        "chart_data": chart_data,
-    }
-    _render_assistant_message(assistant_msg)
+        assistant_msg = {
+            "role":       "assistant",
+            "content":    answer,
+            "datasource": datasource,
+            "tools_used": tools_used,
+            "citations":  citations,
+            "chart_data": chart_data,
+        }
+        msg_index = len(st.session_state.messages)
+        _render_assistant_message(assistant_msg, msg_index=msg_index)
 
 st.session_state.messages.append(assistant_msg)
