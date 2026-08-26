@@ -1,12 +1,4 @@
-"""Streamlit chat UI for the CTE Knowledge Transfer Assistant.
-
-Features:
-- Multi-turn conversation memory (session_id per browser tab)
-- Source citations shown under each AI answer
-- Plotly charts rendered inline when the agent generates one
-- Tool badge showing which tool(s) were used
-- Sidebar: document upload with auto-indexing, sample questions, session controls
-"""
+"""Streamlit chat UI for the CTE Knowledge Transfer Assistant — Professional Edition."""
 
 import io
 import os
@@ -16,15 +8,15 @@ import httpx
 import streamlit as st
 from dotenv import load_dotenv
 
-load_dotenv()  # load KT_API_URL and other vars from .env
+load_dotenv()
 
-# ── Config ──────────────────────────────────────────────────────────────────
-API_URL = os.getenv("KT_API_URL", "http://localhost:8000")
-REQUEST_TIMEOUT = 180.0  # seconds — LLM + tool calls can be slow on first run
+# ── Config ───────────────────────────────────────────────────────────────────
+API_URL         = os.getenv("KT_API_URL", "http://localhost:8000")
+REQUEST_TIMEOUT = 180.0
 
-# ── Sample questions for every tool path ────────────────────────────────────
+# ── Sample questions ─────────────────────────────────────────────────────────
 SAMPLE_QUESTIONS: dict[str, list[str]] = {
-    "💬 Direct LLM": [
+    "💬 General Knowledge": [
         "What is a vector database?",
         "Explain the difference between SQL and NoSQL.",
     ],
@@ -53,21 +45,377 @@ SAMPLE_QUESTIONS: dict[str, list[str]] = {
     ],
 }
 
-# ── Datasource display config ────────────────────────────────────────────────
+# ── Datasource config ─────────────────────────────────────────────────────────
 ROUTE_CONFIG: dict[str, dict] = {
-    "direct_llm":  {"icon": "💬", "label": "LLM answered directly",         "color": "#6c757d"},
-    "company_docs":{"icon": "📄", "label": "Company documents",              "color": "#0d6efd"},
-    "database":    {"icon": "🗄️", "label": "Company database",               "color": "#198754"},
-    "web_search":  {"icon": "🌐", "label": "Live web search",                "color": "#fd7e14"},
-    "calculation": {"icon": "🧮", "label": "Calculator",                     "color": "#6f42c1"},
-    "chart":       {"icon": "📊", "label": "Chart generated",                "color": "#20c997"},
-    "multiple":    {"icon": "🔀", "label": "Multiple tools used",            "color": "#dc3545"},
+    "direct_llm":   {"icon": "💬", "label": "LLM",       "color": "#6366f1"},
+    "company_docs": {"icon": "📄", "label": "Documents",  "color": "#0ea5e9"},
+    "database":     {"icon": "🗄️", "label": "Database",   "color": "#10b981"},
+    "web_search":   {"icon": "🌐", "label": "Web Search", "color": "#f59e0b"},
+    "calculation":  {"icon": "🧮", "label": "Calculator", "color": "#8b5cf6"},
+    "chart":        {"icon": "📊", "label": "Chart",      "color": "#06b6d4"},
+    "multiple":     {"icon": "🔀", "label": "Multi-tool", "color": "#ef4444"},
 }
 
-# ── Helpers ──────────────────────────────────────────────────────────────────
+# ── Page config ───────────────────────────────────────────────────────────────
+st.set_page_config(
+    page_title="DataDialogue — KT Assistant",
+    page_icon="🧠",
+    layout="wide",
+    initial_sidebar_state="expanded",
+)
 
+# ── Professional CSS ──────────────────────────────────────────────────────────
+st.markdown("""
+<style>
+/* ── Google Font ── */
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap');
+
+/* ── Global ── */
+html, body, [class*="css"] {
+    font-family: 'Inter', sans-serif;
+}
+
+/* ── Hide default Streamlit chrome ── */
+#MainMenu, footer, header { visibility: hidden; }
+.stDeployButton { display: none; }
+
+/* ── Keep sidebar collapse/expand arrow visible ── */
+[data-testid="collapsedControl"],
+button[kind="headerNoPadding"],
+[data-testid="stSidebarCollapseButton"] {
+    display: flex !important;
+    visibility: visible !important;
+    opacity: 1 !important;
+}
+[data-testid="stSidebarCollapseButton"] button,
+[data-testid="collapsedControl"] button {
+    background: #161b27 !important;
+    border: 1px solid #1e2536 !important;
+    border-radius: 6px !important;
+    color: #64748b !important;
+}
+[data-testid="stSidebarCollapseButton"] button:hover,
+[data-testid="collapsedControl"] button:hover {
+    background: #1e2a3a !important;
+    color: #94a3b8 !important;
+}
+
+/* ── App background ── */
+.stApp {
+    background: #0f1117;
+}
+
+/* ── Sidebar ── */
+[data-testid="stSidebar"] {
+    background: #161b27 !important;
+    border-right: 1px solid #1e2536;
+}
+[data-testid="stSidebar"] * {
+    color: #cbd5e1 !important;
+}
+[data-testid="stSidebar"] .stButton > button {
+    background: #1e2a3a !important;
+    border: 1px solid #2d3f55 !important;
+    color: #94a3b8 !important;
+    border-radius: 8px !important;
+    font-size: 0.78rem !important;
+    padding: 6px 10px !important;
+    transition: all 0.2s;
+    text-align: left !important;
+}
+[data-testid="stSidebar"] .stButton > button:hover {
+    background: #243347 !important;
+    border-color: #3b82f6 !important;
+    color: #e2e8f0 !important;
+}
+
+/* ── Main content area ── */
+.main .block-container {
+    padding-top: 1.5rem !important;
+    padding-bottom: 2rem !important;
+    max-width: 900px;
+}
+
+/* ── Header ── */
+.app-header {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    padding: 0 0 1rem 0;
+    border-bottom: 1px solid #1e2536;
+    margin-bottom: 1.5rem;
+}
+.app-header-icon {
+    font-size: 2rem;
+    line-height: 1;
+}
+.app-header-title {
+    font-size: 1.4rem;
+    font-weight: 700;
+    color: #f1f5f9;
+    letter-spacing: -0.3px;
+    margin: 0;
+}
+.app-header-subtitle {
+    font-size: 0.78rem;
+    color: #64748b;
+    margin: 0;
+}
+.status-dot {
+    width: 8px; height: 8px;
+    background: #22c55e;
+    border-radius: 50%;
+    display: inline-block;
+    margin-right: 5px;
+    animation: pulse 2s infinite;
+}
+@keyframes pulse {
+    0%, 100% { opacity: 1; }
+    50%       { opacity: 0.4; }
+}
+
+/* ── Chat messages ── */
+[data-testid="stChatMessage"] {
+    background: transparent !important;
+    border: none !important;
+    padding: 0.25rem 0 !important;
+}
+[data-testid="stChatMessageContent"] {
+    background: #161b27 !important;
+    border: 1px solid #1e2536 !important;
+    border-radius: 12px !important;
+    padding: 14px 18px !important;
+    color: #e2e8f0 !important;
+}
+[data-testid="stChatMessageContent"] h1,
+[data-testid="stChatMessageContent"] h2,
+[data-testid="stChatMessageContent"] h3 {
+    color: #f1f5f9 !important;
+    font-size: 0.95rem !important;
+    font-weight: 600 !important;
+    margin-top: 0.6rem !important;
+    margin-bottom: 0.2rem !important;
+}
+[data-testid="stChatMessageContent"] p,
+[data-testid="stChatMessageContent"] li {
+    color: #cbd5e1 !important;
+    font-size: 0.88rem;
+    line-height: 1.7;
+}
+[data-testid="stChatMessageContent"] code {
+    background: #0f1117 !important;
+    color: #7dd3fc !important;
+    padding: 2px 6px;
+    border-radius: 4px;
+    font-size: 0.82rem;
+}
+[data-testid="stChatMessageContent"] pre {
+    background: #0f1117 !important;
+    border: 1px solid #1e2536;
+    border-radius: 8px;
+    padding: 12px;
+}
+
+/* ── User message bubble ── */
+[data-testid="stChatMessage"]:has([data-testid="stChatMessageAvatarUser"]) [data-testid="stChatMessageContent"] {
+    background: #1a2744 !important;
+    border-color: #2d4270 !important;
+}
+
+/* ── Chat input ── */
+[data-testid="stChatInput"] {
+    background: #161b27 !important;
+    border: 1px solid #2d3f55 !important;
+    border-radius: 12px !important;
+    padding: 4px 8px !important;
+}
+[data-testid="stChatInput"] textarea {
+    color: #e2e8f0 !important;
+    font-size: 0.9rem !important;
+}
+[data-testid="stChatInput"]:focus-within {
+    border-color: #3b82f6 !important;
+    box-shadow: 0 0 0 2px rgba(59,130,246,0.15) !important;
+}
+
+/* ── Tool badge ── */
+.tool-badge {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    border-radius: 6px;
+    padding: 2px 10px;
+    font-size: 0.72rem;
+    font-weight: 600;
+    color: #fff;
+    margin-right: 6px;
+    letter-spacing: 0.3px;
+}
+
+/* ── Citation pill ── */
+.citation-pill {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    background: #0f1a2e;
+    border: 1px solid #1e3a5f;
+    border-radius: 20px;
+    padding: 2px 10px;
+    font-size: 0.72rem;
+    color: #60a5fa;
+    margin: 2px 3px 2px 0;
+    cursor: default;
+    transition: background 0.15s;
+}
+.citation-pill:hover {
+    background: #162444;
+}
+
+/* ── Citation block ── */
+.citation-block {
+    border-top: 1px solid #1e2536;
+    margin-top: 10px;
+    padding-top: 8px;
+    display: flex;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: 2px;
+}
+.citation-label {
+    font-size: 0.68rem;
+    color: #475569;
+    font-weight: 600;
+    letter-spacing: 0.5px;
+    text-transform: uppercase;
+    margin-right: 6px;
+}
+
+/* ── Meta row below answer ── */
+.meta-row {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin-top: 8px;
+    flex-wrap: wrap;
+}
+.tool-name-chip {
+    font-size: 0.68rem;
+    color: #64748b;
+    background: #0f1117;
+    border: 1px solid #1e2536;
+    border-radius: 4px;
+    padding: 1px 6px;
+    font-family: 'Courier New', monospace;
+}
+
+/* ── Sidebar section headers ── */
+.sidebar-section {
+    font-size: 0.68rem;
+    font-weight: 700;
+    letter-spacing: 1px;
+    text-transform: uppercase;
+    color: #475569 !important;
+    margin: 1rem 0 0.4rem 0;
+}
+
+/* ── Doc item in sidebar ── */
+.doc-item {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 6px 8px;
+    background: #0f1117;
+    border: 1px solid #1e2536;
+    border-radius: 8px;
+    margin-bottom: 4px;
+}
+.doc-name {
+    font-size: 0.78rem;
+    color: #94a3b8;
+    font-weight: 500;
+    flex: 1;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+.doc-size {
+    font-size: 0.68rem;
+    color: #475569;
+}
+
+/* ── Welcome card ── */
+.welcome-card {
+    background: linear-gradient(135deg, #161b27 0%, #1a2035 100%);
+    border: 1px solid #1e2d45;
+    border-radius: 16px;
+    padding: 24px;
+    margin-bottom: 1rem;
+}
+.welcome-title {
+    font-size: 1.1rem;
+    font-weight: 700;
+    color: #f1f5f9;
+    margin-bottom: 8px;
+}
+.welcome-grid {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 8px;
+    margin-top: 12px;
+}
+.welcome-item {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    background: #0f1117;
+    border: 1px solid #1e2536;
+    border-radius: 8px;
+    padding: 8px 12px;
+    font-size: 0.78rem;
+    color: #94a3b8;
+}
+
+/* ── Primary upload button ── */
+[data-testid="stSidebar"] .stButton > button[kind="primary"] {
+    background: linear-gradient(135deg, #3b82f6, #2563eb) !important;
+    border: none !important;
+    color: #fff !important;
+    font-weight: 600 !important;
+}
+[data-testid="stSidebar"] .stButton > button[kind="primary"]:hover {
+    background: linear-gradient(135deg, #60a5fa, #3b82f6) !important;
+    box-shadow: 0 4px 12px rgba(59,130,246,0.3) !important;
+}
+
+/* ── Expander ── */
+[data-testid="stExpander"] {
+    background: #0f1117 !important;
+    border: 1px solid #1e2536 !important;
+    border-radius: 8px !important;
+    margin-bottom: 4px !important;
+}
+[data-testid="stExpander"] summary {
+    color: #94a3b8 !important;
+    font-size: 0.82rem !important;
+    font-weight: 500 !important;
+}
+
+/* ── Spinner ── */
+[data-testid="stSpinner"] > div {
+    border-top-color: #3b82f6 !important;
+}
+
+/* ── Scrollbar ── */
+::-webkit-scrollbar { width: 6px; }
+::-webkit-scrollbar-track { background: #0f1117; }
+::-webkit-scrollbar-thumb { background: #1e2d45; border-radius: 3px; }
+::-webkit-scrollbar-thumb:hover { background: #2d4270; }
+</style>
+""", unsafe_allow_html=True)
+
+
+# ── Helpers ───────────────────────────────────────────────────────────────────
 def _fetch_documents() -> list[dict]:
-    """Return the list of indexed documents from the backend, or [] on error."""
     try:
         r = httpx.get(f"{API_URL.rstrip('/')}/documents", timeout=8)
         r.raise_for_status()
@@ -77,168 +425,122 @@ def _fetch_documents() -> list[dict]:
 
 
 def _upload_files(uploaded_files) -> dict:
-    """POST files to /upload and return the response JSON."""
     files_payload = [
         ("files", (f.name, io.BytesIO(f.read()), f.type or "application/octet-stream"))
         for f in uploaded_files
     ]
-    r = httpx.post(
-        f"{API_URL.rstrip('/')}/upload",
-        files=files_payload,
-        timeout=300,   # indexing large files can take a while
-    )
+    r = httpx.post(f"{API_URL.rstrip('/')}/upload", files=files_payload, timeout=300)
     r.raise_for_status()
     return r.json()
 
 
-# ── Page setup ───────────────────────────────────────────────────────────────
-st.set_page_config(    page_title="KT Assistant",
-    page_icon="🤖",
-    layout="wide",
-    initial_sidebar_state="expanded",
-)
-
-# ── CSS ──────────────────────────────────────────────────────────────────────
-st.markdown("""
-<style>
-/* Normalise heading sizes inside chat bubbles */
-[data-testid="stChatMessageContent"] h1,
-[data-testid="stChatMessageContent"] h2,
-[data-testid="stChatMessageContent"] h3,
-[data-testid="stChatMessageContent"] h4 {
-    font-size: 1rem !important;
-    font-weight: 600 !important;
-    margin-top: 0.5rem !important;
-    margin-bottom: 0.2rem !important;
-}
-[data-testid="stChatMessageContent"] p,
-[data-testid="stChatMessageContent"] li {
-    font-size: 0.93rem;
-    line-height: 1.65;
-}
-/* Citation pill */
-.citation-pill {
-    display: inline-block;
-    background: #f0f4ff;
-    border: 1px solid #c9d8ff;
-    border-radius: 12px;
-    padding: 2px 10px;
-    font-size: 0.78rem;
-    color: #3a5bd9;
-    margin: 2px 3px 2px 0;
-}
-/* Tool badge */
-.tool-badge {
-    display: inline-block;
-    border-radius: 4px;
-    padding: 1px 8px;
-    font-size: 0.76rem;
-    font-weight: 600;
-    color: #fff;
-    margin-right: 4px;
-}
-/* Thin separator above citations */
-.citation-block {
-    border-top: 1px solid #e9ecef;
-    margin-top: 8px;
-    padding-top: 6px;
-}
-</style>
-""", unsafe_allow_html=True)
+def _check_backend() -> bool:
+    try:
+        r = httpx.get(f"{API_URL.rstrip('/')}/health", timeout=3)
+        return r.status_code == 200
+    except Exception:
+        return False
 
 
-# ── Session state bootstrap ──────────────────────────────────────────────────
+# ── Session state ─────────────────────────────────────────────────────────────
 if "session_id" not in st.session_state:
-    # Each browser tab gets its own UUID — gives true per-tab conversation memory
     st.session_state.session_id = str(uuid.uuid4())
 
 if "messages" not in st.session_state:
-    st.session_state.messages = [
-        {
-            "role": "assistant",
-            "content": (
-                "Hi! I'm your **Knowledge Transfer Assistant**. Ask me anything:\n\n"
-                "- 📄 Questions about company documents (PDFs, Word, Excel)\n"
-                "- 🗄️ Database queries (orders, customers, employees...)\n"
-                "- 🌐 Live web facts (news, prices, weather)\n"
-                "- 🧮 Calculations and number crunching\n"
-                "- 📊 Data visualisation (charts from your data)\n\n"
-                "I remember the full conversation — feel free to ask follow-up questions!"
-            ),
-            "datasource": None,
-            "tools_used": [],
-            "citations": [],
-            "chart_data": None,
-        }
-    ]
+    st.session_state.messages = []
+
+if "backend_ok" not in st.session_state:
+    st.session_state.backend_ok = _check_backend()
 
 
-# ── Helper: render a single assistant message ────────────────────────────────
+# ── Render assistant message ──────────────────────────────────────────────────
 def _render_assistant_message(msg: dict) -> None:
-    """Render answer text, tool badge, chart, and citations for one assistant turn."""
     st.markdown(msg["content"])
 
-    datasource  = msg.get("datasource")
-    tools_used  = msg.get("tools_used") or []
-    citations   = msg.get("citations") or []
-    chart_data  = msg.get("chart_data")
+    datasource = msg.get("datasource")
+    tools_used = msg.get("tools_used") or []
+    citations  = msg.get("citations") or []
+    chart_data = msg.get("chart_data")
 
-    # ── Inline chart ──────────────────────────────────────────────────────
+    # Chart
     if chart_data:
         try:
             import plotly.graph_objects as go
             fig = go.Figure(chart_data)
+            fig.update_layout(
+                paper_bgcolor="rgba(0,0,0,0)",
+                plot_bgcolor="#0f1117",
+                font_color="#cbd5e1",
+            )
             st.plotly_chart(fig, use_container_width=True, key=f"chart_{id(msg)}")
         except Exception as exc:
             st.warning(f"Could not render chart: {exc}")
 
-    # ── Tool badge + tools list ───────────────────────────────────────────
+    # Meta row — badge + tool chips
     if datasource:
         cfg   = ROUTE_CONFIG.get(datasource, {"icon": "🔧", "label": datasource, "color": "#666"})
-        color = cfg["color"]
-        label = cfg["label"]
-        icon  = cfg["icon"]
-
-        badge_html = (
-            f'<span class="tool-badge" style="background:{color}">'
-            f'{icon} {label}</span>'
+        badge = (
+            f'<span class="tool-badge" style="background:{cfg["color"]}">'
+            f'{cfg["icon"]} {cfg["label"]}</span>'
         )
-        if tools_used:
-            tools_str = " · ".join(f"`{t}`" for t in tools_used)
-            st.markdown(
-                badge_html + f'<span style="font-size:0.78rem;color:#555"> {tools_str}</span>',
-                unsafe_allow_html=True,
-            )
-        else:
-            st.markdown(badge_html, unsafe_allow_html=True)
+        chips = "".join(
+            f'<span class="tool-name-chip">{t}</span>'
+            for t in tools_used
+        )
+        st.markdown(
+            f'<div class="meta-row">{badge}{chips}</div>',
+            unsafe_allow_html=True,
+        )
 
-    # ── Citations ─────────────────────────────────────────────────────────
+    # Citations
     if citations:
-        pills_html = "".join(
+        pills = "".join(
             f'<span class="citation-pill" title="{c.get("detail","")}">'
             f'📎 {c["source"]}</span>'
             for c in citations
         )
         st.markdown(
             f'<div class="citation-block">'
-            f'<span style="font-size:0.76rem;color:#888;font-weight:600">SOURCES </span>'
-            f'{pills_html}</div>',
+            f'<span class="citation-label">Sources</span>{pills}</div>',
             unsafe_allow_html=True,
         )
 
 
-# ── Sidebar ──────────────────────────────────────────────────────────────────
+# ── Sidebar ───────────────────────────────────────────────────────────────────
 with st.sidebar:
-    st.title("🤖 KT Assistant")
-    st.caption(f"Session `{st.session_state.session_id[:8]}…`")
+    # Brand
+    st.markdown("""
+    <div style="padding: 8px 0 16px 0;">
+        <div style="font-size:1.1rem;font-weight:700;color:#f1f5f9;letter-spacing:-0.3px;">
+            🧠 DataDialogue
+        </div>
+        <div style="font-size:0.72rem;color:#475569;margin-top:2px;">
+            Knowledge Transfer Assistant
+        </div>
+    </div>
+    """, unsafe_allow_html=True)
+
+    # Backend status
+    status_color = "#22c55e" if st.session_state.backend_ok else "#ef4444"
+    status_text  = "Backend connected" if st.session_state.backend_ok else "Backend offline"
+    st.markdown(
+        f'<div style="display:flex;align-items:center;gap:6px;padding:6px 10px;'
+        f'background:#0f1117;border:1px solid #1e2536;border-radius:8px;margin-bottom:12px;">'
+        f'<div style="width:7px;height:7px;background:{status_color};border-radius:50%;"></div>'
+        f'<span style="font-size:0.72rem;color:#64748b;">{status_text}</span>'
+        f'<span style="font-size:0.68rem;color:#334155;margin-left:auto;">'
+        f'{st.session_state.session_id[:8]}…</span></div>',
+        unsafe_allow_html=True,
+    )
+
     st.divider()
 
-    # ── Document upload ───────────────────────────────────────────────────
-    st.markdown("### 📂 Upload Documents")
-    st.caption("PDF, DOCX, XLSX, CSV, TXT — dropped into `data/` and indexed automatically.")
+    # Upload
+    st.markdown('<div class="sidebar-section">Upload Documents</div>', unsafe_allow_html=True)
+    st.caption("PDF · DOCX · XLSX · CSV · TXT")
 
     uploaded = st.file_uploader(
-        label="Choose files",
+        label="files",
         type=["pdf", "docx", "doc", "xlsx", "xls", "csv", "txt"],
         accept_multiple_files=True,
         label_visibility="collapsed",
@@ -246,84 +548,73 @@ with st.sidebar:
 
     if uploaded:
         if st.button("⬆️ Upload & Index", type="primary", use_container_width=True):
-            with st.spinner("Uploading and building index… this may take a minute."):
+            with st.spinner("Indexing…"):
                 try:
-                    result = _upload_files(uploaded)
+                    result   = _upload_files(uploaded)
                     saved    = result.get("saved", [])
                     rejected = result.get("rejected", [])
-                    indexed  = result.get("indexed", [])
-
                     if saved:
-                        st.success(
-                            f"✅ {len(saved)} file(s) uploaded and indexed:\n"
-                            + "\n".join(f"• {f}" for f in saved)
-                        )
+                        st.success(f"✅ {len(saved)} file(s) indexed")
                     if rejected:
-                        st.warning(
-                            f"⚠️ {len(rejected)} file(s) skipped (unsupported format):\n"
-                            + "\n".join(f"• {f}" for f in rejected)
-                        )
-                    # Force the document list to refresh
+                        st.warning(f"⚠️ {len(rejected)} file(s) skipped")
                     st.session_state.pop("docs_cache", None)
-
                 except httpx.ConnectError:
-                    st.error("Cannot reach the backend. Is FastAPI running?")
+                    st.error("Backend offline")
                 except Exception as exc:
                     st.error(f"Upload failed: {exc}")
 
     st.divider()
 
-    # ── Indexed documents list ────────────────────────────────────────────
-    st.markdown("### 📋 Indexed Documents")
+    # Documents
+    st.markdown('<div class="sidebar-section">Indexed Documents</div>', unsafe_allow_html=True)
 
-    # Cache the doc list in session state so it doesn't re-fetch on every keystroke
     if "docs_cache" not in st.session_state:
         st.session_state.docs_cache = _fetch_documents()
 
     docs = st.session_state.docs_cache
-
     if docs:
+        FILE_ICONS = {"PDF": "📄", "DOCX": "📝", "DOC": "📝",
+                      "XLSX": "📊", "XLS": "📊", "CSV": "📊", "TXT": "📃"}
         for doc in docs:
-            icon = {"PDF": "📄", "DOCX": "📝", "DOC": "📝",
-                    "XLSX": "📊", "XLS": "📊", "CSV": "📊", "TXT": "📃"}.get(doc["type"], "📎")
+            icon = FILE_ICONS.get(doc["type"], "📎")
             st.markdown(
-                f"{icon} **{doc['name']}** "
-                f"<span style='color:#888;font-size:0.78rem'>{doc['size_kb']} KB</span>",
+                f'<div class="doc-item">'
+                f'<span>{icon}</span>'
+                f'<span class="doc-name">{doc["name"]}</span>'
+                f'<span class="doc-size">{doc["size_kb"]} KB</span>'
+                f'</div>',
                 unsafe_allow_html=True,
             )
     else:
-        st.caption("No documents indexed yet. Upload files above to get started.")
+        st.caption("No documents yet.")
 
-    if st.button("🔄 Refresh list", use_container_width=True):
+    if st.button("🔄 Refresh", use_container_width=True):
         st.session_state.docs_cache = _fetch_documents()
         st.rerun()
 
     st.divider()
 
-    # ── Session controls ──────────────────────────────────────────────────
-    st.markdown("### 💬 Session")
+    # Session controls
+    st.markdown('<div class="sidebar-section">Session</div>', unsafe_allow_html=True)
     col1, col2 = st.columns(2)
     with col1:
-        if st.button("🗑️ Clear chat", use_container_width=True):
+        if st.button("🗑️ Clear", use_container_width=True):
             st.session_state.messages = []
             try:
-                httpx.delete(
-                    f"{API_URL}/sessions/{st.session_state.session_id}/history",
-                    timeout=10,
-                )
+                httpx.delete(f"{API_URL}/sessions/{st.session_state.session_id}/history", timeout=10)
             except Exception:
                 pass
             st.rerun()
     with col2:
-        if st.button("🆕 New session", use_container_width=True):
+        if st.button("🆕 New", use_container_width=True):
             st.session_state.session_id = str(uuid.uuid4())
             st.session_state.messages   = []
             st.rerun()
 
     st.divider()
 
-    # ── Sample questions ──────────────────────────────────────────────────
-    st.markdown("### 💡 Try a sample question")
+    # Sample questions
+    st.markdown('<div class="sidebar-section">Sample Questions</div>', unsafe_allow_html=True)
     for group, questions in SAMPLE_QUESTIONS.items():
         with st.expander(group, expanded=False):
             for q in questions:
@@ -331,31 +622,51 @@ with st.sidebar:
                     st.session_state.pending_question = q
                     st.rerun()
 
-    st.divider()
-    st.markdown("**Backend**")
-    st.code(API_URL, language="text")
-    st.caption("Start: `uvicorn app:app --reload --port 8000`")
 
+# ── Main area ─────────────────────────────────────────────────────────────────
 
-# ── Main layout ──────────────────────────────────────────────────────────────
-st.title("CTE Knowledge Transfer Assistant 🤖")
-st.caption(
-    "Ask anything about company documents, databases, or the live web. "
-    "Charts, calculations, and source citations included."
-)
+# Header
+st.markdown("""
+<div class="app-header">
+    <span class="app-header-icon">🧠</span>
+    <div>
+        <div class="app-header-title">DataDialogue</div>
+        <div class="app-header-subtitle">
+            <span class="status-dot"></span>
+            Ask questions about your documents, database, or the live web
+        </div>
+    </div>
+</div>
+""", unsafe_allow_html=True)
 
-# Render existing conversation history
+# Welcome card (only when no messages)
+if not st.session_state.messages:
+    st.markdown("""
+    <div class="welcome-card">
+        <div class="welcome-title">What can I help you with?</div>
+        <div style="font-size:0.82rem;color:#64748b;">
+            I can search your documents, query the database, run calculations,
+            generate charts, or look up live web data.
+        </div>
+        <div class="welcome-grid">
+            <div class="welcome-item">📄 Company documents &amp; reports</div>
+            <div class="welcome-item">🗄️ Database queries &amp; analytics</div>
+            <div class="welcome-item">🌐 Live web facts &amp; prices</div>
+            <div class="welcome-item">📊 Charts &amp; calculations</div>
+        </div>
+    </div>
+    """, unsafe_allow_html=True)
+
+# Conversation history
 for msg in st.session_state.messages:
-    with st.chat_message(msg["role"]):
+    with st.chat_message(msg["role"], avatar="🧠" if msg["role"] == "assistant" else "👤"):
         if msg["role"] == "assistant":
             _render_assistant_message(msg)
         else:
             st.markdown(msg["content"])
 
-# ── Input handling ───────────────────────────────────────────────────────────
-# Always call st.chat_input on every render — Streamlit hides it permanently
-# if it is skipped even once (which happened when pending_question short-circuited the `or`).
-typed_input = st.chat_input("Ask a question…")
+# Input
+typed_input = st.chat_input("Ask anything…")
 prompt = st.session_state.pop("pending_question", None) or typed_input
 
 if not prompt:
@@ -365,14 +676,14 @@ prompt = prompt.strip()
 if not prompt:
     st.stop()
 
-# Show user message immediately
+# Show user message
 st.session_state.messages.append({"role": "user", "content": prompt})
-with st.chat_message("user"):
+with st.chat_message("user", avatar="👤"):
     st.markdown(prompt)
 
-# ── Call the FastAPI backend ─────────────────────────────────────────────────
-with st.chat_message("assistant"):
-    with st.spinner("Thinking…"):
+# Call backend
+with st.chat_message("assistant", avatar="🧠"):
+    with st.spinner(""):
         answer     = ""
         datasource = None
         tools_used = []
@@ -382,10 +693,7 @@ with st.chat_message("assistant"):
         try:
             response = httpx.post(
                 f"{API_URL.rstrip('/')}/ask",
-                json={
-                    "question":   prompt,
-                    "session_id": st.session_state.session_id,
-                },
+                json={"question": prompt, "session_id": st.session_state.session_id},
                 timeout=REQUEST_TIMEOUT,
             )
             response.raise_for_status()
@@ -395,23 +703,24 @@ with st.chat_message("assistant"):
             tools_used = payload.get("tools_used") or []
             citations  = payload.get("citations") or []
             chart_data = payload.get("chart_data")
+            st.session_state.backend_ok = True
 
         except httpx.ConnectError:
+            st.session_state.backend_ok = False
             answer = (
                 "⚠️ **Cannot reach the backend.**\n\n"
-                f"Make sure FastAPI is running:\n```\nuvicorn app:app --reload --port 8000\n```\n"
+                f"Make sure FastAPI is running:\n"
+                f"```\nuvicorn app:app --reload --port 8000\n```\n"
                 f"Expected at: `{API_URL}`"
             )
         except httpx.TimeoutException:
             answer = (
-                "⚠️ **Request timed out.** "
-                "The agent may still be processing — try asking again or "
-                "check the backend logs."
+                "⚠️ **Request timed out.**\n\n"
+                "The agent is still processing — try asking again."
             )
         except Exception as exc:
             answer = f"⚠️ **Unexpected error:** {exc}"
 
-    # Build the message dict so _render_assistant_message can use it
     assistant_msg = {
         "role":       "assistant",
         "content":    answer,
@@ -422,5 +731,4 @@ with st.chat_message("assistant"):
     }
     _render_assistant_message(assistant_msg)
 
-# Persist to session state so the message is re-rendered on the next rerun
 st.session_state.messages.append(assistant_msg)

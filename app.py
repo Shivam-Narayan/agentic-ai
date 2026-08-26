@@ -1,17 +1,18 @@
 """FastAPI backend for the KT Agent.
 
-Conversation memory is handled by LangGraph's SqliteSaver checkpointer.
+Conversation memory is handled by LangGraph's AsyncSqliteSaver checkpointer.
 Each session_id maps to a LangGraph thread — history is persisted in
 memory_store/conversations.db and survives server restarts.
 """
 
 import logging
+from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
 
 from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.responses import JSONResponse
-from langgraph.checkpoint.sqlite import SqliteSaver
+from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
 
 from src.agent.config import DATA_DIR, setup_logging
 from src.agent.rag import SUPPORTED_EXTENSIONS, _discover_documents, rebuild_index
@@ -22,21 +23,32 @@ setup_logging()
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
-# LangGraph SQLite checkpointer
+# LangGraph AsyncSqliteSaver checkpointer
 #
-# Persists the full message history for every session_id to a local SQLite
-# database. LangGraph reloads it automatically on the next request with the
-# same session_id — no manual history management needed.
+# Opened once at startup via FastAPI lifespan, shared across all requests.
+# Persists full message history per session_id to conversations.db.
 # ---------------------------------------------------------------------------
 
 _MEMORY_DIR = Path(__file__).parent / "memory_store"
 _MEMORY_DIR.mkdir(exist_ok=True)
 
-# SqliteSaver.from_conn_string returns a context manager.
-# We enter it once at module load time and keep it open for the
-# lifetime of the server process.
-_checkpointer_ctx = SqliteSaver.from_conn_string(str(_MEMORY_DIR / "conversations.db"))
-_checkpointer = _checkpointer_ctx.__enter__()
+# Module-level reference filled in by the lifespan handler
+_checkpointer = None
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Open the async SQLite checkpointer on startup, close on shutdown."""
+    global _checkpointer
+    async with AsyncSqliteSaver.from_conn_string(
+        str(_MEMORY_DIR / "conversations.db")
+    ) as cp:
+        _checkpointer = cp
+        logger.info("AsyncSqliteSaver opened: %s", _MEMORY_DIR / "conversations.db")
+        yield
+    _checkpointer = None
+    logger.info("AsyncSqliteSaver closed")
+
 
 app = FastAPI(
     title="KT Knowledge Transfer Assistant",
@@ -45,6 +57,7 @@ app = FastAPI(
         "Supports conversation memory via session_id."
     ),
     version="2.0.0",
+    lifespan=lifespan,
 )
 
 
@@ -122,25 +135,22 @@ async def ask_question(request: QuestionRequest) -> QuestionResponse:
 async def get_session_history(session_id: str) -> dict[str, Any]:
     """Return the conversation history for a session from the SQLite checkpointer."""
     try:
-        # Load the latest checkpoint for this thread
         config = {"configurable": {"thread_id": session_id}}
-        state = _checkpointer.get(config)
-        if state is None:
+        checkpoint_tuple = await _checkpointer.aget_tuple(config)
+        if checkpoint_tuple is None:
             return {"session_id": session_id, "turn_count": 0, "messages": []}
 
-        messages = state.get("channel_values", {}).get("messages", [])
-        # Convert LangChain message objects to plain dicts for JSON response
+        messages = checkpoint_tuple.checkpoint.get("channel_values", {}).get("messages", [])
         history = []
         for msg in messages:
-            if hasattr(msg, "type"):
-                role = "human" if msg.type == "human" else "ai"
+            if hasattr(msg, "type") and msg.type in ("human", "ai"):
                 content = msg.content if isinstance(msg.content, str) else str(msg.content)
-                history.append({"role": role, "content": content})
+                history.append({"role": msg.type, "content": content})
 
-        # Count only human+ai pairs (exclude system/tool messages)
         turns = sum(1 for m in history if m["role"] == "human")
         return {"session_id": session_id, "turn_count": turns, "messages": history}
-    except Exception:
+    except Exception as exc:
+        logger.warning("Could not get history for %s: %s", session_id, exc)
         return {"session_id": session_id, "turn_count": 0, "messages": []}
 
 
@@ -170,13 +180,20 @@ async def clear_session_history(session_id: str) -> dict[str, str]:
 @app.get("/sessions", tags=["memory"])
 async def list_sessions() -> dict[str, Any]:
     """List all sessions stored in the SQLite checkpointer."""
+    import sqlite3
+    db_path = _MEMORY_DIR / "conversations.db"
+    if not db_path.exists():
+        return {"sessions": []}
     try:
-        sessions = []
-        for config, *_ in _checkpointer.list({}):
-            tid = config.get("configurable", {}).get("thread_id", "unknown")
-            sessions.append({"session_id": tid})
-        return {"sessions": sessions}
-    except Exception:
+        con = sqlite3.connect(str(db_path))
+        # AsyncSqliteSaver stores thread_id as a direct column in checkpoints
+        rows = con.execute(
+            "SELECT DISTINCT thread_id FROM checkpoints ORDER BY thread_id"
+        ).fetchall()
+        con.close()
+        return {"sessions": [{"session_id": row[0]} for row in rows]}
+    except Exception as exc:
+        logger.warning("Could not list sessions: %s", exc)
         return {"sessions": []}
 
 
