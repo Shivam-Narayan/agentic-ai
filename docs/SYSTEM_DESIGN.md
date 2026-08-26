@@ -24,35 +24,50 @@ rag.py  (document layer)                                          │
  ├── get_vector_index()      → loads from indexing_data/           │
  └── retrieve_documents()   → returns List[Document]              │
                                                                    │
-tools.py  (LangChain tools)                                       │
+tools.py  (LangChain tools — 6 local tools)                       │
  ├── search_company_documents  → calls rag.retrieve_documents()   │
- └── search_web                → calls chains.get_web_search_tool()│
+ ├── summarise_document        → reads full file via LlamaIndex   │
+ ├── extract_structured_data   → RAG + field template             │
+ ├── search_web                → calls chains.get_web_search_tool()│
+ ├── calculate                 → safe AST evaluator               │
+ └── generate_chart            → Plotly JSON figure               │
                                                                    │
-mcp_client.py  (database tools)                                   │
+mcp_client.py  (database tools — 3 MCP tools)                    │
  ├── list_database_tables                                         │
  ├── describe_database_table                                       │
  └── query_company_database    (SELECT only)                      │
                                                                    │
 workflow.py  (LangGraph agent)  ◄── uses all of the above        │
+ ├── SYSTEM_PROMPT                                                │
  ├── AgentState                                                   │
  ├── build_graph(tools)                                           │
- ├── agent_node()                                                 │
+ ├── agent_node()          (injects SystemMessage each turn)      │
  ├── should_continue()                                            │
+ ├── _extract_citations()                                         │
+ ├── _extract_chart()                                             │
  ├── parse_result()                                               │
- └── aask(question)  ← FastAPI calls this                        │
+ ├── LOCAL_TOOLS = [6 tools]                                      │
+ └── aask(question, history)  ← FastAPI calls this               │
                                                                    │
 app.py  (FastAPI)                                                  │
- └── POST /ask  →  aask()  →  QuestionResponse                   │
+ ├── POST /ask          →  aask(question, history)                │
+ ├── GET  /health                                                 │
+ ├── POST /upload        →  rebuild_index()                       │
+ ├── GET  /documents                                              │
+ ├── GET  /sessions/{id}/history                                  │
+ └── DELETE /sessions/{id}/history                               │
                                                                    │
 streamlit_app.py  (UI)                                            │
- └── st.chat_input  →  httpx.post(/ask)  →  render answer        │
+ ├── st.chat_input  →  httpx.post(/ask, session_id)              │
+ ├── _render_assistant_message()  (badges, charts, citations)     │
+ └── sidebar: upload, indexed docs, session controls, samples    │
 ```
 
 ---
 
 ## `config.py` — Environment and Paths
 
-**Purpose:** Single source of truth for all file paths and environment validation. Every other module imports paths from here rather than computing them independently.
+**Purpose:** Single source of truth for all file paths and environment validation.
 
 ```python
 ROOT_DIR  = Path(__file__).resolve().parent.parent.parent
@@ -66,7 +81,7 @@ Called at startup to fail fast if required keys are missing:
 - At least one of: `GROQ_API_KEY`, `GOOGLE_API_KEY`, `COHERE_API_KEY`
 - `TAVILY_API_KEY` for the web search tool
 
-Optional keys:
+Optional:
 - `LLM_PROVIDER` — force a specific provider (`groq`, `google`, `cohere`)
 - `GOOGLE_DRIVE_FOLDER_ID` — enables Google Drive ingestion
 - `KT_API_URL` — Streamlit uses this to reach FastAPI (default: `http://localhost:8000`)
@@ -75,7 +90,7 @@ Optional keys:
 
 ## `chains.py` — Dynamic LLM Factory
 
-**Purpose:** Selects and instantiates the LLM and web search tool based on available API keys. The rest of the codebase never references a specific LLM provider — it only calls `get_llm()`.
+**Purpose:** Selects and instantiates the LLM and web search tool based on available API keys. The rest of the codebase never references a specific LLM provider.
 
 **LLM selection logic:**
 
@@ -85,36 +100,22 @@ def get_llm() -> BaseChatModel:
     provider = os.getenv("LLM_PROVIDER", "").lower()
 
     if provider == "groq" or (not provider and GROQ_API_KEY):
-        return ChatGroq(model="openai/gpt-oss-120b", api_key=GROQ_API_KEY)
+        return ChatGroq(model="openai/gpt-oss-120b", temperature=0)
 
     if provider == "google" or (not provider and GOOGLE_API_KEY):
-        return ChatGoogleGenerativeAI(model="gemini-1.5-flash", google_api_key=GOOGLE_API_KEY)
+        return ChatGoogleGenerativeAI(model="gemini-1.5-flash", temperature=0)
 
     if provider == "cohere" or (not provider and COHERE_API_KEY):
-        return ChatCohere(model="command-r-plus", cohere_api_key=COHERE_API_KEY)
-
-    raise ValueError("No LLM API key found in .env")
+        return ChatCohere(model="command-r-plus", temperature=0)
 ```
 
-Priority when multiple keys are present: **Groq → Google → Cohere**
-
-**Why `@lru_cache`?** The LLM client is an expensive object (authenticates on creation, sets up HTTP connections). Caching it means it is created once when the first request arrives and reused for every subsequent request.
-
-**Web search tool:**
-
-```python
-@lru_cache(maxsize=1)
-def get_web_search_tool() -> TavilySearchResults:
-    return TavilySearchResults(max_results=3, tavily_api_key=TAVILY_API_KEY)
-```
-
-Returns top 3 results per query. Also cached.
+Priority: **Groq → Google → Cohere**. `@lru_cache` means the client is created once and reused.
 
 ---
 
 ## `rag.py` — Document Ingestion and Retrieval
 
-**Purpose:** Manages the full lifecycle of document-based knowledge — from raw files in `data/` to searchable vector chunks at query time.
+**Purpose:** Manages the full lifecycle of document-based knowledge.
 
 ### Supported file formats
 
@@ -122,49 +123,23 @@ Returns top 3 results per query. Also cached.
 SUPPORTED_EXTENSIONS = {".pdf", ".docx", ".doc", ".xlsx", ".xls", ".csv", ".txt"}
 ```
 
-| Format | Parsed by |
-|---|---|
-| `.pdf` | LlamaIndex built-in (pypdf) |
-| `.docx`, `.doc` | LlamaIndex built-in (docx2txt) |
-| `.xlsx`, `.xls` | LlamaIndex + openpyxl |
-| `.csv` | LlamaIndex built-in (pandas) |
-| `.txt` | LlamaIndex built-in |
-
 ### Auto-discovery
 
-```python
-def _discover_documents(data_dir: Path = DATA_DIR) -> List[Path]:
-    return [
-        p for p in data_dir.iterdir()
-        if p.is_file() and p.suffix.lower() in SUPPORTED_EXTENSIONS
-    ]
-```
+`_discover_documents()` scans `data/` automatically — no code changes needed when adding files.
 
-When `build_index()` is called without explicit file paths (which is the normal case), it calls `_discover_documents()` to automatically find every supported file in `data/`. No code changes are needed when adding or removing files — just re-run the indexer.
-
-### Index building (`build_index`)
-
-Run once (or whenever files change):
+### Index building
 
 ```bash
 python -m src.agent.rag
 ```
 
-What happens:
-1. `_discover_documents()` scans `data/` and returns all supported file paths
-2. `SimpleDirectoryReader` loads and parses each file into text
-3. `SentenceSplitter(chunk_size=512, chunk_overlap=50)` splits text into overlapping chunks
-4. `HuggingFaceEmbedding(model_name="BAAI/bge-small-en-v1.5")` converts each chunk to a vector
-5. `VectorStoreIndex` stores all chunks and their vectors in memory
-6. `index.storage_context.persist(persist_dir=INDEX_DIR)` writes everything to `indexing_data/`
+1. Discovers files in `data/`
+2. Parses each file into text
+3. Splits into 512-token chunks (50 token overlap)
+4. Embeds with `BAAI/bge-small-en-v1.5` (local, no API key)
+5. Persists to `indexing_data/`
 
-**Embedding model choice:** `BAAI/bge-small-en-v1.5` is a small (33M parameter), high-quality English embedding model that runs entirely locally. No API key, no network call, no cost. The model is downloaded from HuggingFace on first use and cached locally.
-
-**Chunk settings explained:**
-- `chunk_size=512` — each chunk is at most 512 tokens (~380 words). Large enough to contain a full thought, small enough for precise retrieval.
-- `chunk_overlap=50` — consecutive chunks share 50 tokens so sentences at chunk boundaries are not lost.
-
-### Index loading (`get_vector_index`)
+### Index loading
 
 ```python
 @lru_cache(maxsize=1)
@@ -173,70 +148,59 @@ def get_vector_index():
     return load_index_from_storage(storage_context)
 ```
 
-`@lru_cache` means the index is loaded from disk exactly once per server process, then kept in memory. Every call to `retrieve_documents()` reuses the same in-memory index.
+Loaded from disk once per server process, then kept in memory.
 
-### Document retrieval (`retrieve_documents`)
+### Document retrieval
 
-```python
-def retrieve_documents(question: str) -> List[Document]:
-    nodes = get_vector_index().as_retriever().retrieve(question)
-    return [Document(page_content=node.node.text) for node in nodes]
-```
-
-The retriever embeds the question using the same `bge-small-en-v1.5` model and finds the top-k most similar chunks by cosine similarity. The results are converted from LlamaIndex `NodeWithScore` objects to LangChain `Document` objects (the format the `@tool` functions return to the agent).
+Embeds the query with the same model and finds top-k most similar chunks by cosine similarity. Results are converted from LlamaIndex `NodeWithScore` to LangChain `Document` objects.
 
 ---
 
-## `tools.py` — Local Agent Tools
+## `tools.py` — The 6 Local Tools
 
-**Purpose:** Wraps `rag.py` and Tavily into LangChain `@tool` functions that the LangGraph agent can call.
+### 1. `search_company_documents`
+
+Calls `retrieve_documents(query)` to get top 4 chunks from the vector store. Each chunk is prefixed with `[Source: filename]` so the citation extractor can pick it up. Text is capped at 700 characters per chunk.
+
+### 2. `summarise_document`
+
+Accepts a filename, loads the full file text via `SimpleDirectoryReader`, caps at 6000 characters, and returns it with a `[Full text of <filename>]` prefix. The LLM then synthesises the summary in its next reasoning step.
+
+### 3. `extract_structured_data`
+
+Retrieves relevant document chunks, then returns the context alongside a JSON field template (e.g. `{"project_name": "<extracted value or null>"}`). The LLM fills in the template values in its response.
+
+### 4. `search_web`
+
+Calls `TavilySearchResults(k=3)` and formats results with `[Source: url]` prefixes for citation extraction.
+
+### 5. `calculate`
+
+Uses Python's `ast` module to safely evaluate arithmetic expressions without `eval()`:
 
 ```python
-@tool
-def search_company_documents(query: str) -> str:
-    """Search the indexed company documents (PDFs, Word docs, Excel files, CSVs).
-    Use this for any question about internal company knowledge, projects, reports,
-    policies, or data stored in uploaded files."""
-    docs = retrieve_documents(query)
-    if not docs:
-        return "No relevant documents found."
-    return "\n\n---\n\n".join(doc.page_content for doc in docs)
-
-
-@tool
-def search_web(query: str) -> str:
-    """Search the live web for real-time information.
-    Use this for current events, prices, weather, or anything that changes over time."""
-    results = get_web_search_tool().invoke(query)
-    return str(results)
+_SAFE_OPERATORS = {ast.Add: operator.add, ast.Sub: operator.sub,
+                   ast.Mult: operator.mul, ast.Div: operator.truediv, ...}
 ```
 
-**Why docstrings matter:** The docstring is literally sent to the LLM as the tool description. It is the only thing the LLM reads to decide when to call this tool. A vague docstring leads to wrong tool selection. Keep docstrings precise and use concrete examples of when to use each tool.
+Only numeric constants and the defined operators are allowed — no function calls, no variable access. Returns `"expression = result"` format.
+
+### 6. `generate_chart`
+
+Accepts `data_json` (list of dicts or dict of lists), `chart_type` (`bar`, `line`, `pie`, `scatter`), and a `title`. Builds a Plotly `go.Figure` and returns `CHART_JSON::{figure_json}`. The `parse_result()` function detects this prefix and extracts the JSON for the UI to render.
 
 ---
 
 ## `mcp_client.py` — Database Tools
 
-**Purpose:** Exposes the company SQLite database as three LangChain tools wrapped in an `asynccontextmanager` that mirrors the Model Context Protocol (MCP) server interface.
+**Purpose:** Three LangChain tools wrapped in an MCP-compatible `asynccontextmanager`.
 
 ### The three tools
 
 ```python
-@tool
-def list_database_tables() -> str:
-    """List all tables in the company database.
-    Call this first when the user asks a database question, to discover what data exists."""
-
-@tool
-def describe_database_table(table_name: str) -> str:
-    """Get the column names and types for a database table.
-    Call this before writing a SQL query to understand the table schema."""
-
-@tool
-def query_company_database(sql_query: str) -> str:
-    """Run a read-only SQL SELECT query against the company database.
-    Only SELECT statements are allowed. Use list_database_tables and
-    describe_database_table first to understand the schema."""
+list_database_tables()              # discover available tables
+describe_database_table(table_name) # get column names and types
+query_company_database(sql_query)   # run a SELECT query
 ```
 
 ### Safety: SELECT-only enforcement
@@ -246,8 +210,6 @@ if not sql_query.strip().upper().startswith("SELECT"):
     return "Error: Only SELECT queries are allowed."
 ```
 
-This check runs before every query execution. The tool description also signals this constraint to the LLM, reducing the chance of the model even attempting a write.
-
 ### MCP-compatible interface
 
 ```python
@@ -256,23 +218,31 @@ async def mcp_server_context() -> AsyncGenerator[List[BaseTool], None]:
     yield [list_database_tables, describe_database_table, query_company_database]
 ```
 
-The `asynccontextmanager` pattern mirrors how a real MCP server connection works — you open a context, get a list of tools, use them, then the context closes. This design means the entire database layer can be replaced with a real MCP server (e.g., connecting to a Postgres database) by swapping only this function. `workflow.py` does not need to change at all.
+The entire database layer can be replaced with a real MCP server by swapping only this function. `workflow.py` does not change.
 
-### Typical agent interaction with the database
+### Typical agent interaction
 
-For a question like "How many open orders are there?", the LLM will:
-1. Call `list_database_tables()` → sees `["orders", "customers", "products"]`
-2. Call `describe_database_table("orders")` → sees `[("id", "INTEGER"), ("status", "TEXT"), ...]`
-3. Call `query_company_database("SELECT COUNT(*) FROM orders WHERE status = 'open'")` → gets the count
-4. Generate: "There are 47 open orders."
-
-This three-step pattern (discover → inspect → query) mirrors how a human analyst would approach an unknown database.
+For "How many open orders are there?", the LLM will:
+1. Call `list_database_tables()` → sees available tables
+2. Call `describe_database_table("orders")` → sees column names
+3. Call `query_company_database("SELECT COUNT(*) FROM orders WHERE status = 'open'")` → gets count
+4. Generate a natural language answer with the SQL shown in a code block
 
 ---
 
 ## `workflow.py` — The LangGraph Agent
 
-**Purpose:** The heart of the system. Defines the LangGraph `StateGraph`, assembles all tools, runs the ReAct loop, and parses the final result.
+**Purpose:** The heart of the system. Assembles all tools, runs the ReAct loop, and parses the final result.
+
+### System Prompt
+
+Injected as a `SystemMessage` at the start of every agent turn. Enforces:
+- Always cite sources (filenames, SQL queries, URLs)
+- Use `calculate` for all arithmetic — never compute in the LLM head
+- Proactively offer charts for tabular/numeric results
+- Use `extract_structured_data` for field extraction tasks
+- Use `summarise_document` for overview/summary requests
+- Leverage conversation history for follow-up questions
 
 ### State definition
 
@@ -281,129 +251,158 @@ class AgentState(TypedDict):
     messages: Annotated[list, add_messages]
 ```
 
-`messages` holds the full conversation history: `HumanMessage` → `AIMessage` (with tool_calls) → `ToolMessage` (with tool results) → `AIMessage` (final answer). The `add_messages` annotation means each node's output is **appended** to the list rather than replacing it, so nothing is lost between iterations.
+Holds the full message history: `SystemMessage` → `HumanMessage` (prior turns) → `AIMessage` (with tool_calls) → `ToolMessage` (results) → `AIMessage` (answer). The `add_messages` annotation appends rather than replaces.
 
-### Graph construction (`build_graph`)
+### Agent node
 
 ```python
-def build_graph(dynamic_tools: list):
-    tool_node = ToolNode(dynamic_tools)          # LangGraph built-in
-
-    def agent_node(state: AgentState):
-        llm_with_tools = get_llm().bind_tools(dynamic_tools)
-        response = llm_with_tools.invoke(state["messages"])
-        return {"messages": [response]}          # appended to state
-
-    builder = StateGraph(AgentState)
-    builder.add_node("agent", agent_node)
-    builder.add_node("tools", tool_node)
-    builder.add_edge(START, "agent")
-    builder.add_conditional_edges(
-        "agent",
-        should_continue,
-        {"tools": "tools", END: END}
-    )
-    builder.add_edge("tools", "agent")           # always loop back
-    return builder.compile()
+def agent_node(state: AgentState) -> dict:
+    llm = get_llm().bind_tools(dynamic_tools)
+    messages_with_system = [SystemMessage(content=SYSTEM_PROMPT)] + state["messages"]
+    response = llm.invoke(messages_with_system)
+    return {"messages": [response]}
 ```
 
-**`ToolNode`** is LangGraph's built-in prebuilt node. Given an `AIMessage` with `tool_calls`, it:
-1. Looks up each called tool by name in the registered tool list
-2. Executes the tool function with the provided arguments
-3. Creates a `ToolMessage` with the result for each call
-4. Appends all `ToolMessage` objects to state
-
-Multiple parallel tool calls are handled automatically by `ToolNode`.
+The system prompt is prepended on **every turn**, not just the first, so it applies to all follow-up questions.
 
 ### Routing (`should_continue`)
 
 ```python
 def should_continue(state: AgentState) -> str:
     last_message = state["messages"][-1]
-    if getattr(last_message, "tool_calls", None):
-        return "tools"
-    return END
+    return "tools" if getattr(last_message, "tool_calls", None) else END
 ```
-
-Simple binary decision: if the last LLM output contains `tool_calls`, run tools. Otherwise, the LLM is done and the graph ends.
 
 ### Entry point (`aask`)
 
 ```python
-async def aask(question: str) -> dict:
-    local_tools = [search_company_documents, search_web]
+LOCAL_TOOLS = [
+    search_company_documents, search_web,
+    summarise_document, extract_structured_data,
+    calculate, generate_chart,
+]
 
+async def aask(question: str, history: list | None = None) -> dict:
+    prior_messages = history or []
     async with mcp_server_context() as mcp_tools:
-        all_tools = local_tools + mcp_tools        # 5 tools total
+        all_tools = LOCAL_TOOLS + mcp_tools   # 9 tools total
         graph = build_graph(all_tools)
         result = await graph.ainvoke({
-            "messages": [HumanMessage(content=question)]
+            "messages": prior_messages + [HumanMessage(content=question)]
         })
-
     return parse_result(result)
 ```
 
-A new graph is built for each request. This is intentional — it ensures tools are always bound fresh and avoids any state leaking between requests.
+A new graph is built for each request to avoid state leaking between requests.
+
+### Citation extraction (`_extract_citations`)
+
+Walks all `ToolMessage` objects in the final state:
+
+| Tool | Citation extracted |
+|---|---|
+| `search_company_documents`, `search_web` | `[Source: value]` regex matches |
+| `query_company_database` | SQL from the preceding `AIMessage.tool_calls` |
+| `calculate` | Expression and result from content |
+| `summarise_document` | Filename from `[Full text of <file>]` prefix |
+| `extract_structured_data` | `[Source: value]` regex matches |
+| `list_database_tables`, `describe_database_table` | `"schema lookup via <tool_name>"` |
+
+### Chart extraction (`_extract_chart`)
+
+Looks for a `ToolMessage` from `generate_chart` whose content starts with `CHART_JSON::` and parses the Plotly figure JSON.
 
 ### Result parsing (`parse_result`)
 
-```python
-def parse_result(result: dict) -> dict:
-    messages = result["messages"]
-    tool_names = [m.name for m in messages if m.type == "tool"]
-    # maps tool names to datasource labels
-    # sets datasource = "multiple" if more than one unique source was used
-```
-
-Inspects the final message list for `ToolMessage` objects. Maps known tool names to their datasource label:
+Maps tool names to datasource labels:
 
 | Tool name | `datasource` |
 |---|---|
-| `search_company_documents` | `company_docs` |
+| `search_company_documents`, `summarise_document`, `extract_structured_data` | `company_docs` |
 | `search_web` | `web_search` |
-| `query_company_database` | `database` |
-| `list_database_tables` | `database` |
-| `describe_database_table` | `database` |
-| *(no tools called)* | `direct_llm` |
-| *(multiple different sources)* | `multiple` |
+| `query_company_database`, `list_database_tables`, `describe_database_table` | `database` |
+| `calculate` | `calculation` |
+| `generate_chart` | `chart` |
+| *(no tools)* | `direct_llm` |
+| *(multiple categories)* | `multiple` |
 
 ---
 
 ## `app.py` — FastAPI Backend
 
-**Purpose:** Thin HTTP wrapper around `aask()`. Handles request validation and error responses.
+**Purpose:** HTTP wrapper around `aask()` with in-memory session management.
+
+### Endpoints
 
 ```
 POST /ask
-  ← QuestionRequest(question: str)    # 1–2000 characters, validated by Pydantic
-  → QuestionResponse(
-        answer: str,
-        datasource: str,
-        tools_used: List[str]
-    )
+  ← QuestionRequest(question: str, session_id: str = "default")
+  → QuestionResponse(answer, datasource, tools_used, citations, chart_data)
 
-GET /health
+GET  /health
   → {"status": "ok"}
 
-GET /docs
-  → Swagger UI (auto-generated by FastAPI)
+GET  /docs
+  → Swagger UI
+
+POST /upload
+  ← multipart files
+  → rebuilds index, returns saved/rejected/indexed lists
+
+GET  /documents
+  → list of files in data/ with name, size_kb, type
+
+GET  /sessions/{session_id}/history
+  → {session_id, turn_count, messages}
+
+DELETE /sessions/{session_id}/history
+  → clears session
 ```
 
-The endpoint is fully async — it calls `await aask(question)` and does not block the event loop while the LangGraph agent is running.
+### Session memory
+
+```python
+_sessions: dict[str, list[dict]] = defaultdict(list)
+MAX_HISTORY_TURNS = 20
+```
+
+Each session stores plain dicts `{"role": "human"|"ai", "content": str}`. On each `/ask` request:
+1. `_get_lc_history(session_id)` reconstructs LangChain message objects
+2. Passed to `aask(question, history=history)`
+3. `_append_to_session()` stores the new exchange, trimming to 40 messages
 
 ---
 
 ## `streamlit_app.py` — Chat Frontend
 
-**Purpose:** A chat UI built with Streamlit that talks to the FastAPI backend over HTTP.
+**Purpose:** Chat UI with rich output rendering.
 
-Key implementation details:
+### Key features
 
-- **Session state:** `st.session_state.messages` holds the full chat history as a list of `{"role": ..., "content": ..., "datasource": ...}` dicts. History persists across interactions within a session.
-- **Rendering:** Each message is rendered with `st.chat_message(role)`. AI messages include a `st.caption()` showing which tool was used, colour-coded by datasource.
-- **API call:** Uses `httpx` with a 120-second timeout (LangGraph + LLM calls can take time on first run due to model loading).
-- **Sidebar:** Pre-built sample questions for each of the 4 answer paths — useful for demos and testing.
-- **API URL:** Reads `KT_API_URL` from the environment. Defaults to `http://localhost:8000`. Change this if FastAPI is running on a different host or port.
+- **Session ID:** Each browser tab gets a UUID (`st.session_state.session_id`). Sent with every `/ask` request so FastAPI maintains per-tab memory.
+- **Message rendering (`_render_assistant_message`):**
+  - Markdown answer text
+  - Inline Plotly chart if `chart_data` is present
+  - Coloured tool badge showing datasource and tool names used
+  - Citation pills showing source filenames/URLs with tooltip for detail
+- **Document upload:** Sidebar file uploader → `POST /upload` → auto-index. Document list fetched from `GET /documents` and cached in session state.
+- **Session controls:** "Clear chat" calls `DELETE /sessions/{id}/history`. "New session" generates a fresh UUID.
+- **Sample questions:** Organised by tool path — LLM, Documents, Database, Web, Calculator, Charts.
+- **Timeout:** 180 seconds (LLM + tool calls can be slow on first run due to model loading).
+
+### Datasource display config
+
+```python
+ROUTE_CONFIG = {
+    "direct_llm":   {"icon": "💬", "color": "#6c757d"},
+    "company_docs": {"icon": "📄", "color": "#0d6efd"},
+    "database":     {"icon": "🗄️", "color": "#198754"},
+    "web_search":   {"icon": "🌐", "color": "#fd7e14"},
+    "calculation":  {"icon": "🧮", "color": "#6f42c1"},
+    "chart":        {"icon": "📊", "color": "#20c997"},
+    "multiple":     {"icon": "🔀", "color": "#dc3545"},
+}
+```
 
 ---
 
@@ -411,95 +410,80 @@ Key implementation details:
 
 ```python
 class QuestionRequest(BaseModel):
-    question: str = Field(..., min_length=1, max_length=2000)
+    question:   str = Field(..., min_length=1, max_length=2000)
+    session_id: str = Field(default="default")
+
+class Citation(BaseModel):
+    source: str   # filename, table name, or URL
+    detail: str   # page number, SQL query, search snippet
 
 class QuestionResponse(BaseModel):
-    answer: str
-    datasource: str      # direct_llm | company_docs | database | web_search | multiple
-    tools_used: List[str]
+    answer:     str
+    datasource: str | None = None
+    tools_used: list[str]
+    citations:  list[Citation]
+    chart_data: dict | None     # Plotly figure JSON or null
 ```
-
-These models are shared between FastAPI (for HTTP validation) and the internal `parse_result()` function.
-
----
-
-## `ingest_drive.py` — Google Drive Ingestion (Optional)
-
-**Purpose:** Pulls documents from a Google Drive folder into the vector store. Useful for teams that store their knowledge base in Drive.
-
-**How it works:**
-1. Uses `llama_index.readers.google.GoogleDriveReader` (requires OAuth `credentials.json`)
-2. Downloads all documents from the folder specified by `GOOGLE_DRIVE_FOLDER_ID` in `.env`
-3. Calls `build_index(extra_documents=drive_docs)` to merge Drive docs with local `data/` files
-
-**To use:**
-1. Set `GOOGLE_DRIVE_FOLDER_ID=your_folder_id` in `.env`
-2. Place your OAuth `credentials.json` in the project root
-3. Run: `python -m src.agent.ingest_drive`
-
-A browser window will open for OAuth authorisation on first run.
 
 ---
 
 ## Data Flow: End to End
 
-Here is the complete trace of a document question through every layer of the system:
+Complete trace of a document question:
 
 ```
 User types: "What does the KT document say about the database schema?"
 │
 ├─ Streamlit: appends to st.session_state.messages
-│             calls httpx.post("http://localhost:8000/ask",
-│                              json={"question": "..."}, timeout=120)
+│             calls httpx.post("/ask",
+│                              json={"question": "...", "session_id": "abc123"},
+│                              timeout=180)
 │
 ├─ FastAPI (app.py):
-│   receives QuestionRequest
-│   calls await aask("What does the KT document say about the database schema?")
+│   validates QuestionRequest
+│   history = _get_lc_history("abc123")  → prior HumanMessage/AIMessage list
+│   calls await aask("...", history=history)
 │
 ├─ workflow.py aask():
-│   local_tools = [search_company_documents, search_web]
-│   opens mcp_server_context() → [list_database_tables,
-│                                  describe_database_table,
-│                                  query_company_database]
-│   all_tools = 5 tools total
+│   prior_messages + [HumanMessage("...")]
+│   async with mcp_server_context() → 3 DB tools
+│   all_tools = 9 tools total
 │   graph = build_graph(all_tools)
-│   result = await graph.ainvoke({"messages": [HumanMessage(...)]})
+│   result = await graph.ainvoke({"messages": [...]})
 │
 ├─ Agent Node (LLM):
-│   receives HumanMessage + 5 tool schemas
+│   receives [SystemMessage, ...history, HumanMessage] + 9 tool schemas
 │   decides: call search_company_documents("database schema")
-│   returns AIMessage(tool_calls=[{name: "search_company_documents",
-│                                   args: {"query": "database schema"}}])
+│   returns AIMessage(tool_calls=[{name: "search_company_documents", ...}])
 │
-├─ should_continue(): tool_calls present → route to "tools"
+├─ should_continue() → "tools"
 │
 ├─ Tool Node:
 │   executes search_company_documents("database schema")
-│   → calls retrieve_documents("database schema")
-│   → calls get_vector_index().as_retriever().retrieve(...)
-│   → LlamaIndex embeds query → cosine similarity search → top 4 chunks
-│   → returns formatted text chunks
-│   appends ToolMessage(content="...chunks...", name="search_company_documents")
-│
-├─ should_continue(): back to Agent Node
+│   → retrieve_documents() → cosine similarity → top 4 chunks
+│   → each chunk prefixed with [Source: filename]
+│   appends ToolMessage(content="[Source: kt_doc.pdf]\n...", name="search_company_documents")
 │
 ├─ Agent Node (LLM):
-│   reads full message history including ToolMessage
-│   generates final answer synthesised from the chunks
-│   returns AIMessage(content="The KT document describes the database schema as...")
-│   no tool_calls → should_continue() → END
+│   reads full history including ToolMessage
+│   generates answer citing "kt_doc.pdf"
+│   no tool_calls → END
 │
 ├─ parse_result():
-│   finds ToolMessage with name="search_company_documents"
-│   returns {answer: "...", datasource: "company_docs",
-│             tools_used: ["search_company_documents"]}
+│   tools_used = ["search_company_documents"]
+│   datasource = "company_docs"
+│   _extract_citations() → [{"source": "kt_doc.pdf", "detail": ""}]
+│   _extract_chart() → None
 │
-├─ FastAPI: returns QuestionResponse JSON
+├─ _append_to_session("abc123", question, answer)
+│
+├─ FastAPI returns QuestionResponse JSON
 │
 └─ Streamlit:
-    appends answer to st.session_state.messages
-    renders with st.chat_message("assistant")
-    shows caption: "📄 Tool: search_company_documents"
+    renders answer markdown
+    renders tool badge "📄 Company documents · `search_company_documents`"
+    renders citation pill "📎 kt_doc.pdf"
+    appends to st.session_state.messages
 ```
 
 ---
@@ -510,9 +494,9 @@ User types: "What does the KT document say about the database schema?"
 |---|---|---|
 | Vector store is file-based | JSON files in `indexing_data/` | Replace with Postgres + pgvector |
 | Database is SQLite | `data/company.db` | Connect a real MCP Postgres server |
+| Session state is in-memory | `_sessions` dict in `app.py` | Redis-backed session store for multi-worker |
 | No authentication on `/ask` | Endpoint is open | Add API key header middleware or OAuth |
-| Single-user session state | Streamlit `st.session_state` is per-tab | Add Redis-backed session management |
-| No streaming responses | Full answer returned at once | Implement SSE via `graph.astream()` |
+| No streaming responses | Full answer returned at once | Implement SSE via `graph.astream()` (`KnowledgeTransferAgent.run()` is ready) |
 | Google Drive sync is manual | Run `ingest_drive.py` by hand | Add a scheduled job (cron / Celery beat) |
 | Index rebuild requires restart | `@lru_cache` holds stale index | Add cache invalidation on index rebuild |
-| No conversation memory | Each request starts fresh | Pass previous messages in `AgentState` |
+| Chart data not persisted | `chart_data` lost on page reload | Store Plotly JSON in session state |
