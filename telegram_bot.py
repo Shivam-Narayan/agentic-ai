@@ -7,12 +7,16 @@ Usage:
 """
 
 import logging
+import os
 import httpx
+from dotenv import load_dotenv
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 
+load_dotenv()
+
 # ── Configuration ──────────────────────────────────────────────────────────────
-TELEGRAM_BOT_TOKEN = "8612796937:AAHWjH6eHx_qgoBZ8Ahd2RWLXiwP5L96-vw"
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 DATADIALOGUE_API_URL = "http://localhost:8000/ask"
 
 logging.basicConfig(
@@ -35,76 +39,68 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     )
 
 
+async def query_backend(question: str, session_id: str) -> dict:
+    """Send question to DataDialogue API and return the parsed JSON result."""
+    async with httpx.AsyncClient(timeout=60.0) as client:
+        response = await client.post(
+            DATADIALOGUE_API_URL,
+            json={"question": question, "session_id": session_id}
+        )
+        response.raise_for_status()
+        return response.json()
+
+
+def format_reply(result: dict) -> str:
+    """Format the raw API result into a clean Telegram Markdown string."""
+    reply = result.get("answer", "Sorry, I could not get an answer.")
+    
+    # 1. Add Citations
+    citations = result.get("citations", [])
+    if citations:
+        sources = [c["source"] for c in citations if c.get("source")]
+        if sources:
+            unique_sources = list(dict.fromkeys(sources))
+            reply += f"\n\n📎 *Sources:* {', '.join(unique_sources)}"
+
+    # 2. Add Tool Badges
+    tools_used = result.get("tools_used", [])
+    if tools_used:
+        tool_icons = {
+            "search_company_documents": "📄",
+            "search_web": "🌐",
+            "calculate": "🧮",
+            "generate_chart": "📊",
+            "summarise_document": "📋",
+            "query_company_database": "🗄️",
+        }
+        icons = [tool_icons.get(t, "🔧") for t in tools_used[:2]]
+        if icons:
+            reply += f"\n{''.join(icons)}"
+            
+    return reply
+
+
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Forward every Telegram message to DataDialogue and reply with the answer."""
     user = update.effective_user
     question = update.message.text
-    # Use Telegram user ID as session ID for conversation memory
     session_id = f"telegram_{user.id}"
 
     logger.info("Message from %s (%s): %s", user.full_name, user.id, question)
-
-    # Show typing indicator while processing
-    await context.bot.send_chat_action(
-        chat_id=update.effective_chat.id,
-        action="typing"
-    )
+    await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
 
     try:
-        async with httpx.AsyncClient(timeout=60.0) as client:
-            response = await client.post(
-                DATADIALOGUE_API_URL,
-                json={
-                    "question": question,
-                    "session_id": session_id
-                }
-            )
-            response.raise_for_status()
-            result = response.json()
-
-        answer = result.get("answer", "Sorry, I could not get an answer.")
-        tools_used = result.get("tools_used", [])
-        citations = result.get("citations", [])
-
-        # Build the reply message
-        reply = answer
-
-        # Add citations if any
-        if citations:
-            sources = [c["source"] for c in citations if c.get("source")]
-            if sources:
-                unique_sources = list(dict.fromkeys(sources))  # deduplicate
-                reply += f"\n\n📎 *Sources:* {', '.join(unique_sources)}"
-
-        # Add tool badge
-        if tools_used:
-            tool_icons = {
-                "search_company_documents": "📄",
-                "search_web": "🌐",
-                "calculate": "🧮",
-                "generate_chart": "📊",
-                "summarise_document": "📋",
-                "query_company_database": "🗄️",
-            }
-            icons = [tool_icons.get(t, "🔧") for t in tools_used[:2]]
-            if icons:
-                reply += f"\n{''.join(icons)}"
-
-        await update.message.reply_text(reply, parse_mode="Markdown")
+        result = await query_backend(question, session_id)
+        reply_text = format_reply(result)
+        
+        await update.message.reply_text(reply_text, parse_mode="Markdown")
         logger.info("Replied to %s: datasource=%s", user.full_name, result.get("datasource"))
 
     except httpx.ConnectError:
-        await update.message.reply_text(
-            "⚠️ Cannot reach the DataDialogue backend.\n"
-            "Make sure it's running:\n"
-            "`python -m uvicorn app:app --host 0.0.0.0 --port 8000`",
-            parse_mode="Markdown"
-        )
+        await update.message.reply_text("⚠️ Cannot reach the DataDialogue backend. Make sure FastAPI is running.")
     except Exception as e:
         logger.exception("Error processing message")
-        await update.message.reply_text(
-            f"⚠️ Something went wrong: {str(e)[:200]}"
-        )
+        await update.message.reply_text(f"⚠️ Something went wrong: {str(e)[:200]}")
 
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
