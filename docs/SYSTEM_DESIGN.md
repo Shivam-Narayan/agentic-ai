@@ -14,9 +14,12 @@ For a higher-level view of the overall architecture and data flow, see [ARCHITEC
 .env
  └── config.py  ─────────────────────────────────────────────────────────┐
                                                                          │
-chains.py  (LLM factory)                                                │
+chains.py  (LLM factory + web search)                                   │
  ├── get_llm()             → ChatGroq / ChatGoogleGenerativeAI / ChatCohere
- └── get_web_search_tool() → TavilySearch (langchain-tavily)            │
+ ├── _make_serper_tool()   → GoogleSerperRun (if SERPER_API_KEY set)     │
+ ├── _make_ddg_tool()      → DuckDuckGoSearchRun (always available)      │
+ ├── _FallbackSearchTool   → BaseTool wrapper: tries primary → fallbacks │
+ └── get_web_search_tool() → Tavily (primary) → Serper → DuckDuckGo     │
                                                                          │
 rag.py  (document layer)                                                │
  ├── _discover_documents()   → scans data/ for supported files          │
@@ -58,6 +61,7 @@ schemas.py  (Pydantic models)                                           │
  └── OpenClawHealthResponse                           (OpenClaw)        │
                                                                          │
 app.py  (FastAPI)                                                        │
+ ├── GET  /stream           →  KnowledgeTransferAgent.run() SSE stream  │
  ├── POST /ask              →  aask(question, session_id, checkpointer) │
  ├── GET  /health                                                        │
  ├── POST /upload            →  rebuild_index()                         │
@@ -93,18 +97,21 @@ INDEX_DIR = ROOT_DIR / "indexing_data" # LlamaIndex persists the vector store he
 
 **Environment validation (`require_runtime_keys()`):**
 
-Called at startup to fail fast if required keys are missing:
-- At least one of: `GROQ_API_KEY`, `GOOGLE_API_KEY`, `COHERE_API_KEY`
-- `TAVILY_API_KEY` for the web search tool
+Called at startup. Raises a hard error only if no LLM key is present — web search keys are optional:
 
-Optional:
+- **Required (at least one):** `GROQ_API_KEY`, `GOOGLE_API_KEY`, `COHERE_API_KEY`
+- **Optional (web search):** `TAVILY_API_KEY`, `SERPER_API_KEY`
+  - If neither is set, logs a warning and falls back to DuckDuckGo automatically
+  - No crash — the app starts and works without any web search key
+
+Optional environment vars:
 - `LLM_PROVIDER` — force a specific provider (`groq`, `google`, `cohere`)
 - `KT_API_URL` — Streamlit uses this to reach FastAPI (default: `http://localhost:8000`)
 - `OPENCLAW_WEBHOOK_LOGGING` — enable verbose logging for webhook requests
 
 ---
 
-## `chains.py` — Dynamic LLM Factory
+## `chains.py` — LLM Factory + Web Search Fallback Chain
 
 **Purpose:** Selects and instantiates the LLM and web search tool based on available API keys.
 
@@ -116,16 +123,44 @@ def get_llm() -> BaseChatModel:
     provider = os.getenv("LLM_PROVIDER", "").lower()
 
     if provider == "groq" or (not provider and GROQ_API_KEY):
-        return ChatGroq(model="openai/gpt-oss-20b", temperature=0)
+        return ChatGroq(model="openai/gpt-oss-20b", temperature=0, streaming=True)
 
     if provider == "google" or (not provider and GOOGLE_API_KEY):
-        return ChatGoogleGenerativeAI(model="gemini-1.5-flash", temperature=0)
+        return ChatGoogleGenerativeAI(model="gemini-1.5-flash", temperature=0, streaming=True)
 
     if provider == "cohere" or (not provider and COHERE_API_KEY):
-        return ChatCohere(model="command-r-plus", temperature=0)
+        return ChatCohere(model="command-r-plus", temperature=0, streaming=True)
 ```
 
-Priority: **Groq → Google → Cohere**. `@lru_cache` means the client is created once per process.
+Priority: **Groq → Google → Cohere**. `@lru_cache` means the client is created once per process. All three providers have `streaming=True` for token-level streaming.
+
+**Web search fallback chain:**
+
+`get_web_search_tool()` returns a `_FallbackSearchTool` that wraps multiple providers and cascades at *query time* — not just at init time. This is critical because Tavily initialises successfully even when its quota is exhausted; the error only surfaces when a query is made.
+
+```python
+class _FallbackSearchTool(BaseTool):
+    def _run(self, query: str) -> str:
+        for tool in [primary] + fallbacks:
+            try:
+                result = tool.invoke(query)
+                # Tavily returns {"error": ...} dict on quota errors instead of raising
+                if isinstance(result, dict) and "error" in result:
+                    raise RuntimeError(result["error"])
+                return result
+            except Exception as exc:
+                logger.warning("Search tool '%s' failed: %s — trying next", tool.name, exc)
+        raise RuntimeError("All web search providers failed")
+```
+
+Provider selection priority:
+1. **Tavily** — `TAVILY_API_KEY` set — AI-optimised results, best quality
+2. **Serper** — `SERPER_API_KEY` set — real Google results, 2,500 free credits
+3. **DuckDuckGo** — no key needed — always available, appended unconditionally
+
+If only Tavily is configured → `_FallbackSearchTool(primary=Tavily, fallbacks=[DuckDuckGo])`
+If Tavily + Serper configured → `_FallbackSearchTool(primary=Tavily, fallbacks=[Serper, DuckDuckGo])`
+If no keys → `DuckDuckGoSearchRun` returned directly (no wrapper overhead)
 
 ---
 
@@ -167,7 +202,7 @@ Loads full file text (capped at 6000 chars) with `[Full text of <filename>]` pre
 Retrieves relevant chunks then returns context + JSON field template. LLM fills in the values.
 
 ### 4. `search_web`
-Calls `TavilySearch` and handles both response formats (dict with `results` key, or legacy plain list). Results formatted as `[Source: url]\ncontent`.
+Calls the `_FallbackSearchTool` which tries Tavily → Serper → DuckDuckGo in order. Handles Tavily's dict-format quota error (`{"error": ValueError(...)}`) by treating it as a failure and cascading. Results formatted as `[Source: url]\ncontent`.
 
 ### 5. `calculate`
 Uses Python's `ast` module — safe arithmetic without `eval()`. Only numeric constants and arithmetic operators allowed. Returns `"expression = result"` format.
@@ -236,7 +271,27 @@ Called fresh on every agent invocation — live date is always accurate.
 
 Runs inside `agent_node` after every LLM response. Blocks `search_company_documents` from running more than once per question, preventing rate limit exhaustion. If the LLM response is empty after blocking, re-invokes without tools to force a text answer.
 
-### `parse_result` — walks backwards for the answer
+### Streaming: `KnowledgeTransferAgent`
+
+`KnowledgeTransferAgent` wraps the same LangGraph graph as `aask()` but exposes it as an `AsyncIterator[dict]` suitable for SSE:
+
+```python
+class KnowledgeTransferAgent:
+    async def run(self, question: str, session_id: str = "default") -> AsyncIterator[dict]:
+        yield {"type": "status", "stage": "thinking"}
+        async for mode, chunk in graph.astream(..., stream_mode=["messages", "values"]):
+            if mode == "messages":
+                # filter to agent node, extract text chunks
+                yield {"type": "token", "text": chunk_text}
+            elif mode == "values":
+                # detect new tool calls
+                yield {"type": "tool", "name": tool_name}
+        yield {"type": "done", "payload": parse_result(final_values)}
+```
+
+FastAPI's `GET /stream` wraps this in a `StreamingResponse` with `media_type="text/event-stream"`. The Streamlit UI consumes it via `httpx.stream()`.
+
+`aask()` still exists and is used by Telegram and `POST /ask` — it calls `graph.ainvoke()` (blocking, single response).
 
 ```python
 for msg in reversed(messages):
@@ -316,6 +371,11 @@ The `AsyncSqliteSaver` is opened once at startup and shared by all endpoints. It
 ### Endpoints
 
 ```
+GET  /stream
+  ← query params: question, session_id
+  → text/event-stream (SSE)
+  → events: status | token | tool | done | error
+
 POST /ask
   ← QuestionRequest(question, session_id)
   → QuestionResponse(answer, datasource, tools_used, citations, chart_data)
@@ -523,8 +583,7 @@ Same flow applies for Streamlit (renders as badge + citation pill + markdown) an
 | Company database is SQLite | `data/company.db` | Connect a real MCP Postgres server |
 | Telegram bot requires FastAPI running | Direct HTTP call to localhost | Add retry/backoff logic; deploy both on same server |
 | No authentication on `/ask` or `/openclaw/webhook` | Endpoints are open | Add API key header middleware or OAuth |
-| No streaming responses | Full answer returned at once | Implement SSE via `graph.astream()` (`KnowledgeTransferAgent.run()` is ready) |
 | Charts not sent as images via Telegram | Chart JSON returned but not rendered | Use `plotly.io.to_image()` to export PNG and send via `send_photo` |
-
 | OpenClaw requires exact model availability | Groq model names change; caused 401 errors during setup | Use `GROQ_API_KEY` directly in DataDialogue rather than relying on OpenClaw's LLM |
 | Groq free tier rate limit | 30 RPM | Dedup guard + `parallel_tool_calls=False` keeps usage low; upgrade to paid tier for heavy use |
+| Tavily free tier quota | 1,000 searches/month | Add `SERPER_API_KEY` — system cascades automatically; DuckDuckGo always available as final fallback |

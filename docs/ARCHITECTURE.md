@@ -21,9 +21,9 @@ The key design principle: **there is no hard-coded routing**. The LLM itself rea
 │  │  :8501               │   │                 │   │                  │  │
 │  └──────────┬───────────┘   └────────┬────────┘   └────────┬─────────┘  │
 └─────────────│────────────────────────│────────────────────│─────────────┘
-              │ POST /ask              │ POST /ask           │ POST /openclaw
+              │ GET /stream (SSE)      │ POST /ask           │ POST /openclaw
               │ session_id=<uuid>      │ session_id=         │ /webhook
-              │                        │ telegram_<user_id>  │ session_id=
+              │ (token-by-token)       │ telegram_<user_id>  │ session_id=
               │                        │                     │ <oc_session>
               └────────────────────────┴─────────────────────┘
                                        │
@@ -32,6 +32,7 @@ The key design principle: **there is no hard-coded routing**. The LLM itself rea
 │                         FASTAPI BACKEND (app.py)                         │
 │                          http://localhost:8000                           │
 │                                                                          │
+│  GET  /stream             →  KnowledgeTransferAgent.run() SSE stream    │
 │  POST /ask                →  aask(question, session_id, checkpointer)   │
 │  GET  /health                                                            │
 │  POST /upload             →  rebuild_index()                            │
@@ -69,7 +70,7 @@ The key design principle: **there is no hard-coded routing**. The LLM itself rea
 │   └──────────────────────┘  └──────────────────────────────┘           │
 │   ┌──────────────────────┐  ┌──────────────────────────────┐           │
 │   │ search_web           │  │ calculate                    │           │
-│   │ (Tavily API)         │  │ generate_chart (Plotly)      │           │
+│   │ (Tavily→Serper→DDG)  │  │ generate_chart (Plotly)      │           │
 │   └──────────────────────┘  └──────────────────────────────┘           │
 │                                                                          │
 │   MCP tools (mcp_client.py):                                             │
@@ -81,10 +82,10 @@ The key design principle: **there is no hard-coded routing**. The LLM itself rea
                               │
               ┌───────────────┼────────────────┐
               ▼               ▼                ▼
-┌─────────────────┐  ┌──────────────┐  ┌───────────────┐
-│  VECTOR STORE   │  │  SQLITE DB   │  │  TAVILY API   │
-│  indexing_data/ │  │  data/*.db   │  │  (live web)   │
-│  (LlamaIndex)   │  │  (sqlite3)   │  └───────────────┘
+┌─────────────────┐  ┌──────────────┐  ┌───────────────────────────────┐
+│  VECTOR STORE   │  │  SQLITE DB   │  │  WEB SEARCH (fallback chain)  │
+│  indexing_data/ │  │  data/*.db   │  │  Tavily → Serper → DuckDuckGo │
+│  (LlamaIndex)   │  │  (sqlite3)   │  └───────────────────────────────┘
 └─────────────────┘  └──────────────┘
         ▲
         │ indexed from
@@ -106,17 +107,20 @@ The agent supports three independent access channels. Each channel maps to its o
 
 ```
 Browser → streamlit_app.py
-        → POST /ask {question, session_id=<uuid>}
-        → aask(question, session_id, checkpointer)
-        → LangGraph agent
-        → QuestionResponse (answer + datasource badge + citations + chart)
-        → render in chat UI
+        → GET /stream?question=...&session_id=<uuid>  (SSE)
+        → KnowledgeTransferAgent.run() async generator
+        → token events streamed word-by-word
+        → done event carries datasource + citations + chart_data
+        → render live in chat UI with blinking cursor
 ```
 
 - Session ID is a UUID generated once per browser tab
-- Charts render inline as interactive Plotly figures
+- Tokens render live with a `▌` blinking cursor as the LLM generates them
+- Tool-use indicator ("⚙ using search_web…") shown during tool calls
+- Charts render inline as interactive Plotly figures on the `done` event
 - Datasource badges (📄 🌐 🧮 📊 🗄️) shown under each answer
 - Citation pills show exact filename, URL, or SQL
+- Falls back to `POST /ask` (blocking) when SSE is not available
 
 ### Channel 2 — Telegram Bot (Direct)
 
@@ -154,9 +158,60 @@ WhatsApp / Discord / Slack
 
 ---
 
-## Conversation Memory
+## Real-Time Streaming
 
-Memory is now **persisted to disk** via `AsyncSqliteSaver` — sessions survive server restarts.
+`KnowledgeTransferAgent` in `workflow.py` is an async generator that yields SSE events as the LangGraph graph runs:
+
+```
+GET /stream?question=...&session_id=...
+        │
+        ▼
+KnowledgeTransferAgent.run(question, session_id)
+        │
+        ├── yield {"type": "status", "stage": "thinking"}
+        │
+        ├── graph.astream(state, stream_mode=["messages", "values"])
+        │       │
+        │       ├── "messages" mode → agent node only
+        │       │       └── yield {"type": "token", "text": "..."}  per chunk
+        │       │
+        │       └── "values" mode → tool call events
+        │               └── yield {"type": "tool", "name": "..."}
+        │
+        └── yield {"type": "done", "payload": {datasource, citations, ...}}
+```
+
+The Streamlit UI consumes this with `httpx.stream()`, accumulating tokens into a live `st.empty()` slot. The `POST /ask` endpoint still exists for Telegram and other non-streaming callers.
+
+---
+
+## Web Search Fallback Chain
+
+The `search_web` tool uses `_FallbackSearchTool` — a `BaseTool` wrapper that tries each provider in order and cascades on any runtime error including quota exhaustion:
+
+```
+search_web("query")
+        │
+        ▼ try TavilySearch
+        │   ✓ returns result → done
+        │   ✗ quota/error (including {"error": ...} dict response) →
+        ▼ try GoogleSerperRun
+        │   ✓ returns result → done
+        │   ✗ error →
+        ▼ DuckDuckGoSearchRun
+            ✓ always available (no key needed)
+```
+
+Provider selection at startup (logged on first request):
+```
+INFO | Web search primary: Tavily
+INFO | Web search fallback #1: Serper
+INFO | Web search fallback #2: DuckDuckGo
+```
+
+---
+
+## Conversation Memory (persistent)
 
 ```
 Request arrives with session_id
@@ -338,16 +393,16 @@ data/company.db                ← SQLite, read-only via SELECT
 
 | File | Layer | What it does |
 |---|---|---|
-| `streamlit_app.py` | UI | Chat UI — badges, citations, Plotly charts, file upload, session controls |
+| `streamlit_app.py` | UI | Chat UI — SSE streaming, badges, citations, Plotly charts, file upload, session controls |
 | `telegram_bot.py` | Channel | Telegram bot — polls for messages, calls `/ask`, replies with answer + citations |
-| `app.py` | API | FastAPI — `/ask`, `/health`, `/upload`, `/documents`, `/sessions/*`, `/openclaw/*` |
-| `workflow.py` | Agent | LangGraph graph, system prompt with live date, dedup guard, citations, parse_result |
-| `chains.py` | LLM | Factory: Groq / Gemini / Cohere; provides TavilySearch tool |
+| `app.py` | API | FastAPI — `/stream` (SSE), `/ask`, `/health`, `/upload`, `/documents`, `/sessions/*`, `/openclaw/*` |
+| `workflow.py` | Agent | LangGraph graph, `KnowledgeTransferAgent` async generator, system prompt, dedup guard, citations |
+| `chains.py` | LLM + Search | LLM factory (Groq/Gemini/Cohere); `_FallbackSearchTool` (Tavily→Serper→DuckDuckGo) |
 | `tools.py` | Tools | 6 local tools: search, summarise, extract, web search, calculate, chart |
 | `rag.py` | RAG | File discovery, DocxReader, LlamaIndex vector store build/load/retrieve |
 | `mcp_client.py` | DB | 3 database tools behind MCP-compatible asynccontextmanager |
 | `schemas.py` | Models | QuestionRequest/Response + OpenClawWebhookRequest/Response/HealthResponse |
-| `config.py` | Config | DATA_DIR, INDEX_DIR paths; env key validation |
+| `config.py` | Config | DATA_DIR, INDEX_DIR paths; LLM key validation; web search key warning |
 
 
 ---
@@ -376,13 +431,16 @@ Priority order: **Groq → Google → Cohere**. All providers use LangChain's `B
 | **LangChain** | `@tool` decorator, `ToolNode`, `BaseChatModel` interface |
 | **LlamaIndex** | Document ingestion, chunking, HuggingFace embeddings, vector store |
 | **llama-index-readers-file** | `DocxReader` for proper Word document text extraction |
-| **FastAPI** | Async HTTP API — `/ask`, `/upload`, `/openclaw/webhook`, session endpoints |
-| **Streamlit** | Web chat UI with badges, citations, Plotly charts, document upload |
+| **FastAPI** | Async HTTP API — `/stream` (SSE), `/ask`, `/upload`, `/openclaw/webhook`, session endpoints |
+| **Server-Sent Events (SSE)** | Real-time token streaming via `GET /stream` + `StreamingResponse` |
+| **Streamlit** | Web chat UI — SSE consumer, live token rendering, badges, charts, upload |
 | **python-telegram-bot** | Telegram channel — polls Telegram and calls FastAPI `/ask` |
-| **Groq** | Default LLM — `openai/gpt-oss-20b` |
-| **Google Gemini** | Alternative LLM — `gemini-1.5-flash` |
-| **Cohere** | Alternative LLM — `command-r-plus` |
-| **Tavily** | Real-time web search via `langchain-tavily` |
+| **Groq** | Default LLM — `openai/gpt-oss-20b`, streaming enabled |
+| **Google Gemini** | Alternative LLM — `gemini-1.5-flash`, streaming enabled |
+| **Cohere** | Alternative LLM — `command-r-plus`, streaming enabled |
+| **Tavily** | Web search primary — AI-optimised results via `langchain-tavily` |
+| **Serper** | Web search fallback #1 — real Google results, 2,500 free credits |
+| **DuckDuckGo** | Web search fallback #2 — always free, no key required |
 | **HuggingFace** | `BAAI/bge-small-en-v1.5` local embedding model |
 | **Plotly** | Interactive chart generation |
 | **SQLite** | Company database + conversation memory store |
