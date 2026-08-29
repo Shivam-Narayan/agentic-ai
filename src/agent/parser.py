@@ -175,3 +175,18 @@ def parse_result(result: dict) -> dict:
         "citations":   citations,
         "chart_data":  chart_data,
     }
+
+
+def serialize_parse_result(parsed: dict) -> dict:
+    """Shape parse_result() output for JSON / SSE clients.
+
+    Moved here from workflow.py so it lives next to parse_result()
+    and can be tested independently.
+    """
+    return {
+        "answer":     parsed.get("generation", ""),
+        "datasource": parsed.get("datasource"),
+        "tools_used": parsed.get("tools_used") or [],
+        "citations":  parsed.get("citations") or [],
+        "chart_data": parsed.get("chart_data"),
+    }
