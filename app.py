@@ -5,19 +5,20 @@ Each session_id maps to a LangGraph thread — history is persisted in
 memory_store/conversations.db and survives server restarts.
 """
 
+import json
 import logging
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
 
 from fastapi import FastAPI, File, HTTPException, UploadFile
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
 
 from src.agent.config import DATA_DIR, setup_logging
 from src.agent.rag import SUPPORTED_EXTENSIONS, _discover_documents, rebuild_index
 from src.agent.schemas import Citation, QuestionRequest, QuestionResponse
-from src.agent.workflow import aask
+from src.agent.workflow import KnowledgeTransferAgent, aask
 
 setup_logging()
 logger = logging.getLogger(__name__)
@@ -80,6 +81,43 @@ async def root() -> dict:
 async def health() -> dict[str, str]:
     """Liveness check."""
     return {"status": "ok"}
+
+
+@app.get("/stream", tags=["agent"])
+async def stream_question(question: str, session_id: str = "default"):
+    """Stream a question to the KT agent using Server-Sent Events.
+
+    Each SSE event is a JSON object with a `type` field:
+    - `{"type": "status", "stage": "thinking"}` — agent started
+    - `{"type": "token",  "text": "..."}` — incremental answer token
+    - `{"type": "tool",   "name": "..."}` — tool being invoked
+    - `{"type": "done",   "payload": {...}}` — final structured result
+    - `{"type": "error",  "detail": "..."}` — unrecoverable error
+    """
+    question = question.strip()
+    if not question:
+        raise HTTPException(status_code=400, detail="question must not be empty.")
+
+    logger.info("[stream][session=%s] question: %s", session_id, question)
+
+    agent = KnowledgeTransferAgent(checkpointer=_checkpointer)
+
+    async def event_generator():
+        try:
+            async for event in agent.run(question, session_id=session_id):
+                yield f"data: {json.dumps(event)}\n\n"
+        except Exception as exc:
+            logger.exception("[stream][session=%s] agent error", session_id)
+            yield f"data: {json.dumps({'type': 'error', 'detail': str(exc)})}\n\n"
+
+    return StreamingResponse(
+        event_generator(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",   # disable nginx buffering if behind a proxy
+        },
+    )
 
 
 @app.post("/ask", response_model=QuestionResponse, tags=["agent"])

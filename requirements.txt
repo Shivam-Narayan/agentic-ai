@@ -230,3 +230,7 @@ langchain-mcp-adapters
 openpyxl==3.1.5
 plotly==5.24.1
 python-telegram-bot==21.6
+duckduckgo-search==8.1.1
+ddgs==9.16.0
+google-search-results==2.4.2
+langchain-tavily==0.2.18

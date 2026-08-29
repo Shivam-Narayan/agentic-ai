@@ -29,10 +29,21 @@ def require_env_var(name: str) -> str:
 
 
 def require_runtime_keys() -> None:
-    require_env_var("TAVILY_API_KEY")
+    # LLM key — at least one must be present
     if not any([
         os.getenv("GOOGLE_API_KEY"),
         os.getenv("GROQ_API_KEY"),
         os.getenv("COHERE_API_KEY")
     ]):
         raise RuntimeError("At least one of GOOGLE_API_KEY, GROQ_API_KEY, or COHERE_API_KEY must be configured in .env")
+
+    # Web search key — warn if none present, but don't crash.
+    # get_web_search_tool() will fall back to DuckDuckGo (no key needed).
+    if not any([
+        os.getenv("TAVILY_API_KEY"),
+        os.getenv("SERPER_API_KEY"),
+    ]):
+        logger.warning(
+            "No web search API key found (TAVILY_API_KEY or SERPER_API_KEY). "
+            "Falling back to DuckDuckGo — live search results may be slower or rate-limited."
+        )

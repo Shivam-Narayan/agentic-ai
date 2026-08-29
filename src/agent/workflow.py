@@ -27,9 +27,9 @@ Key design decisions:
 """
 
 import logging
-from typing import Annotated
+from typing import Annotated, Any, AsyncIterator
 
-from langchain_core.messages import HumanMessage, SystemMessage
+from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 from langgraph.graph import END, START, StateGraph
 from langgraph.graph.message import add_messages
 from langgraph.prebuilt import ToolNode
@@ -73,6 +73,49 @@ def should_continue(state: AgentState) -> str:
 # Deduplication helper
 # ---------------------------------------------------------------------------
 
+def _chunk_text(content: Any) -> str:
+    """Normalize a streaming chunk's content into a plain string."""
+    if content is None:
+        return ""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts: list[str] = []
+        for block in content:
+            if isinstance(block, str):
+                parts.append(block)
+            elif isinstance(block, dict):
+                if block.get("type") == "text" or "text" in block:
+                    parts.append(str(block.get("text") or ""))
+            elif hasattr(block, "text"):
+                parts.append(str(getattr(block, "text") or ""))
+        return "".join(parts)
+    return str(content)
+
+
+def _has_tool_call_chunks(token: Any) -> bool:
+    chunks = getattr(token, "tool_call_chunks", None) or []
+    return bool(chunks)
+
+
+async def _astream_complete(llm, messages) -> AIMessage:
+    """Run the chat model in streaming mode and return the assembled message."""
+    assembled = None
+    async for chunk in llm.astream(messages):
+        assembled = chunk if assembled is None else assembled + chunk
+    if assembled is None:
+        return AIMessage(content="")
+    if isinstance(assembled, AIMessage) and not type(assembled).__name__.endswith("Chunk"):
+        return assembled
+    return AIMessage(
+        content=assembled.content,
+        tool_calls=list(getattr(assembled, "tool_calls", None) or []),
+        additional_kwargs=dict(getattr(assembled, "additional_kwargs", None) or {}),
+        response_metadata=dict(getattr(assembled, "response_metadata", None) or {}),
+        id=getattr(assembled, "id", None),
+    )
+
+
 def _get_previous_tool_calls(messages: list) -> set[str]:
     """
     Return a set of 'toolname::query' keys for every tool call already made.
@@ -101,11 +144,11 @@ def build_graph(dynamic_tools: list, checkpointer=None):
     """Compile and return the LangGraph agent graph."""
     tool_node = ToolNode(dynamic_tools)
 
-    def agent_node(state: AgentState) -> dict:
-        """Core LLM node with deduplication guard."""
+    async def agent_node(state: AgentState) -> dict:
+        """Core LLM node with deduplication guard. Uses astream so tokens can SSE."""
         llm = get_llm().bind_tools(dynamic_tools, parallel_tool_calls=False)
         messages_with_system = [SystemMessage(content=_build_system_prompt())] + state["messages"]
-        response = llm.invoke(messages_with_system)
+        response = await _astream_complete(llm, messages_with_system)
 
         # ── Deduplication guard ──────────────────────────────────────────
         if getattr(response, "tool_calls", None):
@@ -158,7 +201,7 @@ def build_graph(dynamic_tools: list, checkpointer=None):
                             )
                         )
                     ]
-                    response = bare_llm.invoke(direct_messages)
+                    response = await _astream_complete(bare_llm, direct_messages)
             elif filtered_calls != response.tool_calls:
                 response.tool_calls = filtered_calls
 
@@ -223,18 +266,102 @@ def ask(question: str, session_id: str = "default",
                             checkpointer=checkpointer, history=history))
 
 
-class KnowledgeTransferAgent:
-    """Streaming interface for the agent."""
-    def __init__(self) -> None:
-        pass
+def _serialize_parse_result(parsed: dict) -> dict[str, Any]:
+    """Shape parse_result() output for JSON / SSE clients."""
+    return {
+        "answer": parsed.get("generation", ""),
+        "datasource": parsed.get("datasource"),
+        "tools_used": parsed.get("tools_used") or [],
+        "citations": parsed.get("citations") or [],
+        "chart_data": parsed.get("chart_data"),
+    }
 
-    async def run(self, question: str, history: list | None = None):
-        """Stream graph steps for the given question."""
-        prior_messages = history or []
+
+class KnowledgeTransferAgent:
+    """Streaming interface for the agent (token + tool events for SSE)."""
+
+    def __init__(self, checkpointer=None) -> None:
+        self.checkpointer = checkpointer
+
+    async def run(
+        self,
+        question: str,
+        session_id: str = "default",
+        history: list | None = None,
+    ) -> AsyncIterator[dict[str, Any]]:
+        """Yield SSE-ready events while the graph runs.
+
+        Event types:
+          - ``token``: ``{"type": "token", "text": "..."}`` — answer delta
+          - ``tool``:  ``{"type": "tool", "name": "..."}`` — a tool was requested
+          - ``done``:  ``{"type": "done", "payload": {...}}`` — final answer + metadata
+          - ``error``: ``{"type": "error", "detail": "..."}``
+        """
+        yield {"type": "status", "stage": "thinking"}
+
+        checkpointer = self.checkpointer
         async with mcp_server_context() as mcp_tools:
             all_tools = LOCAL_TOOLS + mcp_tools
-            graph = build_graph(all_tools)
-            async for step in graph.astream(
-                {"messages": prior_messages + [HumanMessage(content=question)]}
-            ):
-                yield step
+            graph = build_graph(all_tools, checkpointer=checkpointer)
+
+            if checkpointer is not None:
+                initial_state = {"messages": [HumanMessage(content=question)]}
+            else:
+                prior_messages = history or []
+                initial_state = {
+                    "messages": prior_messages + [HumanMessage(content=question)]
+                }
+
+            config = {
+                "configurable": {"thread_id": session_id},
+                "recursion_limit": 8,
+            }
+
+            final_values: dict | None = None
+            emitted_tool_ids: set[str] = set()
+
+            try:
+                async for mode, data in graph.astream(
+                    initial_state,
+                    config=config,
+                    stream_mode=["messages", "values"],
+                ):
+                    if mode == "messages":
+                        token, metadata = data
+                        if metadata.get("langgraph_node") != "agent":
+                            continue
+                        if _has_tool_call_chunks(token):
+                            continue
+                        text = _chunk_text(getattr(token, "content", None))
+                        if text:
+                            yield {"type": "token", "text": text}
+
+                    elif mode == "values":
+                        final_values = data
+                        messages = (data or {}).get("messages") or []
+                        if not messages:
+                            continue
+                        last = messages[-1]
+                        if getattr(last, "tool_calls", None):
+                            for tc in last.tool_calls:
+                                name = tc.get("name") or ""
+                                tid = str(tc.get("id") or name)
+                                if not name or tid in emitted_tool_ids:
+                                    continue
+                                emitted_tool_ids.add(tid)
+                                yield {"type": "tool", "name": name}
+
+                if not final_values:
+                    yield {
+                        "type": "error",
+                        "detail": "Agent finished without a result.",
+                    }
+                    return
+
+                yield {
+                    "type": "done",
+                    "payload": _serialize_parse_result(parse_result(final_values)),
+                }
+            except Exception as exc:
+                logger.exception("Streaming agent failed")
+                yield {"type": "error", "detail": str(exc)}

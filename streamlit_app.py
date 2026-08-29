@@ -1,8 +1,10 @@
 """Streamlit chat UI for the CTE Knowledge Transfer Assistant — Professional Edition."""
 
 import io
+import json
 import os
 import uuid
+from pathlib import Path
 
 import httpx
 import streamlit as st
@@ -59,423 +61,44 @@ ROUTE_CONFIG: dict[str, dict] = {
 # ── Page config ───────────────────────────────────────────────────────────────
 st.set_page_config(
     page_title="DataDialogue — KT Assistant",
-    page_icon="🧠",
+    page_icon=":material/psychology:",
     layout="wide",
     initial_sidebar_state="expanded",
 )
 
-# ── Professional CSS ──────────────────────────────────────────────────────────
-st.markdown("""
-<style>
-/* ── Google Font ── */
-@import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap');
+# ── Premium theme CSS ─────────────────────────────────────────────────────────
+st.html(Path(__file__).parent / "assets" / "premium.css")
 
-/* ── Global ── */
-html, body, [class*="css"] {
-    font-family: 'Inter', sans-serif;
-}
+# ── Agent status cards (thinking / tools / indexing) ──────────────────────────
+def _agent_status_html(title: str, subtitle: str, steps: list[str]) -> str:
+    items = "".join(f"<li>{step}</li>" for step in steps)
+    return (
+        '<div class="agent-status">'
+        '<div class="agent-orb-wrap">'
+        '<div class="agent-orb"></div>'
+        '<div class="agent-orb-core"></div>'
+        '<div class="agent-orb-ring"></div>'
+        "</div>"
+        "<div>"
+        f'<div class="agent-status-title">{title}</div>'
+        f'<div class="agent-status-sub">{subtitle}</div>'
+        f'<ul class="agent-steps">{items}</ul>'
+        '<div class="shimmer-bar"></div>'
+        "</div></div>"
+    )
 
-/* ── Hide default Streamlit chrome ── */
-#MainMenu, footer, header { visibility: hidden; }
-.stDeployButton { display: none; }
 
-/* ── Keep sidebar collapse/expand arrow visible ── */
-[data-testid="collapsedControl"],
-button[kind="headerNoPadding"],
-[data-testid="stSidebarCollapseButton"] {
-    display: flex !important;
-    visibility: visible !important;
-    opacity: 1 !important;
-}
-[data-testid="stSidebarCollapseButton"] button,
-[data-testid="collapsedControl"] button {
-    background: #161b27 !important;
-    border: 1px solid #1e2536 !important;
-    border-radius: 6px !important;
-    color: #64748b !important;
-}
-[data-testid="stSidebarCollapseButton"] button:hover,
-[data-testid="collapsedControl"] button:hover {
-    background: #1e2a3a !important;
-    color: #94a3b8 !important;
-}
+THINKING_HTML = _agent_status_html(
+    "Agent thinking",
+    "Planning the answer and deciding which tools to use",
+    ["Thinking", "Calling tools", "Composing answer"],
+)
 
-/* ── App background ── */
-.stApp {
-    background: #0f1117;
-}
-
-/* ── Sidebar ── */
-[data-testid="stSidebar"] {
-    background: #161b27 !important;
-    border-right: 1px solid #1e2536;
-}
-[data-testid="stSidebar"] * {
-    color: #cbd5e1 !important;
-}
-[data-testid="stSidebar"] .stButton > button {
-    background: #1e2a3a !important;
-    border: 1px solid #2d3f55 !important;
-    color: #94a3b8 !important;
-    border-radius: 8px !important;
-    font-size: 0.78rem !important;
-    padding: 6px 10px !important;
-    transition: all 0.2s;
-    text-align: left !important;
-}
-[data-testid="stSidebar"] .stButton > button:hover {
-    background: #243347 !important;
-    border-color: #3b82f6 !important;
-    color: #e2e8f0 !important;
-}
-
-/* ── Main content area ── */
-.main .block-container {
-    padding-top: 1.5rem !important;
-    padding-bottom: 2rem !important;
-    max-width: 900px;
-}
-
-/* ── Header ── */
-.app-header {
-    display: flex;
-    align-items: center;
-    gap: 12px;
-    padding: 0 0 1rem 0;
-    border-bottom: 1px solid #1e2536;
-    margin-bottom: 1.5rem;
-}
-.app-header-icon {
-    font-size: 2rem;
-    line-height: 1;
-}
-.app-header-title {
-    font-size: 1.4rem;
-    font-weight: 700;
-    color: #f1f5f9;
-    letter-spacing: -0.3px;
-    margin: 0;
-}
-.app-header-subtitle {
-    font-size: 0.78rem;
-    color: #64748b;
-    margin: 0;
-}
-.status-dot {
-    width: 8px; height: 8px;
-    background: #22c55e;
-    border-radius: 50%;
-    display: inline-block;
-    margin-right: 5px;
-    animation: pulse 2s infinite;
-}
-@keyframes pulse {
-    0%, 100% { opacity: 1; }
-    50%       { opacity: 0.4; }
-}
-
-/* ── Chat messages ── */
-[data-testid="stChatMessage"] {
-    background: transparent !important;
-    border: none !important;
-    padding: 0.25rem 0 !important;
-}
-[data-testid="stChatMessageContent"] {
-    background: #161b27 !important;
-    border: 1px solid #1e2536 !important;
-    border-radius: 12px !important;
-    padding: 14px 18px !important;
-    color: #e2e8f0 !important;
-}
-[data-testid="stChatMessageContent"] h1,
-[data-testid="stChatMessageContent"] h2,
-[data-testid="stChatMessageContent"] h3 {
-    color: #f1f5f9 !important;
-    font-size: 0.95rem !important;
-    font-weight: 600 !important;
-    margin-top: 0.6rem !important;
-    margin-bottom: 0.2rem !important;
-}
-[data-testid="stChatMessageContent"] p,
-[data-testid="stChatMessageContent"] li {
-    color: #cbd5e1 !important;
-    font-size: 0.88rem;
-    line-height: 1.7;
-}
-[data-testid="stChatMessageContent"] code {
-    background: #0f1117 !important;
-    color: #7dd3fc !important;
-    padding: 2px 6px;
-    border-radius: 4px;
-    font-size: 0.82rem;
-}
-[data-testid="stChatMessageContent"] pre {
-    background: #0f1117 !important;
-    border: 1px solid #1e2536;
-    border-radius: 8px;
-    padding: 12px;
-}
-
-/* ── User message bubble ── */
-[data-testid="stChatMessage"]:has([data-testid="stChatMessageAvatarUser"]) [data-testid="stChatMessageContent"] {
-    background: #1a2744 !important;
-    border-color: #2d4270 !important;
-}
-
-/* ── Chat input ── */
-[data-testid="stChatInput"] {
-    background: #161b27 !important;
-    border: 1px solid #2d3f55 !important;
-    border-radius: 12px !important;
-    padding: 4px 8px !important;
-}
-[data-testid="stChatInput"] textarea {
-    color: #e2e8f0 !important;
-    font-size: 0.9rem !important;
-}
-[data-testid="stChatInput"]:focus-within {
-    border-color: #3b82f6 !important;
-    box-shadow: 0 0 0 2px rgba(59,130,246,0.15) !important;
-}
-
-/* ── Tool badge — compact inline chip ── */
-.tool-badge {
-    display: inline-flex;
-    align-items: center;
-    gap: 5px;
-    border-radius: 6px;
-    padding: 3px 10px 3px 8px;
-    font-size: 0.72rem;
-    font-weight: 600;
-    letter-spacing: 0.2px;
-    border: 1px solid transparent;
-    margin-right: 6px;
-}
-.tool-badge .badge-icon {
-    font-size: 0.85rem;
-    line-height: 1;
-}
-
-/* ── Tool name chip ── */
-.tool-name-chip {
-    font-size: 0.68rem;
-    color: #475569;
-    background: transparent;
-    border: none;
-    padding: 0;
-    font-family: 'Inter', sans-serif;
-    letter-spacing: 0.1px;
-}
-
-/* ── Meta row ── */
-.meta-row {
-    display: flex;
-    align-items: center;
-    gap: 6px;
-    margin-top: 10px;
-    padding-top: 8px;
-    border-top: 1px solid #1e2536;
-}
-.meta-spacer { flex: 1; }
-
-/* ── Sources button — minimal icon button ── */
-.src-btn-wrap button {
-    background: transparent !important;
-    border: 1px solid #1e2d45 !important;
-    border-radius: 6px !important;
-    color: #475569 !important;
-    font-size: 0.7rem !important;
-    padding: 2px 8px !important;
-    min-height: 0 !important;
-    height: 24px !important;
-    line-height: 1 !important;
-    transition: all 0.15s !important;
-}
-.src-btn-wrap button:hover {
-    background: #0f1a2e !important;
-    border-color: #3b82f6 !important;
-    color: #60a5fa !important;
-}
-
-/* ── Sources panel ── */
-.sources-panel {
-    background: #13192a;
-    border: 1px solid #1e2d45;
-    border-radius: 14px;
-    padding: 0;
-    overflow: hidden;
-    height: fit-content;
-}
-.sources-panel-header {
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-    padding: 14px 16px 12px 16px;
-    border-bottom: 1px solid #1e2d45;
-}
-.sources-panel-title {
-    font-size: 0.82rem;
-    font-weight: 700;
-    color: #e2e8f0;
-    letter-spacing: -0.1px;
-}
-.sources-panel-body { padding: 14px 16px; }
-
-/* ── Source card ── */
-.source-card {
-    display: flex;
-    align-items: flex-start;
-    gap: 10px;
-    background: #0d1320;
-    border: 1px solid #1a2540;
-    border-radius: 10px;
-    padding: 10px 12px;
-    margin-bottom: 8px;
-    transition: border-color 0.15s;
-    text-decoration: none;
-}
-.source-card:hover { border-color: #2d4a7a; }
-.source-icon {
-    width: 28px; height: 28px;
-    background: #1a2540;
-    border-radius: 6px;
-    display: flex; align-items: center; justify-content: center;
-    font-size: 0.82rem;
-    flex-shrink: 0;
-    margin-top: 1px;
-}
-.source-content { flex: 1; min-width: 0; }
-.source-domain {
-    font-size: 0.72rem;
-    color: #60a5fa;
-    font-weight: 500;
-    white-space: nowrap;
-    overflow: hidden;
-    text-overflow: ellipsis;
-}
-.source-detail {
-    font-size: 0.68rem;
-    color: #374151;
-    margin-top: 2px;
-    font-family: monospace;
-    white-space: nowrap;
-    overflow: hidden;
-    text-overflow: ellipsis;
-}
-.section-label {
-    font-size: 0.62rem;
-    font-weight: 700;
-    letter-spacing: 0.8px;
-    text-transform: uppercase;
-    color: #334155;
-    margin-bottom: 8px;
-    margin-top: 4px;
-}
-
-/* ── Sidebar section headers ── */
-.sidebar-section {
-    font-size: 0.68rem;
-    font-weight: 700;
-    letter-spacing: 1px;
-    text-transform: uppercase;
-    color: #475569 !important;
-    margin: 1rem 0 0.4rem 0;
-}
-
-/* ── Doc item in sidebar ── */
-.doc-item {
-    display: flex;
-    align-items: center;
-    gap: 8px;
-    padding: 6px 8px;
-    background: #0f1117;
-    border: 1px solid #1e2536;
-    border-radius: 8px;
-    margin-bottom: 4px;
-}
-.doc-name {
-    font-size: 0.78rem;
-    color: #94a3b8;
-    font-weight: 500;
-    flex: 1;
-    white-space: nowrap;
-    overflow: hidden;
-    text-overflow: ellipsis;
-}
-.doc-size {
-    font-size: 0.68rem;
-    color: #475569;
-}
-
-/* ── Welcome card ── */
-.welcome-card {
-    background: linear-gradient(135deg, #161b27 0%, #1a2035 100%);
-    border: 1px solid #1e2d45;
-    border-radius: 16px;
-    padding: 24px;
-    margin-bottom: 1rem;
-}
-.welcome-title {
-    font-size: 1.1rem;
-    font-weight: 700;
-    color: #f1f5f9;
-    margin-bottom: 8px;
-}
-.welcome-grid {
-    display: grid;
-    grid-template-columns: 1fr 1fr;
-    gap: 8px;
-    margin-top: 12px;
-}
-.welcome-item {
-    display: flex;
-    align-items: center;
-    gap: 8px;
-    background: #0f1117;
-    border: 1px solid #1e2536;
-    border-radius: 8px;
-    padding: 8px 12px;
-    font-size: 0.78rem;
-    color: #94a3b8;
-}
-
-/* ── Primary upload button ── */
-[data-testid="stSidebar"] .stButton > button[kind="primary"] {
-    background: linear-gradient(135deg, #3b82f6, #2563eb) !important;
-    border: none !important;
-    color: #fff !important;
-    font-weight: 600 !important;
-}
-[data-testid="stSidebar"] .stButton > button[kind="primary"]:hover {
-    background: linear-gradient(135deg, #60a5fa, #3b82f6) !important;
-    box-shadow: 0 4px 12px rgba(59,130,246,0.3) !important;
-}
-
-/* ── Expander ── */
-[data-testid="stExpander"] {
-    background: #0f1117 !important;
-    border: 1px solid #1e2536 !important;
-    border-radius: 8px !important;
-    margin-bottom: 4px !important;
-}
-[data-testid="stExpander"] summary {
-    color: #94a3b8 !important;
-    font-size: 0.82rem !important;
-    font-weight: 500 !important;
-}
-
-/* ── Spinner ── */
-[data-testid="stSpinner"] > div {
-    border-top-color: #3b82f6 !important;
-}
-
-/* ── Scrollbar ── */
-::-webkit-scrollbar { width: 6px; }
-::-webkit-scrollbar-track { background: #0f1117; }
-::-webkit-scrollbar-thumb { background: #1e2d45; border-radius: 3px; }
-::-webkit-scrollbar-thumb:hover { background: #2d4270; }
-</style>
-""", unsafe_allow_html=True)
+INDEXING_HTML = _agent_status_html(
+    "Indexing documents",
+    "Parsing files and updating the knowledge base",
+    ["Reading files", "Chunking", "Embedding"],
+)
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -542,10 +165,10 @@ def _render_assistant_message(msg: dict, msg_index: int = 0) -> None:
             fig = go.Figure(chart_data)
             fig.update_layout(
                 paper_bgcolor="rgba(0,0,0,0)",
-                plot_bgcolor="#0d1320",
+                plot_bgcolor="rgba(13, 19, 32, 0.65)",
                 font_color="#cbd5e1",
             )
-            st.plotly_chart(fig, use_container_width=True, key=f"chart_{id(msg)}")
+            st.plotly_chart(fig, width="stretch", key=f"chart_{id(msg)}")
         except Exception as exc:
             st.warning(f"Could not render chart: {exc}")
 
@@ -602,25 +225,20 @@ def _render_assistant_message(msg: dict, msg_index: int = 0) -> None:
 with st.sidebar:
     # Brand
     st.markdown("""
-    <div style="padding: 8px 0 16px 0;">
-        <div style="font-size:1.1rem;font-weight:700;color:#f1f5f9;letter-spacing:-0.3px;">
-            🧠 DataDialogue
-        </div>
-        <div style="font-size:0.72rem;color:#475569;margin-top:2px;">
-            Knowledge Transfer Assistant
-        </div>
+    <div class="brand-mark">
+        <div class="brand-title">DataDialogue</div>
+        <div class="brand-sub">Knowledge transfer assistant</div>
     </div>
     """, unsafe_allow_html=True)
 
     # Backend status
-    status_color = "#22c55e" if st.session_state.backend_ok else "#ef4444"
-    status_text  = "Backend connected" if st.session_state.backend_ok else "Backend offline"
+    dot_cls = "ok" if st.session_state.backend_ok else "bad"
+    status_text = "Backend connected" if st.session_state.backend_ok else "Backend offline"
     st.markdown(
-        f'<div style="display:flex;align-items:center;gap:6px;padding:6px 10px;'
-        f'background:#0f1117;border:1px solid #1e2536;border-radius:8px;margin-bottom:12px;">'
-        f'<div style="width:7px;height:7px;background:{status_color};border-radius:50%;"></div>'
-        f'<span style="font-size:0.72rem;color:#64748b;">{status_text}</span>'
-        f'<span style="font-size:0.68rem;color:#334155;margin-left:auto;">'
+        f'<div class="status-pill">'
+        f'<div class="status-pill-dot {dot_cls}"></div>'
+        f'<span style="font-size:0.72rem;color:#94a3b8;">{status_text}</span>'
+        f'<span style="font-size:0.68rem;color:#475569;margin-left:auto;">'
         f'{st.session_state.session_id[:8]}…</span></div>',
         unsafe_allow_html=True,
     )
@@ -639,21 +257,25 @@ with st.sidebar:
     )
 
     if uploaded:
-        if st.button("⬆️ Upload & Index", type="primary", use_container_width=True):
-            with st.spinner("Indexing…"):
-                try:
-                    result   = _upload_files(uploaded)
-                    saved    = result.get("saved", [])
-                    rejected = result.get("rejected", [])
-                    if saved:
-                        st.success(f"✅ {len(saved)} file(s) indexed")
-                    if rejected:
-                        st.warning(f"⚠️ {len(rejected)} file(s) skipped")
-                    st.session_state.pop("docs_cache", None)
-                except httpx.ConnectError:
-                    st.error("Backend offline")
-                except Exception as exc:
-                    st.error(f"Upload failed: {exc}")
+        if st.button("Upload and index", type="primary", icon=":material/upload:", width="stretch"):
+            index_slot = st.empty()
+            index_slot.markdown(INDEXING_HTML, unsafe_allow_html=True)
+            try:
+                result   = _upload_files(uploaded)
+                saved    = result.get("saved", [])
+                rejected = result.get("rejected", [])
+                index_slot.empty()
+                if saved:
+                    st.success(f"{len(saved)} file(s) indexed", icon=":material/check_circle:")
+                if rejected:
+                    st.warning(f"{len(rejected)} file(s) skipped", icon=":material/warning:")
+                st.session_state.pop("docs_cache", None)
+            except httpx.ConnectError:
+                index_slot.empty()
+                st.error("Backend offline", icon=":material/error:")
+            except Exception as exc:
+                index_slot.empty()
+                st.error(f"Upload failed: {exc}", icon=":material/error:")
 
     st.divider()
 
@@ -680,7 +302,7 @@ with st.sidebar:
     else:
         st.caption("No documents yet.")
 
-    if st.button("🔄 Refresh", use_container_width=True):
+    if st.button("Refresh", icon=":material/refresh:", width="stretch"):
         st.session_state.docs_cache = _fetch_documents()
         st.rerun()
 
@@ -690,7 +312,7 @@ with st.sidebar:
     st.markdown('<div class="sidebar-section">Session</div>', unsafe_allow_html=True)
     col1, col2 = st.columns(2)
     with col1:
-        if st.button("🗑️ Clear", use_container_width=True):
+        if st.button("Clear", icon=":material/delete:", width="stretch"):
             st.session_state.messages = []
             try:
                 httpx.delete(f"{API_URL}/sessions/{st.session_state.session_id}/history", timeout=10)
@@ -698,7 +320,7 @@ with st.sidebar:
                 pass
             st.rerun()
     with col2:
-        if st.button("🆕 New", use_container_width=True):
+        if st.button("New", icon=":material/add:", width="stretch"):
             st.session_state.session_id = str(uuid.uuid4())
             st.session_state.messages   = []
             st.rerun()
@@ -710,7 +332,7 @@ with st.sidebar:
     for group, questions in SAMPLE_QUESTIONS.items():
         with st.expander(group, expanded=False):
             for q in questions:
-                if st.button(q, key=f"sample_{q}", use_container_width=True):
+                if st.button(q, key=f"sample_{q}", width="stretch"):
                     st.session_state.pending_question = q
                     st.rerun()
 
@@ -759,7 +381,10 @@ with chat_col:
 
     # Conversation history
     for i, msg in enumerate(st.session_state.messages):
-        with st.chat_message(msg["role"], avatar="🧠" if msg["role"] == "assistant" else "👤"):
+        with st.chat_message(
+            msg["role"],
+            avatar=":material/psychology:" if msg["role"] == "assistant" else ":material/person:",
+        ):
             if msg["role"] == "assistant":
                 _render_assistant_message(msg, msg_index=i)
             else:
@@ -862,7 +487,7 @@ if sources_col is not None:
                 )
 
 # ── Input ─────────────────────────────────────────────────────────────────────
-typed_input = st.chat_input("Ask anything…")
+typed_input = st.chat_input("Ask anything…", submit_mode="disable")
 prompt = st.session_state.pop("pending_question", None) or typed_input
 
 if not prompt:
@@ -875,49 +500,102 @@ if not prompt:
 # Show user message
 st.session_state.messages.append({"role": "user", "content": prompt})
 with chat_col:
-    with st.chat_message("user", avatar="👤"):
+    with st.chat_message("user", avatar=":material/person:"):
         st.markdown(prompt)
 
 # Call backend
 with chat_col:
-    with st.chat_message("assistant", avatar="🧠"):
-        with st.spinner(""):
-            answer     = ""
-            datasource = None
-            tools_used = []
-            citations  = []
-            chart_data = None
+    with st.chat_message("assistant", avatar=":material/psychology:"):
+        thinking = st.empty()
+        thinking.markdown(THINKING_HTML, unsafe_allow_html=True)
 
-            try:
-                response = httpx.post(
-                    f"{API_URL.rstrip('/')}/ask",
-                    json={"question": prompt, "session_id": st.session_state.session_id},
-                    timeout=REQUEST_TIMEOUT,
-                )
-                response.raise_for_status()
-                payload    = response.json()
-                answer     = payload.get("answer") or "I could not generate an answer."
-                datasource = payload.get("datasource")
-                tools_used = payload.get("tools_used") or []
-                citations  = payload.get("citations") or []
-                chart_data = payload.get("chart_data")
-                st.session_state.backend_ok = True
+        answer     = ""
+        datasource = None
+        tools_used = []
+        citations  = []
+        chart_data = None
 
-            except httpx.ConnectError:
-                st.session_state.backend_ok = False
-                answer = (
-                    "⚠️ **Cannot reach the backend.**\n\n"
-                    f"Make sure FastAPI is running:\n"
-                    f"```\nuvicorn app:app --reload --port 8000\n```\n"
-                    f"Expected at: `{API_URL}`"
-                )
-            except httpx.TimeoutException:
-                answer = (
-                    "⚠️ **Request timed out.**\n\n"
-                    "The agent is still processing — try asking again."
-                )
-            except Exception as exc:
-                answer = f"⚠️ **Unexpected error:** {exc}"
+        # ── Streaming via SSE /stream endpoint ───────────────────────────────
+        # We consume the SSE stream chunk-by-chunk so tokens appear as the
+        # LLM generates them, exactly like ChatGPT's typewriter effect.
+        answer_slot = st.empty()   # live-updating text area
+        tool_slot   = st.empty()   # "using tool …" indicator
+
+        try:
+            with httpx.stream(
+                "GET",
+                f"{API_URL.rstrip('/')}/stream",
+                params={"question": prompt, "session_id": st.session_state.session_id},
+                timeout=REQUEST_TIMEOUT,
+            ) as r:
+                r.raise_for_status()
+                for raw_line in r.iter_lines():
+                    if not raw_line.startswith("data: "):
+                        continue
+                    event = json.loads(raw_line[6:])
+                    etype = event.get("type")
+
+                    if etype == "status":
+                        # Still in "thinking" phase — keep the spinner
+                        pass
+
+                    elif etype == "token":
+                        # First token arrives → clear the spinner immediately
+                        if not answer:
+                            thinking.empty()
+                        answer += event.get("text", "")
+                        answer_slot.markdown(answer + "▌")   # blinking cursor
+
+                    elif etype == "tool":
+                        tool_name = event.get("name", "tool")
+                        tool_slot.markdown(
+                            f'<div class="tool-badge" style="color:#a78bfa;'
+                            f'background:#1e1040;border-color:#a78bfa22;">'
+                            f'<span class="badge-icon">⚙</span> using {tool_name}…</div>',
+                            unsafe_allow_html=True,
+                        )
+
+                    elif etype == "done":
+                        payload    = event.get("payload", {})
+                        datasource = payload.get("datasource")
+                        tools_used = payload.get("tools_used") or []
+                        citations  = payload.get("citations") or []
+                        chart_data = payload.get("chart_data")
+                        if not answer:
+                            # done with no tokens → use generation field as fallback
+                            answer = payload.get("generation", "I could not generate an answer.")
+
+                    elif etype == "error":
+                        if not answer:
+                            answer = f"⚠️ **Agent error:** {event.get('detail', 'Unknown error')}"
+
+            # Remove the blinking cursor and tool indicator now that we're done
+            answer_slot.empty()
+            tool_slot.empty()
+            thinking.empty()
+            st.session_state.backend_ok = True
+
+        except httpx.ConnectError:
+            st.session_state.backend_ok = False
+            answer = (
+                "⚠️ **Cannot reach the backend.**\n\n"
+                f"Make sure FastAPI is running:\n"
+                f"```\nuvicorn app:app --reload --port 8000\n```\n"
+                f"Expected at: `{API_URL}`"
+            )
+        except httpx.TimeoutException:
+            answer = (
+                "⚠️ **Request timed out.**\n\n"
+                "The agent is still processing — try asking again."
+            )
+        except Exception as exc:
+            answer = f"⚠️ **Unexpected error:** {exc}"
+        finally:
+            thinking.empty()
+            answer_slot.empty()
+            tool_slot.empty()
+
+        thinking.empty()
 
         assistant_msg = {
             "role":       "assistant",
