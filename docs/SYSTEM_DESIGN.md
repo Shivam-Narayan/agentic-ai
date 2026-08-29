@@ -525,6 +525,6 @@ Same flow applies for Streamlit (renders as badge + citation pill + markdown) an
 | No authentication on `/ask` or `/openclaw/webhook` | Endpoints are open | Add API key header middleware or OAuth |
 | No streaming responses | Full answer returned at once | Implement SSE via `graph.astream()` (`KnowledgeTransferAgent.run()` is ready) |
 | Charts not sent as images via Telegram | Chart JSON returned but not rendered | Use `plotly.io.to_image()` to export PNG and send via `send_photo` |
-| Google Drive sync is manual | Run `ingest_drive.py` by hand | Add a scheduled job (cron / Celery beat) |
+
 | OpenClaw requires exact model availability | Groq model names change; caused 401 errors during setup | Use `GROQ_API_KEY` directly in DataDialogue rather than relying on OpenClaw's LLM |
 | Groq free tier rate limit | 30 RPM | Dedup guard + `parallel_tool_calls=False` keeps usage low; upgrade to paid tier for heavy use |

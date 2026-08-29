@@ -348,7 +348,7 @@ data/company.db                ← SQLite, read-only via SELECT
 | `mcp_client.py` | DB | 3 database tools behind MCP-compatible asynccontextmanager |
 | `schemas.py` | Models | QuestionRequest/Response + OpenClawWebhookRequest/Response/HealthResponse |
 | `config.py` | Config | DATA_DIR, INDEX_DIR paths; env key validation |
-| `ingest_drive.py` | Ingestion | Optional: pulls files from Google Drive into data/ |
+
 
 ---
 

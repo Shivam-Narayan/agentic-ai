@@ -78,7 +78,7 @@ DataDialogue/
 │       ├── mcp_client.py         # 3 database tools (MCP-compatible)
 │       ├── workflow.py           # LangGraph agent loop, dedup guard, citations
 │       ├── schemas.py            # Pydantic models for API requests/responses
-│       └── ingest_drive.py       # Optional: sync from Google Drive
+
 │
 ├── docs/
 │   ├── ARCHITECTURE.md           # System architecture and data flow
@@ -160,8 +160,7 @@ KT_API_URL=http://localhost:8000
 # Force a specific LLM when multiple keys are present:
 # LLM_PROVIDER=groq    # Options: groq, google, cohere
 
-# Google Drive folder sync (for ingest_drive.py):
-# GOOGLE_DRIVE_FOLDER_ID=your_folder_id_here
+
 ```
 
 > If you have multiple LLM keys, the system auto-selects: **Groq → Google → Cohere**. Set `LLM_PROVIDER` to override.

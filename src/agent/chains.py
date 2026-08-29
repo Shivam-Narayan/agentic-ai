@@ -22,7 +22,7 @@ def get_llm() -> BaseChatModel:
     if provider == "groq" or (not provider and os.getenv("GROQ_API_KEY")):
         from langchain_groq import ChatGroq
         logger.info("Initializing Groq LLM (openai/gpt-oss-20b)")
-        return ChatGroq(model="openai/gpt-oss-20b", temperature=0)
+        return ChatGroq(model="openai/gpt-oss-20b", temperature=0, max_retries=5)
         
     if provider == "google" or (not provider and os.getenv("GOOGLE_API_KEY")):
         from langchain_google_genai import ChatGoogleGenerativeAI

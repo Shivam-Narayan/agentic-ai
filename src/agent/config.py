@@ -10,7 +10,6 @@ ROOT_DIR = Path(__file__).resolve().parent.parent.parent
 INDEX_DIR = ROOT_DIR / "indexing_data"
 DATA_DIR = ROOT_DIR / "data"
 
-DRIVE_FOLDER_ID = os.getenv("GOOGLE_DRIVE_FOLDER_ID")
 
 logger = logging.getLogger(__name__)
 
