@@ -88,9 +88,9 @@ def get_llm() -> BaseChatModel:
     # Priority 2: Use whatever key is available
     if provider == "groq" or (not provider and os.getenv("GROQ_API_KEY")):
         from langchain_groq import ChatGroq
-        logger.info("Initializing Groq LLM (openai/gpt-oss-20b)")
+        logger.info("Initializing Groq LLM (openai/gpt-oss-120b)")
         return ChatGroq(
-            model="openai/gpt-oss-20b",
+            model="openai/gpt-oss-120b",
             temperature=0,
             max_retries=5,
             streaming=True,

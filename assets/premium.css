@@ -1,6 +1,569 @@
-/* DataDialogue — glassmorphism + micro-animations */
+/* DataDialogue — clean, professional dark theme */
 
-@import url("https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700&display=swap");
+@import url("https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap");
+
+html, body, [class*="css"] {
+    font-family: "Inter", -apple-system, BlinkMacSystemFont, sans-serif;
+}
+
+#MainMenu, footer, header { visibility: hidden; }
+.stDeployButton { display: none; }
+
+[data-testid="collapsedControl"],
+button[kind="headerNoPadding"],
+[data-testid="stSidebarCollapseButton"] {
+    display: flex !important;
+    visibility: visible !important;
+    opacity: 1 !important;
+}
+[data-testid="stSidebarCollapseButton"] button,
+[data-testid="collapsedControl"] button {
+    background: rgba(18, 21, 31, 0.72) !important;
+    border: 1px solid rgba(255, 255, 255, 0.08) !important;
+    border-radius: 10px !important;
+    color: #94a3b8 !important;
+    backdrop-filter: blur(12px);
+}
+[data-testid="stSidebarCollapseButton"] button:hover,
+[data-testid="collapsedControl"] button:hover {
+    background: rgba(255, 255, 255, 0.08) !important;
+    color: #e2e8f0 !important;
+}
+
+/* ── Pure dark background — no gradient noise ── */
+.stApp {
+    background: #0d0d0d !important;
+}
+.stApp::before {
+    display: none; /* removed ambient gradient — too distracting */
+}
+.stApp > header,
+.stApp [data-testid="stAppViewContainer"],
+.stApp [data-testid="stSidebar"] {
+    position: relative;
+    z-index: 1;
+}
+
+/* ── Sidebar — clean, minimal ── */
+[data-testid="stSidebar"] {
+    background: #171717 !important;
+    border-right: 1px solid rgba(255, 255, 255, 0.06) !important;
+}
+[data-testid="stSidebar"] * {
+    color: #cbd5e1 !important;
+}
+[data-testid="stSidebar"] .stButton > button {
+    background: transparent !important;
+    border: 1px solid rgba(255, 255, 255, 0.07) !important;
+    color: #94a3b8 !important;
+    border-radius: 8px !important;
+    font-size: 0.82rem !important;
+    padding: 7px 11px !important;
+    transition: background 0.15s ease, color 0.15s ease;
+    text-align: left !important;
+}
+[data-testid="stSidebar"] .stButton > button:hover {
+    background: rgba(255, 255, 255, 0.06) !important;
+    border-color: rgba(255, 255, 255, 0.12) !important;
+    color: #e2e8f0 !important;
+}
+[data-testid="stSidebar"] hr {
+    border-color: rgba(255, 255, 255, 0.06) !important;
+}
+
+/* ── Main chat area — centered, max 720px ── */
+.main .block-container {
+    padding-top: 1.2rem !important;
+    padding-bottom: 2rem !important;
+    max-width: 720px;
+    margin: 0 auto;
+}
+
+/* ── App header ── */
+.app-header {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    padding: 10px 14px;
+    margin-bottom: 1.2rem;
+    background: rgba(255, 255, 255, 0.03);
+    border: 1px solid rgba(255, 255, 255, 0.07);
+    border-radius: 14px;
+}
+.app-header-icon {
+    font-size: 1.5rem;
+    line-height: 1;
+    width: 40px;
+    height: 40px;
+    display: grid;
+    place-items: center;
+    border-radius: 10px;
+    background: rgba(255, 255, 255, 0.06);
+    border: 1px solid rgba(255, 255, 255, 0.1);
+}
+.app-header-title {
+    font-size: 1.1rem;
+    font-weight: 600;
+    color: #f5f5f5;
+    letter-spacing: -0.3px;
+    margin: 0;
+}
+.app-header-subtitle {
+    font-size: 0.78rem;
+    color: #6b7280;
+    margin: 2px 0 0 0;
+}
+.status-dot {
+    width: 7px;
+    height: 7px;
+    background: #22c55e;
+    border-radius: 50%;
+    display: inline-block;
+    margin-right: 5px;
+    animation: pulse-ring 2.5s infinite;
+}
+@keyframes pulse-ring {
+    0%   { box-shadow: 0 0 0 0 rgba(34, 197, 94, 0.5); }
+    70%  { box-shadow: 0 0 0 6px rgba(34, 197, 94, 0); }
+    100% { box-shadow: 0 0 0 0 rgba(34, 197, 94, 0); }
+}
+
+/* ── Chat messages — no heavy glass, clean text ── */
+[data-testid="stChatMessage"] {
+    background: transparent !important;
+    border: none !important;
+    padding: 0.15rem 0 !important;
+    animation: message-in 0.3s ease both;
+}
+@keyframes message-in {
+    from { opacity: 0; transform: translateY(6px); }
+    to   { opacity: 1; transform: translateY(0); }
+}
+
+/* Assistant message — no background, just clean text */
+[data-testid="stChatMessage"]:has([data-testid="stChatMessageAvatarAssistant"]) [data-testid="stChatMessageContent"] {
+    background: transparent !important;
+    border: none !important;
+    padding: 4px 0 !important;
+    box-shadow: none !important;
+}
+
+/* User message — subtle dark bubble */
+[data-testid="stChatMessage"]:has([data-testid="stChatMessageAvatarUser"]) [data-testid="stChatMessageContent"] {
+    background: #1e1e1e !important;
+    border: 1px solid rgba(255, 255, 255, 0.08) !important;
+    border-radius: 14px !important;
+    padding: 12px 16px !important;
+    box-shadow: none !important;
+}
+
+/* Typography — larger, more readable */
+[data-testid="stChatMessageContent"] p,
+[data-testid="stChatMessageContent"] li {
+    color: #e5e5e5 !important;
+    font-size: 0.96rem !important;
+    line-height: 1.75 !important;
+}
+[data-testid="stChatMessageContent"] h1,
+[data-testid="stChatMessageContent"] h2,
+[data-testid="stChatMessageContent"] h3 {
+    color: #f5f5f5 !important;
+    font-size: 1rem !important;
+    font-weight: 600 !important;
+    margin-top: 1rem !important;
+    margin-bottom: 0.3rem !important;
+}
+[data-testid="stChatMessageContent"] code {
+    background: rgba(255, 255, 255, 0.08) !important;
+    color: #93c5fd !important;
+    padding: 2px 6px;
+    border-radius: 5px;
+    font-size: 0.88rem;
+}
+[data-testid="stChatMessageContent"] pre {
+    background: #1a1a1a !important;
+    border: 1px solid rgba(255, 255, 255, 0.08);
+    border-radius: 10px;
+    padding: 14px 16px;
+}
+
+/* ── Chat input — pill style ── */
+[data-testid="stChatInput"] {
+    background: #1a1a1a !important;
+    border: 1px solid rgba(255, 255, 255, 0.12) !important;
+    border-radius: 24px !important;
+    padding: 6px 12px !important;
+    box-shadow: 0 0 0 0 transparent;
+    transition: border-color 0.2s ease, box-shadow 0.2s ease;
+}
+[data-testid="stChatInput"] textarea {
+    color: #e5e5e5 !important;
+    font-size: 0.96rem !important;
+    line-height: 1.5 !important;
+}
+[data-testid="stChatInput"]:focus-within {
+    border-color: rgba(255, 255, 255, 0.25) !important;
+    box-shadow: 0 0 0 3px rgba(255, 255, 255, 0.05) !important;
+}
+
+/* ── Tool badges ── */
+.tool-badge {
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    border-radius: 999px;
+    padding: 3px 10px 3px 8px;
+    font-size: 0.72rem;
+    font-weight: 500;
+    letter-spacing: 0.1px;
+    border: 1px solid transparent;
+    margin-right: 6px;
+}
+.tool-badge .badge-icon {
+    font-size: 0.82rem;
+    line-height: 1;
+}
+
+.tool-name-chip {
+    font-size: 0.68rem;
+    color: #6b7280;
+    background: transparent;
+    border: none;
+    padding: 0;
+    font-family: ui-monospace, monospace;
+}
+
+.meta-row {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    margin-top: 10px;
+    padding-top: 8px;
+    border-top: 1px solid rgba(255, 255, 255, 0.06);
+}
+
+/* ── Sources button ── */
+.src-btn-wrap button {
+    background: transparent !important;
+    border: 1px solid rgba(255, 255, 255, 0.08) !important;
+    border-radius: 999px !important;
+    color: #6b7280 !important;
+    font-size: 0.72rem !important;
+    padding: 3px 10px !important;
+    min-height: 0 !important;
+    height: 26px !important;
+    line-height: 1 !important;
+    transition: all 0.15s !important;
+}
+.src-btn-wrap button:hover {
+    background: rgba(255, 255, 255, 0.06) !important;
+    border-color: rgba(255, 255, 255, 0.18) !important;
+    color: #9ca3af !important;
+}
+
+/* ── Source cards ── */
+.source-card {
+    display: flex;
+    align-items: flex-start;
+    gap: 10px;
+    background: #1a1a1a;
+    border: 1px solid rgba(255, 255, 255, 0.07);
+    border-radius: 10px;
+    padding: 10px 12px;
+    margin-bottom: 7px;
+    transition: border-color 0.15s;
+    text-decoration: none;
+}
+.source-card:hover {
+    border-color: rgba(255, 255, 255, 0.18);
+}
+.source-icon {
+    width: 26px;
+    height: 26px;
+    background: rgba(255, 255, 255, 0.06);
+    border-radius: 7px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 0.78rem;
+    flex-shrink: 0;
+}
+.source-content { flex: 1; min-width: 0; }
+.source-domain {
+    font-size: 0.74rem;
+    color: #93c5fd;
+    font-weight: 500;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+.source-detail {
+    font-size: 0.68rem;
+    color: #4b5563;
+    margin-top: 2px;
+    font-family: ui-monospace, monospace;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+.section-label {
+    font-size: 0.62rem;
+    font-weight: 600;
+    letter-spacing: 0.8px;
+    text-transform: uppercase;
+    color: #4b5563;
+    margin-bottom: 8px;
+    margin-top: 4px;
+}
+
+/* ── Sidebar labels ── */
+.sidebar-section {
+    font-size: 0.66rem;
+    font-weight: 600;
+    letter-spacing: 0.9px;
+    text-transform: uppercase;
+    color: #4b5563 !important;
+    margin: 1rem 0 0.4rem 0;
+}
+
+.brand-mark {
+    padding: 8px 4px 12px 4px;
+}
+.brand-title {
+    font-size: 1rem;
+    font-weight: 600;
+    color: #f5f5f5 !important;
+    letter-spacing: -0.2px;
+}
+.brand-sub {
+    font-size: 0.72rem;
+    color: #4b5563 !important;
+    margin-top: 3px;
+}
+
+/* ── Backend status pill ── */
+.status-pill {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 7px 11px;
+    margin-bottom: 10px;
+    background: rgba(255, 255, 255, 0.03);
+    border: 1px solid rgba(255, 255, 255, 0.06);
+    border-radius: 10px;
+}
+.status-pill-dot {
+    width: 6px;
+    height: 6px;
+    border-radius: 50%;
+    flex-shrink: 0;
+}
+.status-pill-dot.ok  { background: #22c55e; }
+.status-pill-dot.bad { background: #ef4444; }
+
+/* ── Doc items ── */
+.doc-item {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 7px 10px;
+    background: rgba(255, 255, 255, 0.03);
+    border: 1px solid rgba(255, 255, 255, 0.06);
+    border-radius: 9px;
+    margin-bottom: 4px;
+}
+.doc-name {
+    font-size: 0.8rem;
+    color: #9ca3af;
+    font-weight: 400;
+    flex: 1;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+.doc-size {
+    font-size: 0.68rem;
+    color: #4b5563;
+}
+
+/* ── Welcome card ── */
+.welcome-card {
+    background: transparent;
+    border: 1px solid rgba(255, 255, 255, 0.07);
+    border-radius: 16px;
+    padding: 28px 24px;
+    margin-bottom: 1.2rem;
+    animation: message-in 0.4s ease both;
+}
+.welcome-title {
+    font-size: 1.4rem;
+    font-weight: 600;
+    color: #f5f5f5;
+    margin-bottom: 8px;
+    letter-spacing: -0.4px;
+}
+.welcome-grid {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 8px;
+    margin-top: 16px;
+}
+.welcome-item {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    background: rgba(255, 255, 255, 0.03);
+    border: 1px solid rgba(255, 255, 255, 0.07);
+    border-radius: 10px;
+    padding: 10px 12px;
+    font-size: 0.82rem;
+    color: #9ca3af;
+    transition: background 0.15s, border-color 0.15s;
+    cursor: default;
+}
+.welcome-item:hover {
+    background: rgba(255, 255, 255, 0.05);
+    border-color: rgba(255, 255, 255, 0.14);
+    color: #d1d5db;
+}
+
+/* ── Primary sidebar button ── */
+[data-testid="stSidebar"] .stButton > button[kind="primary"] {
+    background: #ffffff !important;
+    border: none !important;
+    color: #0d0d0d !important;
+    font-weight: 600 !important;
+    font-size: 0.84rem !important;
+    border-radius: 8px !important;
+}
+[data-testid="stSidebar"] .stButton > button[kind="primary"]:hover {
+    background: #e5e5e5 !important;
+}
+
+/* ── Expanders ── */
+[data-testid="stExpander"] {
+    background: rgba(255, 255, 255, 0.02) !important;
+    border: 1px solid rgba(255, 255, 255, 0.06) !important;
+    border-radius: 10px !important;
+    margin-bottom: 5px !important;
+}
+[data-testid="stExpander"] summary {
+    color: #9ca3af !important;
+    font-size: 0.82rem !important;
+    font-weight: 500 !important;
+}
+
+[data-testid="stSpinner"] > div {
+    border-top-color: #6b7280 !important;
+}
+
+/* ── Scrollbar ── */
+::-webkit-scrollbar { width: 5px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb { background: rgba(255,255,255,0.1); border-radius: 99px; }
+::-webkit-scrollbar-thumb:hover { background: rgba(255,255,255,0.2); }
+
+/* ── Agent thinking animation ── */
+.agent-status {
+    display: flex;
+    align-items: flex-start;
+    gap: 14px;
+    padding: 14px 16px;
+    margin: 2px 0 6px 0;
+    background: rgba(255, 255, 255, 0.03);
+    border: 1px solid rgba(255, 255, 255, 0.08);
+    border-radius: 14px;
+    animation: message-in 0.25s ease both;
+}
+.agent-orb-wrap {
+    position: relative;
+    width: 34px;
+    height: 34px;
+    flex-shrink: 0;
+}
+.agent-orb {
+    width: 34px;
+    height: 34px;
+    border-radius: 50%;
+    background: conic-gradient(from 0deg, #6366f1, #22d3ee, #a78bfa, #6366f1);
+    animation: orb-spin 1.2s linear infinite;
+}
+.agent-orb-core {
+    position: absolute;
+    inset: 7px;
+    border-radius: 50%;
+    background: #0d0d0d;
+}
+.agent-orb-ring {
+    position: absolute;
+    inset: -4px;
+    border-radius: 50%;
+    border: 1px solid rgba(255, 255, 255, 0.15);
+    animation: orb-pulse 1.6s ease-out infinite;
+}
+@keyframes orb-spin  { to { transform: rotate(360deg); } }
+@keyframes orb-pulse {
+    0%   { transform: scale(0.92); opacity: 0.6; }
+    100% { transform: scale(1.2);  opacity: 0; }
+}
+.agent-status-title {
+    font-size: 0.88rem;
+    font-weight: 600;
+    color: #f5f5f5;
+}
+.agent-status-sub {
+    font-size: 0.74rem;
+    color: #6b7280;
+    margin-top: 2px;
+}
+.agent-steps {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+    margin-top: 10px;
+    padding: 0;
+    list-style: none;
+}
+.agent-steps li {
+    font-size: 0.68rem;
+    font-weight: 500;
+    padding: 3px 9px;
+    border-radius: 999px;
+    border: 1px solid rgba(255, 255, 255, 0.07);
+    background: rgba(255, 255, 255, 0.03);
+    color: #4b5563;
+    opacity: 0.45;
+}
+.agent-steps li:nth-child(1) { animation: step-cycle 4.8s ease-in-out infinite; }
+.agent-steps li:nth-child(2) { animation: step-cycle 4.8s ease-in-out infinite 1.6s; }
+.agent-steps li:nth-child(3) { animation: step-cycle 4.8s ease-in-out infinite 3.2s; }
+@keyframes step-cycle {
+    0%,  22% { opacity: 1; color: #d1d5db; border-color: rgba(255,255,255,0.2); background: rgba(255,255,255,0.06); }
+    28%,100% { opacity: 0.45; color: #4b5563; border-color: rgba(255,255,255,0.07); background: rgba(255,255,255,0.03); }
+}
+
+/* ── Shimmer progress bar ── */
+.shimmer-bar {
+    height: 3px;
+    margin-top: 10px;
+    border-radius: 99px;
+    overflow: hidden;
+    background: rgba(255, 255, 255, 0.05);
+}
+.shimmer-bar::after {
+    content: "";
+    display: block;
+    height: 100%;
+    width: 35%;
+    background: linear-gradient(90deg, transparent, rgba(255,255,255,0.35), transparent);
+    animation: shimmer 1.5s ease-in-out infinite;
+}
+@keyframes shimmer {
+    from { transform: translateX(-140%); }
+    to   { transform: translateX(320%); }
+}
+
 
 html, body, [class*="css"] {
     font-family: "Plus Jakarta Sans", Inter, sans-serif;

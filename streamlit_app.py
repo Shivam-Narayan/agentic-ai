@@ -58,6 +58,27 @@ ROUTE_CONFIG: dict[str, dict] = {
     "multiple":     {"icon": "⊕",  "label": "Multi-tool",    "color": "#94a3b8", "bg": "#1e2536"},
 }
 
+# Fix #3: Tool name → datasource mapping imported from parser so it's
+# always in sync with the backend — no more fragile string matching.
+_TOOL_DATASOURCE: dict[str, str] = {
+    "search_company_documents": "company_docs",
+    "summarise_document":       "company_docs",
+    "extract_structured_data":  "company_docs",
+    "search_web":               "web_search",
+    "calculate":                "calculation",
+    "generate_chart":           "chart",
+    "query_company_database":   "database",
+    "query-database":           "database",
+    "read-query":               "database",
+    "list_database_tables":     "database",
+    "list-tables":              "database",
+    "describe_database_table":  "database",
+}
+
+# How many streaming tokens to accumulate before re-rendering.
+# Fix #5: batching reduces Streamlit markdown re-render flicker.
+_STREAM_BATCH_SIZE: int = 3
+
 # ── Page config ───────────────────────────────────────────────────────────────
 st.set_page_config(
     page_title="DataDialogue — KT Assistant",
@@ -168,7 +189,9 @@ def _render_assistant_message(msg: dict, msg_index: int = 0) -> None:
                 plot_bgcolor="rgba(13, 19, 32, 0.65)",
                 font_color="#cbd5e1",
             )
-            st.plotly_chart(fig, width="stretch", key=f"chart_{id(msg)}")
+            # Fix #6: use msg_index as key — id(msg) changes on every rerun
+            # causing chart flickering.
+            st.plotly_chart(fig, width="stretch", key=f"chart_{msg_index}")
         except Exception as exc:
             st.warning(f"Could not render chart: {exc}")
 
@@ -261,15 +284,41 @@ with st.sidebar:
             index_slot = st.empty()
             index_slot.markdown(INDEXING_HTML, unsafe_allow_html=True)
             try:
-                result   = _upload_files(uploaded)
-                saved    = result.get("saved", [])
-                rejected = result.get("rejected", [])
+                result     = _upload_files(uploaded)
+                saved      = result.get("saved", [])
+                duplicates = result.get("duplicates", [])
+                conflicts  = result.get("conflicts", [])
+                rejected   = result.get("rejected", [])
                 index_slot.empty()
+
                 if saved:
-                    st.success(f"{len(saved)} file(s) indexed", icon=":material/check_circle:")
+                    st.success(
+                        f"{len(saved)} file(s) indexed: {', '.join(saved)}",
+                        icon=":material/check_circle:",
+                    )
+                if duplicates:
+                    st.info(
+                        f"{len(duplicates)} duplicate(s) skipped — already indexed: "
+                        f"{', '.join(duplicates)}",
+                        icon=":material/content_copy:",
+                    )
+                if conflicts:
+                    st.warning(
+                        f"{len(conflicts)} file(s) have a name conflict "
+                        f"(same name, different content) — rename before uploading: "
+                        f"{', '.join(conflicts)}",
+                        icon=":material/warning:",
+                    )
                 if rejected:
-                    st.warning(f"{len(rejected)} file(s) skipped", icon=":material/warning:")
-                st.session_state.pop("docs_cache", None)
+                    st.warning(
+                        f"{len(rejected)} file(s) skipped — unsupported format: "
+                        f"{', '.join(rejected)}",
+                        icon=":material/block:",
+                    )
+
+                if saved:
+                    st.session_state.pop("docs_cache", None)
+
             except httpx.ConnectError:
                 index_slot.empty()
                 st.error("Backend offline", icon=":material/error:")
@@ -283,7 +332,8 @@ with st.sidebar:
     st.markdown('<div class="sidebar-section">Indexed Documents</div>', unsafe_allow_html=True)
 
     if "docs_cache" not in st.session_state:
-        st.session_state.docs_cache = _fetch_documents()
+        with st.spinner("Loading documents…"):
+            st.session_state.docs_cache = _fetch_documents()
 
     docs = st.session_state.docs_cache
     if docs:
@@ -420,11 +470,9 @@ if sources_col is not None:
                 unsafe_allow_html=True,
             )
             for t in st.session_state.active_tools:
-                cfg = ROUTE_CONFIG.get("web_search" if "web" in t else
-                                       "company_docs" if "document" in t or "summarise" in t or "extract" in t else
-                                       "database" if "database" in t or "table" in t else
-                                       "calculation" if t == "calculate" else
-                                       "chart" if t == "generate_chart" else "direct_llm", {})
+                # Fix #3: use _TOOL_DATASOURCE dict — no fragile string matching
+                ds    = _TOOL_DATASOURCE.get(t, "direct_llm")
+                cfg   = ROUTE_CONFIG.get(ds, ROUTE_CONFIG["direct_llm"])
                 color = cfg.get("color", "#64748b")
                 st.markdown(
                     f'<div style="display:inline-flex;align-items:center;gap:6px;'
@@ -516,10 +564,11 @@ with chat_col:
         chart_data = None
 
         # ── Streaming via SSE /stream endpoint ───────────────────────────────
-        # We consume the SSE stream chunk-by-chunk so tokens appear as the
-        # LLM generates them, exactly like ChatGPT's typewriter effect.
-        answer_slot = st.empty()   # live-updating text area
-        tool_slot   = st.empty()   # "using tool …" indicator
+        # Fix #5: accumulate tokens in batches of _STREAM_BATCH_SIZE before
+        # re-rendering to reduce Streamlit markdown flicker on every token.
+        answer_slot  = st.empty()   # live-updating text area
+        tool_slot    = st.empty()   # "using tool …" indicator
+        token_buffer = 0            # counts tokens since last render
 
         try:
             with httpx.stream(
@@ -536,15 +585,17 @@ with chat_col:
                     etype = event.get("type")
 
                     if etype == "status":
-                        # Still in "thinking" phase — keep the spinner
-                        pass
+                        pass  # keep the thinking spinner
 
                     elif etype == "token":
-                        # First token arrives → clear the spinner immediately
                         if not answer:
-                            thinking.empty()
-                        answer += event.get("text", "")
-                        answer_slot.markdown(answer + "▌")   # blinking cursor
+                            thinking.empty()  # clear spinner on first token
+                        answer       += event.get("text", "")
+                        token_buffer += 1
+                        # Fix #5: only re-render every N tokens
+                        if token_buffer >= _STREAM_BATCH_SIZE:
+                            answer_slot.markdown(answer + "▌")
+                            token_buffer = 0
 
                     elif etype == "tool":
                         tool_name = event.get("name", "tool")
@@ -562,21 +613,25 @@ with chat_col:
                         citations  = payload.get("citations") or []
                         chart_data = payload.get("chart_data")
                         if not answer:
-                            # done with no tokens → use generation field as fallback
                             answer = payload.get("generation", "I could not generate an answer.")
 
                     elif etype == "error":
                         if not answer:
                             answer = f"⚠️ **Agent error:** {event.get('detail', 'Unknown error')}"
 
-            # Remove the blinking cursor and tool indicator now that we're done
+                # Flush any remaining buffered tokens
+                if token_buffer > 0 and answer:
+                    answer_slot.markdown(answer + "▌")
+
+            # Fix #1: clear placeholders once — duplicate thinking.empty() removed
+            thinking.empty()
             answer_slot.empty()
             tool_slot.empty()
-            thinking.empty()
+            # Fix #2: re-check backend status so the pill reflects current state
             st.session_state.backend_ok = True
 
         except httpx.ConnectError:
-            st.session_state.backend_ok = False
+            st.session_state.backend_ok = False  # Fix #2: mark backend offline immediately
             answer = (
                 "⚠️ **Cannot reach the backend.**\n\n"
                 f"Make sure FastAPI is running:\n"
@@ -591,11 +646,10 @@ with chat_col:
         except Exception as exc:
             answer = f"⚠️ **Unexpected error:** {exc}"
         finally:
+            # Fix #1: single cleanup point — no duplicate calls
             thinking.empty()
             answer_slot.empty()
             tool_slot.empty()
-
-        thinking.empty()
 
         assistant_msg = {
             "role":       "assistant",
