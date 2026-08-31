@@ -44,9 +44,15 @@ TAVILY_API_KEY=your_key_here      # tavily.com — 1,000 free/month
 SERPER_API_KEY=your_key_here      # serper.dev — 2,500 free, no card
 
 KT_API_URL=http://localhost:8000
+
+# PostgreSQL — only needed if using pgvector or Postgres memory (optional)
+POSTGRES_URL=postgresql+psycopg://postgres:password@localhost:5432/datadialogue
+USE_PGVECTOR=false
+USE_POSTGRES_MEMORY=false
 ```
 
 > No web search key? DuckDuckGo is used automatically — no signup needed.
+> Leave `USE_PGVECTOR` and `USE_POSTGRES_MEMORY` as `false` to use the default SQLite + JSON setup.
 
 ### 3. Index your documents
 
@@ -65,10 +71,60 @@ Two terminals:
 uvicorn app:app --reload --port 8000
 
 # Terminal 2
-streamlit run streamlit_app.py
+python -m streamlit run streamlit_app.py
 ```
 
 Open **http://localhost:8501**
+
+---
+
+## PostgreSQL + pgvector (optional upgrade)
+
+Replaces the default SQLite memory store and JSON vector store with a single PostgreSQL instance. Recommended when you have 50+ documents or multiple concurrent users.
+
+### Why upgrade?
+
+| | Default (SQLite + JSON) | PostgreSQL + pgvector |
+|---|---|---|
+| Documents | Works up to ~20 files | Scales to 100s of files |
+| Concurrent users | Single user | Multiple users |
+| Retrieval quality | Top 2 chunks | Top 8 chunks |
+| Setup | Zero | Docker required |
+
+### Setup
+
+**1. Start Docker:**
+```bash
+docker compose up -d
+```
+
+**2. Run the migration script (once):**
+```bash
+python migrate_to_pgvector.py
+```
+
+This embeds all your documents and inserts them into pgvector, and creates the LangGraph checkpoint tables. Takes a few minutes depending on document count.
+
+**3. Flip the flags in `.env`:**
+```env
+USE_PGVECTOR=true
+USE_POSTGRES_MEMORY=true
+```
+
+**4. Restart FastAPI:**
+```bash
+uvicorn app:app --reload --port 8000
+```
+
+**5. Verify:**
+```bash
+curl http://localhost:8000/health
+# {"status":"ok","memory_backend":"postgres","vector_backend":"pgvector"}
+```
+
+### Rollback
+
+Set both flags back to `false` and restart. SQLite + JSON still work — no data is lost.
 
 ---
 
@@ -92,7 +148,7 @@ Each user gets their own conversation memory automatically.
 |---|---|---|
 | `GET` | `/stream` | Real-time SSE streaming response |
 | `POST` | `/ask` | Blocking response (used by Telegram) |
-| `GET` | `/health` | Liveness check |
+| `GET` | `/health` | Liveness check + active backend info |
 | `POST` | `/upload` | Upload + index documents |
 | `GET` | `/documents` | List indexed documents |
 | `DELETE` | `/sessions/{id}/history` | Clear conversation memory |
@@ -112,6 +168,10 @@ Interactive docs: **http://localhost:8000/docs**
 **Backend offline error in Streamlit** — Start FastAPI first (Terminal 1).
 
 **Stale index after adding files** — Re-run `python -m src.agent.rag` or use the Upload button in the sidebar.
+
+**pgvector migration fails** — Make sure Docker is running (`docker compose up -d`) and `POSTGRES_URL` in `.env` matches your container.
+
+**FastAPI falls back to SQLite even with `USE_POSTGRES_MEMORY=true`** — Postgres is unreachable. Check `docker ps` and confirm the container is healthy.
 
 ---
 

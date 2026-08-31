@@ -6,12 +6,26 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-ROOT_DIR = Path(__file__).resolve().parent.parent.parent
+ROOT_DIR  = Path(__file__).resolve().parent.parent.parent
 INDEX_DIR = ROOT_DIR / "indexing_data"
-DATA_DIR = ROOT_DIR / "data"
-
+DATA_DIR  = ROOT_DIR / "data"
 
 logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# PostgreSQL / pgvector config
+# ---------------------------------------------------------------------------
+
+# Full psycopg3 connection string — used by both rag.py (pgvector) and
+# app.py (AsyncPostgresSaver). Defaults to local Docker setup.
+POSTGRES_URL: str = os.getenv(
+    "POSTGRES_URL",
+    "postgresql+psycopg://postgres:password@localhost:5432/datadialogue",
+)
+
+# Feature flags — flip to true after running migrate_to_pgvector.py
+USE_PGVECTOR:         bool = os.getenv("USE_PGVECTOR",         "false").lower() == "true"
+USE_POSTGRES_MEMORY:  bool = os.getenv("USE_POSTGRES_MEMORY",  "false").lower() == "true"
 
 
 def setup_logging() -> None:

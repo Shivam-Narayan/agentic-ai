@@ -1,21 +1,26 @@
 """FastAPI backend for the KT Agent.
 
-Conversation memory is handled by LangGraph's AsyncSqliteSaver checkpointer.
-Each session_id maps to a LangGraph thread — history is persisted in
-memory_store/conversations.db and survives server restarts.
+Conversation memory is handled by LangGraph checkpointers:
+  - Default:  AsyncSqliteSaver  → memory_store/conversations.db
+  - Postgres: AsyncPostgresSaver → PostgreSQL (USE_POSTGRES_MEMORY=true)
+
+Each session_id maps to a LangGraph thread — history persists across restarts.
 """
 
 import json
 import logging
+import os
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
 
-from fastapi import FastAPI, File, HTTPException, UploadFile
+from fastapi import FastAPI, File, HTTPException, Request, UploadFile
 from fastapi.responses import JSONResponse, StreamingResponse
-from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
+from slowapi import Limiter, _rate_limit_exceeded_handler
+from slowapi.errors import RateLimitExceeded
+from slowapi.util import get_remote_address
 
-from src.agent.config import DATA_DIR, setup_logging
+from src.agent.config import DATA_DIR, POSTGRES_URL, USE_PGVECTOR, USE_POSTGRES_MEMORY, setup_logging
 from src.agent.rag import SUPPORTED_EXTENSIONS, _discover_documents, rebuild_index
 from src.agent.schemas import Citation, QuestionRequest, QuestionResponse
 from src.agent.workflow import KnowledgeTransferAgent, aask
@@ -24,31 +29,85 @@ setup_logging()
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
-# LangGraph AsyncSqliteSaver checkpointer
+# Rate limiter
 #
-# Opened once at startup via FastAPI lifespan, shared across all requests.
-# Persists full message history per session_id to conversations.db.
+# Keyed on client IP. Limits:
+#   /ask    — 20 requests/minute  (blocking — each call is one full LLM round-trip)
+#   /stream — 20 requests/minute  (streaming — same cost as /ask)
+#   /upload — 10 requests/minute  (heavier — triggers full re-indexing)
+#
+# Limits can be overridden per-deployment via RATE_LIMIT_ASK,
+# RATE_LIMIT_STREAM, RATE_LIMIT_UPLOAD env vars.
 # ---------------------------------------------------------------------------
+
+_RATE_ASK    = os.getenv("RATE_LIMIT_ASK",    "20/minute")
+_RATE_STREAM = os.getenv("RATE_LIMIT_STREAM", "20/minute")
+_RATE_UPLOAD = os.getenv("RATE_LIMIT_UPLOAD", "10/minute")
+
+limiter = Limiter(key_func=get_remote_address, default_limits=["60/minute"])
 
 _MEMORY_DIR = Path(__file__).parent / "memory_store"
 _MEMORY_DIR.mkdir(exist_ok=True)
 
-# Module-level reference filled in by the lifespan handler
+# Filled in by the lifespan handler — shared across all requests
 _checkpointer = None
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Open the async SQLite checkpointer on startup, close on shutdown."""
+    """Open the checkpointer on startup, close on shutdown.
+
+    Uses AsyncPostgresSaver when USE_POSTGRES_MEMORY=true,
+    otherwise falls back to AsyncSqliteSaver (default, no extra setup needed).
+    """
     global _checkpointer
-    async with AsyncSqliteSaver.from_conn_string(
-        str(_MEMORY_DIR / "conversations.db")
-    ) as cp:
-        _checkpointer = cp
-        logger.info("AsyncSqliteSaver opened: %s", _MEMORY_DIR / "conversations.db")
-        yield
+
+    if USE_POSTGRES_MEMORY:
+        # ── PostgreSQL memory ───────────────────────────────────────────
+        # AsyncPostgresSaver requires psycopg3 and langgraph-checkpoint-postgres.
+        # cp.setup() creates the checkpoints / checkpoint_writes / checkpoint_blobs
+        # tables automatically on first run — no manual SQL needed.
+        try:
+            from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
+
+            # AsyncPostgresSaver expects a plain psycopg3 URL (no +psycopg prefix)
+            pg_url = POSTGRES_URL.replace("postgresql+psycopg://", "postgresql://")
+
+            async with AsyncPostgresSaver.from_conn_string(pg_url) as cp:
+                await cp.setup()
+                _checkpointer = cp
+                logger.info("AsyncPostgresSaver opened: %s", pg_url.split("@")[-1])
+                yield
+
+        except Exception as exc:
+            # If Postgres is unavailable, fall back to SQLite and log a clear warning
+            logger.error(
+                "AsyncPostgresSaver failed to open (%s). "
+                "Falling back to SQLite memory. "
+                "Is Docker running? Check POSTGRES_URL in .env.",
+                exc,
+            )
+            async with _open_sqlite_checkpointer() as cp:
+                _checkpointer = cp
+                yield
+    else:
+        # ── SQLite memory (default) ─────────────────────────────────────
+        async with _open_sqlite_checkpointer() as cp:
+            _checkpointer = cp
+            yield
+
     _checkpointer = None
-    logger.info("AsyncSqliteSaver closed")
+
+
+@asynccontextmanager
+async def _open_sqlite_checkpointer():
+    """Open the AsyncSqliteSaver — extracted so both lifespan branches can use it."""
+    from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
+
+    db_path = str(_MEMORY_DIR / "conversations.db")
+    async with AsyncSqliteSaver.from_conn_string(db_path) as cp:
+        logger.info("AsyncSqliteSaver opened: %s", db_path)
+        yield cp
 
 
 app = FastAPI(
@@ -60,6 +119,10 @@ app = FastAPI(
     version="2.0.0",
     lifespan=lifespan,
 )
+
+# Attach rate limiter — must be done after app creation
+app.state.limiter = limiter
+app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
 
 # ---------------------------------------------------------------------------
@@ -78,13 +141,18 @@ async def root() -> dict:
 
 
 @app.get("/health", tags=["system"])
-async def health() -> dict[str, str]:
-    """Liveness check."""
-    return {"status": "ok"}
+async def health() -> dict[str, Any]:
+    """Liveness check — reports active backend."""
+    return {
+        "status":         "ok",
+        "memory_backend": "postgres" if USE_POSTGRES_MEMORY else "sqlite",
+        "vector_backend": "pgvector" if USE_PGVECTOR else "json",
+    }
 
 
 @app.get("/stream", tags=["agent"])
-async def stream_question(question: str, session_id: str = "default"):
+@limiter.limit(_RATE_STREAM)
+async def stream_question(request: Request, question: str, session_id: str = "default"):
     """Stream a question to the KT agent using Server-Sent Events.
 
     Each SSE event is a JSON object with a `type` field:
@@ -121,7 +189,8 @@ async def stream_question(question: str, session_id: str = "default"):
 
 
 @app.post("/ask", response_model=QuestionResponse, tags=["agent"])
-async def ask_question(request: QuestionRequest) -> QuestionResponse:
+@limiter.limit(_RATE_ASK)
+async def ask_question(request: Request, body: QuestionRequest) -> QuestionResponse:
     """Submit a question to the KT agent.
 
     - **question**: The user's question (1–2000 characters).
@@ -129,8 +198,8 @@ async def ask_question(request: QuestionRequest) -> QuestionResponse:
       Use the same session_id across requests to maintain context.
       Defaults to `"default"`.
     """
-    session_id = request.session_id or "default"
-    question   = request.question.strip()
+    session_id = body.session_id or "default"
+    question   = body.question.strip()
 
     logger.info("[session=%s] question: %s", session_id, question)
 
@@ -217,22 +286,37 @@ async def clear_session_history(session_id: str) -> dict[str, str]:
 
 @app.get("/sessions", tags=["memory"])
 async def list_sessions() -> dict[str, Any]:
-    """List all sessions stored in the SQLite checkpointer."""
-    import sqlite3
-    db_path = _MEMORY_DIR / "conversations.db"
-    if not db_path.exists():
-        return {"sessions": []}
-    try:
-        con = sqlite3.connect(str(db_path))
-        # AsyncSqliteSaver stores thread_id as a direct column in checkpoints
-        rows = con.execute(
-            "SELECT DISTINCT thread_id FROM checkpoints ORDER BY thread_id"
-        ).fetchall()
-        con.close()
-        return {"sessions": [{"session_id": row[0]} for row in rows]}
-    except Exception as exc:
-        logger.warning("Could not list sessions: %s", exc)
-        return {"sessions": []}
+    """List all sessions stored in the active checkpointer."""
+    if USE_POSTGRES_MEMORY:
+        # Query the PostgreSQL checkpoints table
+        try:
+            import psycopg
+            pg_url = POSTGRES_URL.replace("postgresql+psycopg://", "postgresql://")
+            async with await psycopg.AsyncConnection.connect(pg_url) as conn:
+                rows = await conn.execute(
+                    "SELECT DISTINCT thread_id FROM checkpoints ORDER BY thread_id"
+                )
+                results = await rows.fetchall()
+            return {"sessions": [{"session_id": row[0]} for row in results]}
+        except Exception as exc:
+            logger.warning("Could not list Postgres sessions: %s", exc)
+            return {"sessions": []}
+    else:
+        # Query the SQLite checkpoints table
+        import sqlite3
+        db_path = _MEMORY_DIR / "conversations.db"
+        if not db_path.exists():
+            return {"sessions": []}
+        try:
+            con = sqlite3.connect(str(db_path))
+            rows = con.execute(
+                "SELECT DISTINCT thread_id FROM checkpoints ORDER BY thread_id"
+            ).fetchall()
+            con.close()
+            return {"sessions": [{"session_id": row[0]} for row in rows]}
+        except Exception as exc:
+            logger.warning("Could not list SQLite sessions: %s", exc)
+            return {"sessions": []}
 
 
 # ---------------------------------------------------------------------------
@@ -240,17 +324,25 @@ async def list_sessions() -> dict[str, Any]:
 # ---------------------------------------------------------------------------
 
 @app.post("/upload", tags=["documents"])
-async def upload_documents(files: list[UploadFile] = File(...)) -> JSONResponse:
+@limiter.limit(_RATE_UPLOAD)
+async def upload_documents(request: Request, files: list[UploadFile] = File(...)) -> JSONResponse:
     """Upload one or more documents to the data/ folder and rebuild the index.
 
     Supported formats: PDF, DOCX, DOC, XLSX, XLS, CSV, TXT.
+    Duplicate detection:
+      - Same filename + identical content → rejected as duplicate
+      - Same filename + different content → rejected, user must rename
     The index is rebuilt automatically — no manual CLI step needed.
     """
+    import hashlib
+
     if not files:
         raise HTTPException(status_code=400, detail="No files provided.")
 
-    saved: list[str] = []
-    rejected: list[str] = []
+    saved:      list[str] = []
+    rejected:   list[str] = []
+    duplicates: list[str] = []   # exact content match
+    conflicts:  list[str] = []   # same name, different content
 
     for upload in files:
         suffix = Path(upload.filename).suffix.lower()
@@ -258,20 +350,50 @@ async def upload_documents(files: list[UploadFile] = File(...)) -> JSONResponse:
             rejected.append(upload.filename)
             continue
 
-        dest = DATA_DIR / upload.filename
         content = await upload.read()
+        dest    = DATA_DIR / upload.filename
+
+        if dest.exists():
+            existing_hash = hashlib.md5(dest.read_bytes()).hexdigest()
+            incoming_hash = hashlib.md5(content).hexdigest()
+
+            if existing_hash == incoming_hash:
+                # Byte-for-byte identical — definite duplicate
+                logger.info(
+                    "Skipping duplicate file (identical content): %s", upload.filename
+                )
+                duplicates.append(upload.filename)
+                continue
+            else:
+                # Same filename, different content — require explicit rename
+                logger.warning(
+                    "File conflict (same name, different content): %s", upload.filename
+                )
+                conflicts.append(upload.filename)
+                continue
+
         dest.write_bytes(content)
         saved.append(upload.filename)
         logger.info("Saved uploaded file: %s (%d bytes)", dest, len(content))
 
+    # Nothing new was saved
     if not saved:
+        detail_parts: list[str] = []
+        if duplicates:
+            detail_parts.append(
+                f"Already indexed (identical content): {', '.join(duplicates)}"
+            )
+        if conflicts:
+            detail_parts.append(
+                f"Name conflict — rename before uploading: {', '.join(conflicts)}"
+            )
+        if rejected:
+            detail_parts.append(
+                f"Unsupported format: {', '.join(rejected)}"
+            )
         raise HTTPException(
             status_code=400,
-            detail=(
-                f"No supported files in upload. "
-                f"Rejected: {rejected}. "
-                f"Supported extensions: {sorted(SUPPORTED_EXTENSIONS)}"
-            ),
+            detail=" | ".join(detail_parts) or "No supported files provided.",
         )
 
     # Rebuild the full index (all files in data/) and clear the cache
@@ -285,11 +407,17 @@ async def upload_documents(files: list[UploadFile] = File(...)) -> JSONResponse:
         ) from exc
 
     return JSONResponse({
-        "status":    "indexed",
-        "saved":     saved,
-        "rejected":  rejected,
-        "indexed":   indexed,
-        "message":   f"{len(saved)} file(s) uploaded and index rebuilt successfully.",
+        "status":     "indexed",
+        "saved":      saved,
+        "duplicates": duplicates,
+        "conflicts":  conflicts,
+        "rejected":   rejected,
+        "indexed":    indexed,
+        "message":    (
+            f"{len(saved)} file(s) uploaded and indexed."
+            + (f" {len(duplicates)} duplicate(s) skipped." if duplicates else "")
+            + (f" {len(conflicts)} conflict(s) need renaming." if conflicts else "")
+        ),
     })
 
 
