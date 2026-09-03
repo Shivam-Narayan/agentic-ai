@@ -24,13 +24,16 @@ Key design decisions:
   - Deduplication guard          code-level block on repeated/empty search calls
   - Dynamic system prompt        stamped with live date/time once per request
   - _AGENT_RECURSION_LIMIT       caps the agent loop to prevent runaway API usage
-  - _get_compiled_graph()        lru_cache — graph compiled once per tool-set
-  - _TOOL_CALL_TIMEOUT_SECS      per-tool asyncio timeout guard
+  - _get_compiled_graph()        dict cache keyed on tool names + checkpointer id
+  - _TOOL_CALL_TIMEOUT_SECS      enforced via asyncio.wait_for on every LLM call
+  - Thread-safe prompt injection via per-run contextvars (not shared mutable list)
 """
 
 import asyncio
 import logging
 import uuid
+import warnings
+from contextvars import ContextVar
 from typing import Annotated, Any, AsyncIterator
 
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
@@ -55,18 +58,21 @@ from .tools import (
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
-# Module-level constants  (Fix #3 — no more magic numbers scattered in code)
+# Module-level constants
 # ---------------------------------------------------------------------------
 
 # Maximum tool-call loops before the graph forces a final answer.
 _AGENT_RECURSION_LIMIT: int = 8
 
-# Per-tool call timeout in seconds. Prevents a slow web search or DB query
-# from hanging the entire agent loop indefinitely.
+# Fix #1: per-LLM-call timeout — now actually enforced via asyncio.wait_for().
+# Prevents a slow web search or rate-limited LLM from hanging the agent loop.
 _TOOL_CALL_TIMEOUT_SECS: int = 30
 
+# Fix #2: bounded graph cache — evict oldest entry when this size is exceeded.
+_GRAPH_CACHE_MAX_SIZE: int = 16
+
 # ---------------------------------------------------------------------------
-# Static tool list  (Fix #12 — tuple prevents accidental mutation)
+# Static tool list — tuple prevents accidental mutation
 # ---------------------------------------------------------------------------
 
 LOCAL_TOOLS: tuple = (
@@ -78,6 +84,21 @@ LOCAL_TOOLS: tuple = (
     generate_chart,
 )
 
+# ---------------------------------------------------------------------------
+# Fix #3: thread-safe prompt injection via ContextVar
+#
+# Previously a shared mutable list (_prompt_holder) was attached to the cached
+# graph object. Under concurrent async requests both coroutines would write to
+# the same list and race — the last writer would win, corrupting the prompt for
+# the first request.
+#
+# ContextVar is coroutine-safe: each asyncio Task gets its own copy of the
+# value so concurrent requests never interfere.
+# ---------------------------------------------------------------------------
+
+_current_system_prompt: ContextVar[str] = ContextVar(
+    "_current_system_prompt", default=""
+)
 
 # ---------------------------------------------------------------------------
 # Agent state
@@ -127,36 +148,43 @@ def _has_tool_call_chunks(token: Any) -> bool:
 
 
 # ---------------------------------------------------------------------------
-# LLM streaming assembler  (Fix #6 — raises on empty instead of silent return)
+# LLM streaming assembler
+# Fix #1: wrapped in asyncio.wait_for() to enforce _TOOL_CALL_TIMEOUT_SECS
 # ---------------------------------------------------------------------------
 
 async def _astream_complete(llm, messages: list) -> AIMessage:
     """Stream the LLM and assemble chunks into a single AIMessage.
 
-    Raises:
-        RuntimeError: if the LLM returns no content at all (network / rate-limit issue).
-    """
-    assembled = None
-    async for chunk in llm.astream(messages):
-        assembled = chunk if assembled is None else assembled + chunk
+    Enforces _TOOL_CALL_TIMEOUT_SECS via asyncio.wait_for so a slow or
+    rate-limited LLM cannot hang the agent loop indefinitely.
 
-    # Fix #6: never silently swallow an empty response — surface it immediately.
-    if assembled is None:
-        raise RuntimeError(
-            "LLM returned no content. This usually means a network error, "
-            "rate-limit, or the model timed out. Check your API key and quota."
+    Raises:
+        asyncio.TimeoutError: if the LLM takes longer than _TOOL_CALL_TIMEOUT_SECS.
+        RuntimeError:         if the LLM returns no content at all.
+    """
+    async def _stream() -> AIMessage:
+        assembled = None
+        async for chunk in llm.astream(messages):
+            assembled = chunk if assembled is None else assembled + chunk
+
+        if assembled is None:
+            raise RuntimeError(
+                "LLM returned no content. This usually means a network error, "
+                "rate-limit, or the model timed out. Check your API key and quota."
+            )
+
+        if isinstance(assembled, AIMessage) and not type(assembled).__name__.endswith("Chunk"):
+            return assembled
+
+        return AIMessage(
+            content=assembled.content,
+            tool_calls=list(getattr(assembled, "tool_calls", None) or []),
+            additional_kwargs=dict(getattr(assembled, "additional_kwargs", None) or {}),
+            response_metadata=dict(getattr(assembled, "response_metadata", None) or {}),
+            id=getattr(assembled, "id", None),
         )
 
-    if isinstance(assembled, AIMessage) and not type(assembled).__name__.endswith("Chunk"):
-        return assembled
-
-    return AIMessage(
-        content=assembled.content,
-        tool_calls=list(getattr(assembled, "tool_calls", None) or []),
-        additional_kwargs=dict(getattr(assembled, "additional_kwargs", None) or {}),
-        response_metadata=dict(getattr(assembled, "response_metadata", None) or {}),
-        id=getattr(assembled, "id", None),
-    )
+    return await asyncio.wait_for(_stream(), timeout=_TOOL_CALL_TIMEOUT_SECS)
 
 
 # ---------------------------------------------------------------------------
@@ -184,9 +212,9 @@ def _get_previous_tool_calls(messages: list) -> set[str]:
 def _first_search_had_results(messages: list) -> bool:
     """Return True if search_company_documents already ran AND returned content.
 
-    Fix #5: only block a second search call if the first one actually found
-    something. If it returned empty results the LLM should be allowed to retry
-    with a different query rather than being forced to answer from nothing.
+    Only block a second search call if the first one actually found something.
+    If it returned empty results the LLM should be allowed to retry with a
+    different query rather than being forced to answer from nothing.
     """
     for msg in messages:
         if (
@@ -201,30 +229,28 @@ def _first_search_had_results(messages: list) -> bool:
 
 
 # ---------------------------------------------------------------------------
-# Agent node  (Fix #4 — standalone function, not a nested closure)
+# Agent node — standalone function (testable in isolation)
+# Fix #3: reads system prompt from ContextVar (thread-safe)
+# Fix #4: bound LLM passed in — .bind_tools() not called every loop pass
 # ---------------------------------------------------------------------------
 
 async def agent_node(
     state: AgentState,
     *,
-    tools: tuple,
-    system_prompt: str,
+    bound_llm: Any,
 ) -> dict:
     """Core LLM node with deduplication guard.
 
-    Extracted from build_graph() so it can be unit-tested and profiled
-    independently. Receives the compiled tool list and the pre-built system
-    prompt so neither is re-created on every loop iteration.
-
     Args:
-        state:         Current LangGraph agent state.
-        tools:         Tuple of all available tools (local + MCP).
-        system_prompt: Already-rendered system prompt string (built once per
-                       request in _prepare_run, not on every loop pass).
+        state:     Current LangGraph agent state.
+        bound_llm: LLM already bound to the full tool list. Passed in so
+                   .bind_tools() is called once per graph compilation, not
+                   on every loop iteration.
     """
-    llm = get_llm().bind_tools(list(tools), parallel_tool_calls=False)
+    # Fix #3: read prompt from ContextVar — safe for concurrent async requests
+    system_prompt = _current_system_prompt.get()
     messages_with_system = [SystemMessage(content=system_prompt)] + state["messages"]
-    response = await _astream_complete(llm, messages_with_system)
+    response = await _astream_complete(bound_llm, messages_with_system)
 
     # ── Deduplication guard ──────────────────────────────────────────────
     if getattr(response, "tool_calls", None):
@@ -244,7 +270,6 @@ async def agent_node(
             )
             key = f"{name}::{query.lower().strip()}"
 
-            # Fix #5: only block a repeat search if the first call found content.
             is_redundant_search = (
                 name == "search_company_documents"
                 and _first_search_had_results(state["messages"])
@@ -276,34 +301,40 @@ async def agent_node(
                     )
                 ]
                 response = await _astream_complete(bare_llm, direct_messages)
-        elif filtered_calls != list(response.tool_calls):
+
+        # Fix #5: compare lengths — clearer intent than value equality on dicts
+        elif len(filtered_calls) != len(list(response.tool_calls)):
             response.tool_calls = filtered_calls
 
     return {"messages": [response]}
 
 
 # ---------------------------------------------------------------------------
-# Graph compilation  (Fix #1 — lru_cache so graph is built once per tool-set)
+# Graph compilation — dict cache with bounded size
+# Fix #2: cap _graph_cache at _GRAPH_CACHE_MAX_SIZE entries
+# Fix #4: bind LLM to tools once at compile time
 # ---------------------------------------------------------------------------
 
-# Internal cache: (tool_names_key, checkpointer_id) -> compiled graph
-# LangChain StructuredTool objects are not hashable, so we key on a tuple of
-# tool names + the id() of the checkpointer instead of the objects themselves.
 _graph_cache: dict[tuple, Any] = {}
 
 
 def _get_compiled_graph(tool_tuple: tuple, checkpointer) -> Any:
     """Return a compiled graph, building it only when the tool set changes.
 
-    Uses a plain dict cache keyed on (sorted tool names, checkpointer id)
-    because LangChain StructuredTool objects are not hashable and cannot be
-    used as lru_cache keys directly.
+    Keyed on (sorted tool names, checkpointer id). Evicts the oldest entry
+    when the cache exceeds _GRAPH_CACHE_MAX_SIZE.
     """
     cache_key = (
         tuple(sorted(t.name for t in tool_tuple)),
         id(checkpointer),
     )
     if cache_key not in _graph_cache:
+        # Fix #2: evict oldest entry before inserting a new one
+        if len(_graph_cache) >= _GRAPH_CACHE_MAX_SIZE:
+            oldest_key = next(iter(_graph_cache))
+            del _graph_cache[oldest_key]
+            logger.debug("Graph cache evicted oldest entry (cache full)")
+
         logger.info(
             "Compiling new graph for tool-set: %s",
             [t.name for t in tool_tuple],
@@ -313,21 +344,19 @@ def _get_compiled_graph(tool_tuple: tuple, checkpointer) -> Any:
 
 
 def _compile_graph(tools: tuple, checkpointer) -> Any:
-    """Build and compile the StateGraph. Called only when cache misses."""
-    # Capture the tool tuple in the node closure so the lambda is stable.
-    tool_node = ToolNode(list(tools))
+    """Build and compile the StateGraph. Called only on cache miss.
 
-    # Wrap agent_node with the tool tuple baked in. The system_prompt is
-    # injected per-call via a wrapper set at invocation time (see _run_graph).
-    # We use a mutable container so the wrapper can swap the prompt each call.
-    _prompt_holder: list[str] = [""]
+    Fix #4: bound_llm is created once here so agent_node does not call
+    .bind_tools() on every loop iteration.
+    Fix #3: agent_node reads the system prompt from _current_system_prompt
+    ContextVar — no shared mutable state on the graph object.
+    """
+    # Fix #4: bind tools once at compile time
+    bound_llm = get_llm().bind_tools(list(tools), parallel_tool_calls=False)
+    tool_node  = ToolNode(list(tools))
 
     async def _agent_node_wrapper(state: AgentState) -> dict:
-        return await agent_node(
-            state,
-            tools=tools,
-            system_prompt=_prompt_holder[0],
-        )
+        return await agent_node(state, bound_llm=bound_llm)
 
     builder = StateGraph(AgentState)
     builder.add_node("agent", _agent_node_wrapper)
@@ -337,15 +366,11 @@ def _compile_graph(tools: tuple, checkpointer) -> Any:
         "agent", should_continue, {"tools": "tools", END: END}
     )
     builder.add_edge("tools", "agent")
-    compiled = builder.compile(checkpointer=checkpointer)
-
-    # Attach the prompt holder so callers can inject the prompt before each run.
-    compiled._prompt_holder = _prompt_holder  # type: ignore[attr-defined]
-    return compiled
+    return builder.compile(checkpointer=checkpointer)
 
 
 # ---------------------------------------------------------------------------
-# Shared run-preparation helper  (Fix #2 + #9 — DRY + prompt built once)
+# Shared run-preparation helper — DRY + prompt set via ContextVar
 # ---------------------------------------------------------------------------
 
 def _prepare_run(
@@ -357,24 +382,18 @@ def _prepare_run(
 ) -> tuple[Any, dict, dict]:
     """Build the graph, initial state, and config for one agent run.
 
-    Centralises the setup logic that was previously duplicated between
-    aask() and KnowledgeTransferAgent.run().
-
-    The system prompt is built here — once per request — and injected into
-    the cached graph's prompt holder so agent_node doesn't rebuild it on
-    every loop iteration.
+    Sets the system prompt on the ContextVar so concurrent async requests
+    never share prompt state (Fix #3).
 
     Returns:
         (graph, initial_state, config)
     """
-    # Fix #9: build system prompt once per request, not once per loop iteration.
     system_prompt = _build_system_prompt()
 
-    graph = _get_compiled_graph(all_tools, checkpointer)
+    # Fix #3: set on ContextVar — each asyncio Task sees its own value
+    _current_system_prompt.set(system_prompt)
 
-    # Inject the fresh prompt into the cached graph before running.
-    if hasattr(graph, "_prompt_holder"):
-        graph._prompt_holder[0] = system_prompt
+    graph = _get_compiled_graph(all_tools, checkpointer)
 
     if checkpointer is not None:
         initial_state: dict = {"messages": [HumanMessage(content=question)]}
@@ -384,22 +403,31 @@ def _prepare_run(
 
     config: dict = {
         "configurable": {"thread_id": session_id},
-        "recursion_limit": _AGENT_RECURSION_LIMIT,  # Fix #3: named constant
+        "recursion_limit": _AGENT_RECURSION_LIMIT,
     }
 
     return graph, initial_state, config
 
 
 # ---------------------------------------------------------------------------
-# build_graph — kept as a public convenience wrapper (backwards compat)
+# build_graph — public wrapper kept for backwards compatibility
+# Fix #8: deprecation warning added so callers know to migrate
 # ---------------------------------------------------------------------------
 
-def build_graph(dynamic_tools: list, checkpointer=None):
-    """Public wrapper around _get_compiled_graph.
+def build_graph(dynamic_tools: list, checkpointer=None) -> Any:
+    """Return a compiled graph for the given tool list.
 
-    Kept for backwards compatibility with any external callers.
-    Prefer _get_compiled_graph(tuple(tools), checkpointer) internally.
+    .. deprecated::
+        Use ``_get_compiled_graph(tuple(tools), checkpointer)`` directly.
+        This wrapper is kept for backwards compatibility only and may be
+        removed in a future release.
     """
+    warnings.warn(
+        "build_graph() is deprecated. Use _get_compiled_graph(tuple(tools), checkpointer) "
+        "or let _prepare_run() handle graph creation.",
+        DeprecationWarning,
+        stacklevel=2,
+    )
     return _get_compiled_graph(tuple(dynamic_tools), checkpointer)
 
 
@@ -429,12 +457,21 @@ def ask(
     checkpointer=None,
     history: list | None = None,
 ) -> dict:
-    """Synchronous wrapper around aask — used by CLI scripts and unit tests.
+    """Synchronous wrapper around aask — for CLI scripts and unit tests.
 
-    Fix #8: asyncio imported at module level, not inside the function body.
-    Note: asyncio.run() will raise RuntimeError if an event loop is already
-    running (e.g. Jupyter). Use `await aask(...)` directly in async contexts.
+    Fix #7: detects an already-running event loop and raises a clear error
+    instead of crashing with a cryptic RuntimeError from asyncio.run().
+    Use ``await aask(...)`` directly in async contexts (FastAPI, Jupyter).
     """
+    try:
+        asyncio.get_running_loop()
+        raise RuntimeError(
+            "ask() cannot be called from inside a running event loop. "
+            "Use 'await aask(...)' instead."
+        )
+    except RuntimeError as exc:
+        if "cannot be called" in str(exc):
+            raise
     return asyncio.run(
         aask(question, session_id=session_id, checkpointer=checkpointer, history=history)
     )
@@ -445,6 +482,11 @@ class KnowledgeTransferAgent:
 
     def __init__(self, checkpointer=None) -> None:
         self.checkpointer = checkpointer
+
+    def __repr__(self) -> str:
+        # Fix #6: useful repr for debugging
+        cp_name = type(self.checkpointer).__name__ if self.checkpointer else "None"
+        return f"KnowledgeTransferAgent(checkpointer={cp_name})"
 
     async def run(
         self,
@@ -470,8 +512,6 @@ class KnowledgeTransferAgent:
             )
 
             final_values: dict | None = None
-            # Fix #10: use uuid4 so two calls with the same tool name never
-            # collide in the dedup set when the tool id is absent.
             emitted_tool_ids: set[str] = set()
 
             try:
@@ -501,9 +541,6 @@ class KnowledgeTransferAgent:
                                 name = tc.get("name") or ""
                                 if not name:
                                     continue
-                                # Fix #10: prefer real id; fall back to uuid4
-                                # (never fall back to name — two calls to the
-                                # same tool with different args would be suppressed)
                                 tid = tc.get("id") or str(uuid.uuid4())
                                 if tid in emitted_tool_ids:
                                     continue
@@ -519,6 +556,12 @@ class KnowledgeTransferAgent:
                     "payload": serialize_parse_result(parse_result(final_values)),
                 }
 
+            except asyncio.TimeoutError:
+                logger.error("Agent timed out after %ds", _TOOL_CALL_TIMEOUT_SECS)
+                yield {
+                    "type": "error",
+                    "detail": f"Request timed out after {_TOOL_CALL_TIMEOUT_SECS}s. Try a simpler question.",
+                }
             except Exception as exc:
                 logger.exception("Streaming agent failed")
                 yield {"type": "error", "detail": str(exc)}
