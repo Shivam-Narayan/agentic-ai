@@ -14,6 +14,7 @@ import logging
 import os
 import re
 import sqlite3
+import time
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import AsyncGenerator, List
@@ -43,6 +44,29 @@ _SQLITE_PATH: Path = DATA_DIR / "company.db"
 
 # Statements that are always blocked regardless of ALLOW_DB_WRITES.
 _ALWAYS_BLOCKED: tuple[str, ...] = ("DROP", "TRUNCATE", "ALTER", "CREATE")
+
+# ---------------------------------------------------------------------------
+# Schema Cache (avoids redundant queries during agent tool invocation loops)
+# ---------------------------------------------------------------------------
+_SCHEMA_CACHE: dict[str, tuple[float, str]] = {}
+_SCHEMA_CACHE_TTL: float = float(os.getenv("DB_SCHEMA_CACHE_TTL", "300"))  # 5 minutes default
+
+def get_cached_schema(key: str) -> str | None:
+    """Retrieve an item from the schema cache if still valid."""
+    if key in _SCHEMA_CACHE:
+        cached_time, val = _SCHEMA_CACHE[key]
+        if time.time() - cached_time < _SCHEMA_CACHE_TTL:
+            return val
+        del _SCHEMA_CACHE[key]
+    return None
+
+def set_cached_schema(key: str, val: str) -> None:
+    """Store an item in the schema cache with the current timestamp."""
+    _SCHEMA_CACHE[key] = (time.time(), val)
+
+def clear_schema_cache() -> None:
+    """Clear all cached database schema information."""
+    _SCHEMA_CACHE.clear()
 
 # ---------------------------------------------------------------------------
 # Formatters (module-level — no closures)
@@ -168,6 +192,11 @@ def list_database_tables() -> str:
     discover what data is available before writing any queries.
     """
     logger.info("Tool list_database_tables")
+    cached = get_cached_schema("all_tables")
+    if cached is not None:
+        logger.debug("Returning cached database tables list")
+        return cached
+
     try:
         conn = _get_conn()
         try:
@@ -202,7 +231,9 @@ def list_database_tables() -> str:
                 except Exception:
                     lines.append(f"  \u2022 {name}")
 
-            return "\n".join(lines)
+            result = "\n".join(lines)
+            set_cached_schema("all_tables", result)
+            return result
 
         finally:
             conn.close()
@@ -225,6 +256,11 @@ def describe_database_table(table_name: str) -> str:
     logger.info("Tool describe_database_table: %s", table_name)
     try:
         safe_name = _sanitise_identifier(table_name)
+        cached = get_cached_schema(f"table:{safe_name}")
+        if cached is not None:
+            logger.debug("Returning cached schema for %s", safe_name)
+            return cached
+
         conn = _get_conn()
         try:
             if USE_PGVECTOR:
@@ -263,7 +299,9 @@ def describe_database_table(table_name: str) -> str:
                     for r in rows
                 ]
 
-            return f"Table '{table_name}' columns:\n" + "\n".join(cols_info)
+            result = f"Table '{table_name}' columns:\n" + "\n".join(cols_info)
+            set_cached_schema(f"table:{safe_name}", result)
+            return result
 
         finally:
             conn.close()
@@ -330,6 +368,7 @@ def query_company_database(sql: str) -> str:
                 # Write operation — only reachable when ALLOW_DB_WRITES=true.
                 cursor = conn.execute(stripped)
                 conn.commit()
+                clear_schema_cache()
                 return f"Query executed. Rows affected: {cursor.rowcount}"
 
         finally:

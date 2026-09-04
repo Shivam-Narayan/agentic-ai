@@ -35,9 +35,17 @@ pip install -r requirements.txt
 
 ### 2. Set up `.env`
 
+Copy the template and provide your API keys:
+
+```bash
+cp .env.example .env
+```
+
 ```env
 # LLM — pick at least one
-GROQ_API_KEY=your_key_here
+GOOGLE_API_KEY=your_google_api_key_here   # Google Gemini (default)
+GROQ_API_KEY=your_groq_api_key_here       # Groq (optional)
+COHERE_API_KEY=your_cohere_key_here       # Cohere (optional)
 
 # Web search — all optional, cascades automatically: Tavily → Serper → DuckDuckGo
 TAVILY_API_KEY=your_key_here      # tavily.com — 1,000 free/month
@@ -56,25 +64,42 @@ USE_POSTGRES_MEMORY=false
 
 ### 3. Index your documents
 
-Drop files into `data/` (PDF, DOCX, XLSX, CSV, TXT), then:
+Drop files into `data/` (PDF, DOCX, XLSX, CSV, TXT), then build the index:
 
 ```bash
 python -m src.agent.rag
 ```
+
+> **Incremental Uploads**: You can also upload new documents directly via the Streamlit UI or `POST /upload`. The engine uses incremental indexing (`add_documents_to_index`), adding only the new documents without rebuilding the entire store.
 
 ### 4. Run
 
 Two terminals:
 
 ```bash
-# Terminal 1
+# Terminal 1: FastAPI Backend
 uvicorn app:app --reload --port 8000
 
-# Terminal 2
+# Terminal 2: Streamlit Frontend
 python -m streamlit run streamlit_app.py
 ```
 
 Open **http://localhost:8501**
+
+---
+
+## Running Tests
+
+Run the automated test suite with pytest:
+
+```bash
+pytest tests/
+```
+
+The test suite covers:
+- **`tests/test_tools.py`**: SQL injection guards, DDL blocking, AST math evaluation, and schema caching TTL.
+- **`tests/test_workflow.py`**: State deduplication, tool tracking, and response serialization compatibility.
+- **`tests/test_api.py`**: FastAPI routes (`/health`, `/ask` validation, `/sessions`, `/upload`).
 
 ---
 
@@ -146,12 +171,14 @@ Each user gets their own conversation memory automatically.
 
 | Method | Endpoint | Description |
 |---|---|---|
-| `GET` | `/stream` | Real-time SSE streaming response |
-| `POST` | `/ask` | Blocking response (used by Telegram) |
-| `GET` | `/health` | Liveness check + active backend info |
-| `POST` | `/upload` | Upload + index documents |
-| `GET` | `/documents` | List indexed documents |
-| `DELETE` | `/sessions/{id}/history` | Clear conversation memory |
+| `GET` | `/stream` | Real-time SSE streaming response (`question`, `session_id`) |
+| `POST` | `/ask` | Blocking JSON response (used by Telegram and external integrations) |
+| `GET` | `/health` | Liveness check + active memory and vector backend info |
+| `POST` | `/upload` | Non-blocking incremental document upload & indexing |
+| `GET` | `/documents` | List all indexed files in `data/` |
+| `GET` | `/sessions` | List active sessions from checkpointer |
+| `GET` | `/sessions/{id}/history` | Retrieve conversation turn history for a session |
+| `DELETE` | `/sessions/{id}/history` | Asynchronously clear conversation memory for a session |
 
 Interactive docs: **http://localhost:8000/docs**
 
@@ -179,3 +206,4 @@ Interactive docs: **http://localhost:8000/docs**
 
 - [Architecture overview](docs/ARCHITECTURE.md)
 - [Component design](docs/SYSTEM_DESIGN.md)
+

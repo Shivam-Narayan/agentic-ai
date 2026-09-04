@@ -243,6 +243,59 @@ def rebuild_index() -> list[str]:
     return [p.name for p in discovered]
 
 
+def add_documents_to_index(document_paths: List[Path]) -> list[str]:
+    """Incrementally add new documents to the existing index without a full rebuild.
+
+    Args:
+        document_paths: List of file paths to index.
+
+    Returns:
+        List of filenames added to the index.
+    """
+    existing_files = [p for p in document_paths if p.exists()]
+    if not existing_files:
+        return []
+
+    # If JSON store directory doesn't exist yet, do full build
+    if not USE_PGVECTOR and not (INDEX_DIR / "docstore.json").exists():
+        build_index()
+        get_vector_index.cache_clear()
+        return [p.name for p in existing_files]
+
+    configure_llama_index()
+    loader = SimpleDirectoryReader(
+        input_files=[str(p) for p in existing_files],
+        file_extractor=_get_file_extractors(),
+    )
+    documents = loader.load_data()
+    if not documents:
+        return []
+
+    text_splitter = SentenceSplitter(chunk_size=512, chunk_overlap=50)
+    Settings.text_splitter = text_splitter
+
+    try:
+        index = get_vector_index()
+        for doc in documents:
+            index.insert(doc)
+
+        if not USE_PGVECTOR:
+            INDEX_DIR.mkdir(parents=True, exist_ok=True)
+            index.storage_context.persist(persist_dir=str(INDEX_DIR))
+            logger.info("Persisted updated JSON index with %d new file(s)", len(existing_files))
+        else:
+            logger.info("Inserted %d document(s) into pgvector index", len(existing_files))
+
+        get_vector_index.cache_clear()
+        return [p.name for p in existing_files]
+    except Exception as exc:
+        logger.warning(
+            "Incremental indexing encountered an issue (%s). Falling back to rebuild_index().", exc
+        )
+        rebuild_index()
+        return [p.name for p in existing_files]
+
+
 # ---------------------------------------------------------------------------
 # File discovery + extractors
 # ---------------------------------------------------------------------------

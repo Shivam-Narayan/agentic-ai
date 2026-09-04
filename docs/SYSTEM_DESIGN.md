@@ -25,8 +25,9 @@ rag.py  (document layer)                                                │
  ├── _discover_documents()   → scans data/ for supported files          │
  ├── _get_file_extractors()  → registers DocxReader for .docx/.doc      │
  ├── build_index()           → ingests, embeds, persists                │
- ├── get_vector_index()      → loads from indexing_data/                │
- ├── rebuild_index()         → rebuilds + clears lru_cache              │
+ ├── add_documents_to_index()→ incremental insertion without rebuild    │
+ ├── get_vector_index()      → loads from indexing_data/ or pgvector    │
+ ├── rebuild_index()         → rebuilds from scratch + clears lru_cache │
  └── retrieve_documents()   → returns List[Document]                    │
                                                                          │
 tools.py  (LangChain tools — 6 local tools)                             │
@@ -37,10 +38,12 @@ tools.py  (LangChain tools — 6 local tools)                             │
  ├── calculate                 → safe AST evaluator                     │
  └── generate_chart            → Plotly JSON figure                     │
                                                                          │
-mcp_client.py  (database tools — 3 MCP tools)                          │
- ├── list_database_tables                                               │
- ├── describe_database_table                                             │
- └── query_company_database  (SELECT only)                              │
+mcp_client.py  (database tools — 3 MCP tools + schema cache)            │
+ ├── _SCHEMA_CACHE           → in-memory TTL dictionary                 │
+ ├── list_database_tables    → discover tables (cached)                 │
+ ├── describe_database_table → column schemas (cached)                  │
+ └── query_company_database  → SELECT (or write with ALLOW_DB_WRITES)   │
+                               invalidates schema cache on write         │
                                                                          │
 workflow.py  (LangGraph agent)  ◄── uses all of the above              │
  ├── _build_system_prompt()   (live date/time injection)                │
@@ -184,9 +187,16 @@ def _get_file_extractors() -> dict:
     return {".docx": DocxReader(), ".doc": DocxReader()}
 ```
 
-### Index cache invalidation
+### Index cache invalidation and Incremental Indexing
 
 `rebuild_index()` calls `get_vector_index.cache_clear()` after every rebuild so the next query loads the fresh index without requiring a server restart.
+
+`add_documents_to_index(document_paths: List[Path])`:
+- Ingests and embeds only newly added files.
+- Calls `index.insert(doc)` to update the live vector index.
+- Persists the updated storage context to disk (`indexing_data/`) or inserts into `pgvector`.
+- Clears `get_vector_index.cache_clear()` so retrievers immediately see the new nodes.
+- Falls back to `rebuild_index()` if the vector store does not exist yet.
 
 ---
 
@@ -212,17 +222,25 @@ Builds a Plotly `go.Figure` and returns `CHART_JSON::{figure_json}`. The `_extra
 
 ---
 
-## `mcp_client.py` — Database Tools
+## `mcp_client.py` — Database Tools & Schema Caching
 
 Three LangChain tools wrapped in an MCP-compatible `asynccontextmanager`:
 
 ```python
-list_database_tables()               # discover available tables
-describe_database_table(table_name)  # get column names and types
-query_company_database(sql_query)    # run a SELECT query
+list_database_tables()               # discover available tables (cached with TTL)
+describe_database_table(table_name)  # get column names and types (cached with TTL)
+query_company_database(sql_query)    # run queries (SELECT or write if ALLOW_DB_WRITES=true)
 ```
 
-**Safety:** Only `SELECT` queries are allowed — any other statement is rejected before execution.
+**Safety & Validation:**
+- `_sanitise_identifier()`: Strict regex check (`^[a-zA-Z0-9_]+$`) on table and column names before running PRAGMAs or schema queries to block SQL injection.
+- `_is_blocked_statement()`: Disallows destructive DDL (`DROP`, `TRUNCATE`, `ALTER`, `CREATE`).
+- Read-only by default: `INSERT`, `UPDATE`, and `DELETE` require `ALLOW_DB_WRITES=true` in `.env`.
+
+**Schema Caching:**
+- Metadata queries (`list_database_tables` and `describe_database_table`) are cached in `_SCHEMA_CACHE` with a 5-minute TTL (`DB_SCHEMA_CACHE_TTL`).
+- Multi-step LLM reasoning loops reuse cached schemas without hitting the database repeatedly.
+- Executing a write query automatically invokes `clear_schema_cache()`.
 
 **MCP compatibility:** The entire database layer can be replaced with a real MCP server by swapping only `mcp_server_context()`. `workflow.py` does not change.
 
@@ -587,3 +605,17 @@ Same flow applies for Streamlit (renders as badge + citation pill + markdown) an
 | OpenClaw requires exact model availability | Groq model names change; caused 401 errors during setup | Use `GROQ_API_KEY` directly in DataDialogue rather than relying on OpenClaw's LLM |
 | Groq free tier rate limit | 30 RPM | Dedup guard + `parallel_tool_calls=False` keeps usage low; upgrade to paid tier for heavy use |
 | Tavily free tier quota | 1,000 searches/month | Add `SERPER_API_KEY` — system cascades automatically; DuckDuckGo always available as final fallback |
+
+---
+
+## Automated Testing Architecture (pytest)
+
+The project includes an automated test suite executed with `pytest tests/`:
+
+| Test Module | Coverage Area | Key Assertions |
+|---|---|---|
+| `tests/test_tools.py` | Local and Database Tools | Identifier sanitization, DDL blocking (`DROP`, `TRUNCATE`, `CREATE`), AST math evaluation in `calculate`, Plotly chart validation, schema caching TTL & invalidation |
+| `tests/test_workflow.py` | LangGraph Engine & Parsers | Stable dedup key hashing (`_make_tool_call_key`), tool tracking, citation extraction, UI compatibility (`answer` and `generation` in `serialize_parse_result`) |
+| `tests/test_api.py` | FastAPI Endpoints | `/health` backend check, `/ask` validation, `/sessions` listing, `/sessions/{id}/history` clear, file upload format validation |
+| `tests/test_agents.py` | Agent Diagnostics | Directory validation and HuggingFace embedding initialization smoke tests |
+| `tests/test_tavily.py` | External Web Search | Optional live search connectivity test (guarded with `RUN_LIVE_API_TESTS=true`) |

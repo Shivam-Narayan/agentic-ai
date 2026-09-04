@@ -7,6 +7,7 @@ Conversation memory is handled by LangGraph checkpointers:
 Each session_id maps to a LangGraph thread — history persists across restarts.
 """
 
+import asyncio
 import json
 import logging
 import os
@@ -21,7 +22,7 @@ from slowapi.errors import RateLimitExceeded
 from slowapi.util import get_remote_address
 
 from src.agent.config import DATA_DIR, POSTGRES_URL, USE_PGVECTOR, USE_POSTGRES_MEMORY, setup_logging
-from src.agent.rag import SUPPORTED_EXTENSIONS, _discover_documents, rebuild_index
+from src.agent.rag import SUPPORTED_EXTENSIONS, _discover_documents, add_documents_to_index, rebuild_index
 from src.agent.schemas import Citation, QuestionRequest, QuestionResponse
 from src.agent.workflow import KnowledgeTransferAgent, aask
 
@@ -277,7 +278,11 @@ async def clear_session_history(session_id: str) -> dict[str, str]:
             "versions_seen": {},
             "pending_sends": [],
         }
-        _checkpointer.put(config, empty_checkpoint, CheckpointMetadata(), {})
+        if _checkpointer is not None:
+            if hasattr(_checkpointer, "aput"):
+                await _checkpointer.aput(config, empty_checkpoint, CheckpointMetadata(), {})
+            elif hasattr(_checkpointer, "put"):
+                await asyncio.to_thread(_checkpointer.put, config, empty_checkpoint, CheckpointMetadata(), {})
         logger.info("Cleared session: %s", session_id)
     except Exception as exc:
         logger.warning("Could not clear session %s: %s", session_id, exc)
@@ -302,18 +307,24 @@ async def list_sessions() -> dict[str, Any]:
             logger.warning("Could not list Postgres sessions: %s", exc)
             return {"sessions": []}
     else:
-        # Query the SQLite checkpoints table
+        # Query the SQLite checkpoints table (offloaded to thread to avoid blocking event loop)
         import sqlite3
         db_path = _MEMORY_DIR / "conversations.db"
         if not db_path.exists():
             return {"sessions": []}
         try:
-            con = sqlite3.connect(str(db_path))
-            rows = con.execute(
-                "SELECT DISTINCT thread_id FROM checkpoints ORDER BY thread_id"
-            ).fetchall()
-            con.close()
-            return {"sessions": [{"session_id": row[0]} for row in rows]}
+            def _query_sqlite():
+                con = sqlite3.connect(str(db_path))
+                try:
+                    rows = con.execute(
+                        "SELECT DISTINCT thread_id FROM checkpoints ORDER BY thread_id"
+                    ).fetchall()
+                    return [{"session_id": row[0]} for row in rows]
+                finally:
+                    con.close()
+
+            sessions = await asyncio.to_thread(_query_sqlite)
+            return {"sessions": sessions}
         except Exception as exc:
             logger.warning("Could not list SQLite sessions: %s", exc)
             return {"sessions": []}
@@ -396,14 +407,15 @@ async def upload_documents(request: Request, files: list[UploadFile] = File(...)
             detail=" | ".join(detail_parts) or "No supported files provided.",
         )
 
-    # Rebuild the full index (all files in data/) and clear the cache
+    # Incrementally index newly uploaded files into the vector store
+    saved_paths = [DATA_DIR / f for f in saved]
     try:
-        indexed = rebuild_index()
+        indexed = await asyncio.to_thread(add_documents_to_index, saved_paths)
     except Exception as exc:
-        logger.exception("Index rebuild failed after upload")
+        logger.exception("Incremental indexing failed after upload")
         raise HTTPException(
             status_code=500,
-            detail=f"Files saved but index rebuild failed: {exc}",
+            detail=f"Files saved but index update failed: {exc}",
         ) from exc
 
     return JSONResponse({

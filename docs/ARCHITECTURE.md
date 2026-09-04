@@ -34,11 +34,12 @@ The key design principle: **there is no hard-coded routing**. The LLM itself rea
 │                                                                          │
 │  GET  /stream             →  KnowledgeTransferAgent.run() SSE stream    │
 │  POST /ask                →  aask(question, session_id, checkpointer)   │
-│  GET  /health                                                            │
-│  POST /upload             →  rebuild_index()                            │
-│  GET  /documents                                                         │
-│  GET  /sessions/{id}/history                                             │
-│  DELETE /sessions/{id}/history                                           │
+│  GET  /health             →  liveness & active backend status           │
+│  POST /upload             →  add_documents_to_index() (incremental)    │
+│  GET  /documents          →  list indexed files                         │
+│  GET  /sessions           →  list active sessions (threadpool query)    │
+│  GET  /sessions/{id}/hist →  session turn history                       │
+│  DELETE /sessions/{id}/...→  aput() empty checkpoint (async reset)     │
 │  GET  /openclaw/health    →  OpenClaw health check                      │
 │  POST /openclaw/webhook   →  aask() via OpenClaw session                │
 └─────────────────────────────────┬────────────────────────────────────────┘
@@ -75,8 +76,8 @@ The key design principle: **there is no hard-coded routing**. The LLM itself rea
 │                                                                          │
 │   MCP tools (mcp_client.py):                                             │
 │   ┌──────────────────────────────────────────────────────────────────┐  │
-│   │ list_database_tables  describe_database_table                    │  │
-│   │ query_company_database                                           │  │
+│   │ list_database_tables (cached)  describe_database_table (cached)  │  │
+│   │ query_company_database (write-invalidated cache + DDL blocked)   │  │
 │   └──────────────────────────────────────────────────────────────────┘  │
 └─────────────────────────────┬────────────────────────────────────────────┘
                               │
@@ -399,10 +400,11 @@ data/company.db                ← SQLite, read-only via SELECT
 | `workflow.py` | Agent | LangGraph graph, `KnowledgeTransferAgent` async generator, system prompt, dedup guard, citations |
 | `chains.py` | LLM + Search | LLM factory (Groq/Gemini/Cohere); `_FallbackSearchTool` (Tavily→Serper→DuckDuckGo) |
 | `tools.py` | Tools | 6 local tools: search, summarise, extract, web search, calculate, chart |
-| `rag.py` | RAG | File discovery, DocxReader, LlamaIndex vector store build/load/retrieve |
-| `mcp_client.py` | DB | 3 database tools behind MCP-compatible asynccontextmanager |
+| `rag.py` | RAG | File discovery, DocxReader, LlamaIndex vector store build/load/retrieve/incremental indexing |
+| `mcp_client.py` | DB | 3 database tools behind MCP-compatible asynccontextmanager + TTL schema caching |
 | `schemas.py` | Models | QuestionRequest/Response + OpenClawWebhookRequest/Response/HealthResponse |
 | `config.py` | Config | DATA_DIR, INDEX_DIR paths; LLM key validation; web search key warning |
+| `tests/` | Tests | Pytest test suite: `test_tools.py`, `test_workflow.py`, `test_api.py` |
 
 
 ---
@@ -445,6 +447,7 @@ Priority order: **Groq → Google → Cohere**. All providers use LangChain's `B
 | **Plotly** | Interactive chart generation |
 | **SQLite** | Company database + conversation memory store |
 | **OpenClaw** | Optional multi-channel gateway (WhatsApp, Discord, Slack) |
+| **pytest** | Automated test suite (22 unit & integration tests) |
 
 ---
 

@@ -613,7 +613,7 @@ with chat_col:
                         citations  = payload.get("citations") or []
                         chart_data = payload.get("chart_data")
                         if not answer:
-                            answer = payload.get("generation", "I could not generate an answer.")
+                            answer = payload.get("answer") or payload.get("generation", "I could not generate an answer.")
 
                     elif etype == "error":
                         if not answer:

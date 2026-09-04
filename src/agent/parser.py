@@ -185,6 +185,7 @@ def serialize_parse_result(parsed: dict) -> dict:
     """
     return {
         "answer":     parsed.get("generation", ""),
+        "generation": parsed.get("generation", ""),
         "datasource": parsed.get("datasource"),
         "tools_used": parsed.get("tools_used") or [],
         "citations":  parsed.get("citations") or [],
