@@ -63,7 +63,7 @@ docker-compose.override.yml
 
 # ── Company data files ────────────────────────────────────────────────────
 # Uncomment if your data/ folder contains sensitive company documents
-# data/
+# Data/
 
 # ── Migration artefacts ───────────────────────────────────────────────────
 # The migration script itself is safe to commit
