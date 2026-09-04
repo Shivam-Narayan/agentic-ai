@@ -1,30 +1,24 @@
-"""Streamlit chat UI for the CTE Knowledge Transfer Assistant.
-
-Features:
-- Multi-turn conversation memory (session_id per browser tab)
-- Source citations shown under each AI answer
-- Plotly charts rendered inline when the agent generates one
-- Tool badge showing which tool(s) were used
-- Sidebar: document upload with auto-indexing, sample questions, session controls
-"""
+"""Streamlit chat UI for the CTE Knowledge Transfer Assistant — Professional Edition."""
 
 import io
+import json
 import os
 import uuid
+from pathlib import Path
 
 import httpx
 import streamlit as st
 from dotenv import load_dotenv
 
-load_dotenv()  # load KT_API_URL and other vars from .env
+load_dotenv()
 
-# ── Config ──────────────────────────────────────────────────────────────────
-API_URL = os.getenv("KT_API_URL", "http://localhost:8000")
-REQUEST_TIMEOUT = 180.0  # seconds — LLM + tool calls can be slow on first run
+# ── Config ───────────────────────────────────────────────────────────────────
+API_URL         = os.getenv("KT_API_URL", "http://localhost:8000")
+REQUEST_TIMEOUT = 180.0
 
-# ── Sample questions for every tool path ────────────────────────────────────
+# ── Sample questions ─────────────────────────────────────────────────────────
 SAMPLE_QUESTIONS: dict[str, list[str]] = {
-    "💬 Direct LLM": [
+    "💬 General Knowledge": [
         "What is a vector database?",
         "Explain the difference between SQL and NoSQL.",
     ],
@@ -53,21 +47,83 @@ SAMPLE_QUESTIONS: dict[str, list[str]] = {
     ],
 }
 
-# ── Datasource display config ────────────────────────────────────────────────
+# ── Datasource config ─────────────────────────────────────────────────────────
 ROUTE_CONFIG: dict[str, dict] = {
-    "direct_llm":  {"icon": "💬", "label": "LLM answered directly",         "color": "#6c757d"},
-    "company_docs":{"icon": "📄", "label": "Company documents",              "color": "#0d6efd"},
-    "database":    {"icon": "🗄️", "label": "Company database",               "color": "#198754"},
-    "web_search":  {"icon": "🌐", "label": "Live web search",                "color": "#fd7e14"},
-    "calculation": {"icon": "🧮", "label": "Calculator",                     "color": "#6f42c1"},
-    "chart":       {"icon": "📊", "label": "Chart generated",                "color": "#20c997"},
-    "multiple":    {"icon": "🔀", "label": "Multiple tools used",            "color": "#dc3545"},
+    "direct_llm":   {"icon": "✦",  "label": "Direct answer", "color": "#6366f1", "bg": "#1e1b4b"},
+    "company_docs": {"icon": "≡",  "label": "Documents",     "color": "#38bdf8", "bg": "#0c2340"},
+    "database":     {"icon": "◈",  "label": "Database",      "color": "#34d399", "bg": "#052e1c"},
+    "web_search":   {"icon": "↗",  "label": "Web search",    "color": "#a78bfa", "bg": "#1e1040"},
+    "calculation":  {"icon": "∑",  "label": "Calculator",    "color": "#c084fc", "bg": "#1e0b35"},
+    "chart":        {"icon": "◎",  "label": "Chart",         "color": "#22d3ee", "bg": "#042f3e"},
+    "multiple":     {"icon": "⊕",  "label": "Multi-tool",    "color": "#94a3b8", "bg": "#1e2536"},
 }
 
-# ── Helpers ──────────────────────────────────────────────────────────────────
+# Fix #3: Tool name → datasource mapping imported from parser so it's
+# always in sync with the backend — no more fragile string matching.
+_TOOL_DATASOURCE: dict[str, str] = {
+    "search_company_documents": "company_docs",
+    "summarise_document":       "company_docs",
+    "extract_structured_data":  "company_docs",
+    "search_web":               "web_search",
+    "calculate":                "calculation",
+    "generate_chart":           "chart",
+    "query_company_database":   "database",
+    "query-database":           "database",
+    "read-query":               "database",
+    "list_database_tables":     "database",
+    "list-tables":              "database",
+    "describe_database_table":  "database",
+}
 
+# How many streaming tokens to accumulate before re-rendering.
+# Fix #5: batching reduces Streamlit markdown re-render flicker.
+_STREAM_BATCH_SIZE: int = 3
+
+# ── Page config ───────────────────────────────────────────────────────────────
+st.set_page_config(
+    page_title="DataDialogue — KT Assistant",
+    page_icon=":material/psychology:",
+    layout="wide",
+    initial_sidebar_state="expanded",
+)
+
+# ── Premium theme CSS ─────────────────────────────────────────────────────────
+st.html(Path(__file__).parent / "assets" / "premium.css")
+
+# ── Agent status cards (thinking / tools / indexing) ──────────────────────────
+def _agent_status_html(title: str, subtitle: str, steps: list[str]) -> str:
+    items = "".join(f"<li>{step}</li>" for step in steps)
+    return (
+        '<div class="agent-status">'
+        '<div class="agent-orb-wrap">'
+        '<div class="agent-orb"></div>'
+        '<div class="agent-orb-core"></div>'
+        '<div class="agent-orb-ring"></div>'
+        "</div>"
+        "<div>"
+        f'<div class="agent-status-title">{title}</div>'
+        f'<div class="agent-status-sub">{subtitle}</div>'
+        f'<ul class="agent-steps">{items}</ul>'
+        '<div class="shimmer-bar"></div>'
+        "</div></div>"
+    )
+
+
+THINKING_HTML = _agent_status_html(
+    "Agent thinking",
+    "Planning the answer and deciding which tools to use",
+    ["Thinking", "Calling tools", "Composing answer"],
+)
+
+INDEXING_HTML = _agent_status_html(
+    "Indexing documents",
+    "Parsing files and updating the knowledge base",
+    ["Reading files", "Chunking", "Embedding"],
+)
+
+
+# ── Helpers ───────────────────────────────────────────────────────────────────
 def _fetch_documents() -> list[dict]:
-    """Return the list of indexed documents from the backend, or [] on error."""
     try:
         r = httpx.get(f"{API_URL.rstrip('/')}/documents", timeout=8)
         r.raise_for_status()
@@ -77,286 +133,410 @@ def _fetch_documents() -> list[dict]:
 
 
 def _upload_files(uploaded_files) -> dict:
-    """POST files to /upload and return the response JSON."""
     files_payload = [
         ("files", (f.name, io.BytesIO(f.read()), f.type or "application/octet-stream"))
         for f in uploaded_files
     ]
-    r = httpx.post(
-        f"{API_URL.rstrip('/')}/upload",
-        files=files_payload,
-        timeout=300,   # indexing large files can take a while
-    )
+    r = httpx.post(f"{API_URL.rstrip('/')}/upload", files=files_payload, timeout=300)
     r.raise_for_status()
     return r.json()
 
 
-# ── Page setup ───────────────────────────────────────────────────────────────
-st.set_page_config(    page_title="KT Assistant",
-    page_icon="🤖",
-    layout="wide",
-    initial_sidebar_state="expanded",
-)
-
-# ── CSS ──────────────────────────────────────────────────────────────────────
-st.markdown("""
-<style>
-/* Normalise heading sizes inside chat bubbles */
-[data-testid="stChatMessageContent"] h1,
-[data-testid="stChatMessageContent"] h2,
-[data-testid="stChatMessageContent"] h3,
-[data-testid="stChatMessageContent"] h4 {
-    font-size: 1rem !important;
-    font-weight: 600 !important;
-    margin-top: 0.5rem !important;
-    margin-bottom: 0.2rem !important;
-}
-[data-testid="stChatMessageContent"] p,
-[data-testid="stChatMessageContent"] li {
-    font-size: 0.93rem;
-    line-height: 1.65;
-}
-/* Citation pill */
-.citation-pill {
-    display: inline-block;
-    background: #f0f4ff;
-    border: 1px solid #c9d8ff;
-    border-radius: 12px;
-    padding: 2px 10px;
-    font-size: 0.78rem;
-    color: #3a5bd9;
-    margin: 2px 3px 2px 0;
-}
-/* Tool badge */
-.tool-badge {
-    display: inline-block;
-    border-radius: 4px;
-    padding: 1px 8px;
-    font-size: 0.76rem;
-    font-weight: 600;
-    color: #fff;
-    margin-right: 4px;
-}
-/* Thin separator above citations */
-.citation-block {
-    border-top: 1px solid #e9ecef;
-    margin-top: 8px;
-    padding-top: 6px;
-}
-</style>
-""", unsafe_allow_html=True)
+def _check_backend() -> bool:
+    try:
+        r = httpx.get(f"{API_URL.rstrip('/')}/health", timeout=3)
+        return r.status_code == 200
+    except Exception:
+        return False
 
 
-# ── Session state bootstrap ──────────────────────────────────────────────────
+# ── Session state ─────────────────────────────────────────────────────────────
 if "session_id" not in st.session_state:
-    # Each browser tab gets its own UUID — gives true per-tab conversation memory
     st.session_state.session_id = str(uuid.uuid4())
 
 if "messages" not in st.session_state:
-    st.session_state.messages = [
-        {
-            "role": "assistant",
-            "content": (
-                "Hi! I'm your **Knowledge Transfer Assistant**. Ask me anything:\n\n"
-                "- 📄 Questions about company documents (PDFs, Word, Excel)\n"
-                "- 🗄️ Database queries (orders, customers, employees...)\n"
-                "- 🌐 Live web facts (news, prices, weather)\n"
-                "- 🧮 Calculations and number crunching\n"
-                "- 📊 Data visualisation (charts from your data)\n\n"
-                "I remember the full conversation — feel free to ask follow-up questions!"
-            ),
-            "datasource": None,
-            "tools_used": [],
-            "citations": [],
-            "chart_data": None,
-        }
-    ]
+    st.session_state.messages = []
+
+if "backend_ok" not in st.session_state:
+    st.session_state.backend_ok = _check_backend()
+
+if "sources_open" not in st.session_state:
+    st.session_state.sources_open = False
+
+if "active_sources" not in st.session_state:
+    st.session_state.active_sources = []
+
+if "active_tools" not in st.session_state:
+    st.session_state.active_tools = []
 
 
-# ── Helper: render a single assistant message ────────────────────────────────
-def _render_assistant_message(msg: dict) -> None:
-    """Render answer text, tool badge, chart, and citations for one assistant turn."""
+# ── Render assistant message ──────────────────────────────────────────────────
+def _render_assistant_message(msg: dict, msg_index: int = 0) -> None:
     st.markdown(msg["content"])
 
-    datasource  = msg.get("datasource")
-    tools_used  = msg.get("tools_used") or []
-    citations   = msg.get("citations") or []
-    chart_data  = msg.get("chart_data")
+    datasource = msg.get("datasource")
+    tools_used = msg.get("tools_used") or []
+    citations  = msg.get("citations") or []
+    chart_data = msg.get("chart_data")
 
-    # ── Inline chart ──────────────────────────────────────────────────────
+    # Chart
     if chart_data:
         try:
             import plotly.graph_objects as go
             fig = go.Figure(chart_data)
-            st.plotly_chart(fig, use_container_width=True, key=f"chart_{id(msg)}")
+            fig.update_layout(
+                paper_bgcolor="rgba(0,0,0,0)",
+                plot_bgcolor="rgba(13, 19, 32, 0.65)",
+                font_color="#cbd5e1",
+            )
+            # Fix #6: use msg_index as key — id(msg) changes on every rerun
+            # causing chart flickering.
+            st.plotly_chart(fig, width="stretch", key=f"chart_{msg_index}")
         except Exception as exc:
             st.warning(f"Could not render chart: {exc}")
 
-    # ── Tool badge + tools list ───────────────────────────────────────────
-    if datasource:
-        cfg   = ROUTE_CONFIG.get(datasource, {"icon": "🔧", "label": datasource, "color": "#666"})
-        color = cfg["color"]
-        label = cfg["label"]
-        icon  = cfg["icon"]
+    # Meta row — only if there's something to show
+    if datasource or citations:
+        cfg = ROUTE_CONFIG.get(datasource or "", {
+            "icon": "·", "label": datasource or "", "color": "#64748b", "bg": "#1e2536"
+        })
 
+        # Build the badge HTML
         badge_html = (
-            f'<span class="tool-badge" style="background:{color}">'
-            f'{icon} {label}</span>'
+            f'<span class="tool-badge" style="'
+            f'color:{cfg["color"]};'
+            f'background:{cfg["bg"]};'
+            f'border-color:{cfg["color"]}22;">'
+            f'<span class="badge-icon">{cfg["icon"]}</span>'
+            f'{cfg["label"]}'
+            f'</span>'
         )
-        if tools_used:
-            tools_str = " · ".join(f"`{t}`" for t in tools_used)
-            st.markdown(
-                badge_html + f'<span style="font-size:0.78rem;color:#555"> {tools_str}</span>',
-                unsafe_allow_html=True,
-            )
-        else:
-            st.markdown(badge_html, unsafe_allow_html=True)
 
-    # ── Citations ─────────────────────────────────────────────────────────
-    if citations:
-        pills_html = "".join(
-            f'<span class="citation-pill" title="{c.get("detail","")}">'
-            f'📎 {c["source"]}</span>'
-            for c in citations
-        )
+        # Tool name (first tool, lowercase)
+        tool_label = ""
+        if tools_used:
+            tool_label = f'<span class="tool-name-chip">{tools_used[0]}</span>'
+
         st.markdown(
-            f'<div class="citation-block">'
-            f'<span style="font-size:0.76rem;color:#888;font-weight:600">SOURCES </span>'
-            f'{pills_html}</div>',
+            f'<div class="meta-row">{badge_html}{tool_label}</div>',
             unsafe_allow_html=True,
         )
 
+        # Sources button — separate row, right-aligned, minimal
+        if citations:
+            is_active = (
+                st.session_state.sources_open and
+                st.session_state.active_sources == citations
+            )
+            btn_label = f"{'↙' if is_active else '↗'} {len(citations)} source{'s' if len(citations) != 1 else ''}"
 
-# ── Sidebar ──────────────────────────────────────────────────────────────────
+            st.markdown('<div class="src-btn-wrap">', unsafe_allow_html=True)
+            if st.button(btn_label, key=f"src_{msg_index}_{id(msg)}"):
+                if is_active:
+                    st.session_state.sources_open   = False
+                    st.session_state.active_sources = []
+                    st.session_state.active_tools   = []
+                else:
+                    st.session_state.sources_open   = True
+                    st.session_state.active_sources = citations
+                    st.session_state.active_tools   = tools_used
+                st.rerun()
+            st.markdown('</div>', unsafe_allow_html=True)
+
+
+# ── Sidebar ───────────────────────────────────────────────────────────────────
 with st.sidebar:
-    st.title("🤖 KT Assistant")
-    st.caption(f"Session `{st.session_state.session_id[:8]}…`")
+    # Brand
+    st.markdown("""
+    <div class="brand-mark">
+        <div class="brand-title">DataDialogue</div>
+        <div class="brand-sub">Knowledge transfer assistant</div>
+    </div>
+    """, unsafe_allow_html=True)
+
+    # Backend status
+    dot_cls = "ok" if st.session_state.backend_ok else "bad"
+    status_text = "Backend connected" if st.session_state.backend_ok else "Backend offline"
+    st.markdown(
+        f'<div class="status-pill">'
+        f'<div class="status-pill-dot {dot_cls}"></div>'
+        f'<span style="font-size:0.72rem;color:#94a3b8;">{status_text}</span>'
+        f'<span style="font-size:0.68rem;color:#475569;margin-left:auto;">'
+        f'{st.session_state.session_id[:8]}…</span></div>',
+        unsafe_allow_html=True,
+    )
+
     st.divider()
 
-    # ── Document upload ───────────────────────────────────────────────────
-    st.markdown("### 📂 Upload Documents")
-    st.caption("PDF, DOCX, XLSX, CSV, TXT — dropped into `data/` and indexed automatically.")
+    # Upload
+    st.markdown('<div class="sidebar-section">Upload Documents</div>', unsafe_allow_html=True)
+    st.caption("PDF · DOCX · XLSX · CSV · TXT")
 
     uploaded = st.file_uploader(
-        label="Choose files",
+        label="files",
         type=["pdf", "docx", "doc", "xlsx", "xls", "csv", "txt"],
         accept_multiple_files=True,
         label_visibility="collapsed",
     )
 
     if uploaded:
-        if st.button("⬆️ Upload & Index", type="primary", use_container_width=True):
-            with st.spinner("Uploading and building index… this may take a minute."):
-                try:
-                    result = _upload_files(uploaded)
-                    saved    = result.get("saved", [])
-                    rejected = result.get("rejected", [])
-                    indexed  = result.get("indexed", [])
+        if st.button("Upload and index", type="primary", icon=":material/upload:", width="stretch"):
+            index_slot = st.empty()
+            index_slot.markdown(INDEXING_HTML, unsafe_allow_html=True)
+            try:
+                result     = _upload_files(uploaded)
+                saved      = result.get("saved", [])
+                duplicates = result.get("duplicates", [])
+                conflicts  = result.get("conflicts", [])
+                rejected   = result.get("rejected", [])
+                index_slot.empty()
 
-                    if saved:
-                        st.success(
-                            f"✅ {len(saved)} file(s) uploaded and indexed:\n"
-                            + "\n".join(f"• {f}" for f in saved)
-                        )
-                    if rejected:
-                        st.warning(
-                            f"⚠️ {len(rejected)} file(s) skipped (unsupported format):\n"
-                            + "\n".join(f"• {f}" for f in rejected)
-                        )
-                    # Force the document list to refresh
+                if saved:
+                    st.success(
+                        f"{len(saved)} file(s) indexed: {', '.join(saved)}",
+                        icon=":material/check_circle:",
+                    )
+                if duplicates:
+                    st.info(
+                        f"{len(duplicates)} duplicate(s) skipped — already indexed: "
+                        f"{', '.join(duplicates)}",
+                        icon=":material/content_copy:",
+                    )
+                if conflicts:
+                    st.warning(
+                        f"{len(conflicts)} file(s) have a name conflict "
+                        f"(same name, different content) — rename before uploading: "
+                        f"{', '.join(conflicts)}",
+                        icon=":material/warning:",
+                    )
+                if rejected:
+                    st.warning(
+                        f"{len(rejected)} file(s) skipped — unsupported format: "
+                        f"{', '.join(rejected)}",
+                        icon=":material/block:",
+                    )
+
+                if saved:
                     st.session_state.pop("docs_cache", None)
 
-                except httpx.ConnectError:
-                    st.error("Cannot reach the backend. Is FastAPI running?")
-                except Exception as exc:
-                    st.error(f"Upload failed: {exc}")
+            except httpx.ConnectError:
+                index_slot.empty()
+                st.error("Backend offline", icon=":material/error:")
+            except Exception as exc:
+                index_slot.empty()
+                st.error(f"Upload failed: {exc}", icon=":material/error:")
 
     st.divider()
 
-    # ── Indexed documents list ────────────────────────────────────────────
-    st.markdown("### 📋 Indexed Documents")
+    # Documents
+    st.markdown('<div class="sidebar-section">Indexed Documents</div>', unsafe_allow_html=True)
 
-    # Cache the doc list in session state so it doesn't re-fetch on every keystroke
     if "docs_cache" not in st.session_state:
-        st.session_state.docs_cache = _fetch_documents()
+        with st.spinner("Loading documents…"):
+            st.session_state.docs_cache = _fetch_documents()
 
     docs = st.session_state.docs_cache
-
     if docs:
+        FILE_ICONS = {"PDF": "📄", "DOCX": "📝", "DOC": "📝",
+                      "XLSX": "📊", "XLS": "📊", "CSV": "📊", "TXT": "📃"}
         for doc in docs:
-            icon = {"PDF": "📄", "DOCX": "📝", "DOC": "📝",
-                    "XLSX": "📊", "XLS": "📊", "CSV": "📊", "TXT": "📃"}.get(doc["type"], "📎")
+            icon = FILE_ICONS.get(doc["type"], "📎")
             st.markdown(
-                f"{icon} **{doc['name']}** "
-                f"<span style='color:#888;font-size:0.78rem'>{doc['size_kb']} KB</span>",
+                f'<div class="doc-item">'
+                f'<span>{icon}</span>'
+                f'<span class="doc-name">{doc["name"]}</span>'
+                f'<span class="doc-size">{doc["size_kb"]} KB</span>'
+                f'</div>',
                 unsafe_allow_html=True,
             )
     else:
-        st.caption("No documents indexed yet. Upload files above to get started.")
+        st.caption("No documents yet.")
 
-    if st.button("🔄 Refresh list", use_container_width=True):
+    if st.button("Refresh", icon=":material/refresh:", width="stretch"):
         st.session_state.docs_cache = _fetch_documents()
         st.rerun()
 
     st.divider()
 
-    # ── Session controls ──────────────────────────────────────────────────
-    st.markdown("### 💬 Session")
+    # Session controls
+    st.markdown('<div class="sidebar-section">Session</div>', unsafe_allow_html=True)
     col1, col2 = st.columns(2)
     with col1:
-        if st.button("🗑️ Clear chat", use_container_width=True):
+        if st.button("Clear", icon=":material/delete:", width="stretch"):
             st.session_state.messages = []
             try:
-                httpx.delete(
-                    f"{API_URL}/sessions/{st.session_state.session_id}/history",
-                    timeout=10,
-                )
+                httpx.delete(f"{API_URL}/sessions/{st.session_state.session_id}/history", timeout=10)
             except Exception:
                 pass
             st.rerun()
     with col2:
-        if st.button("🆕 New session", use_container_width=True):
+        if st.button("New", icon=":material/add:", width="stretch"):
             st.session_state.session_id = str(uuid.uuid4())
             st.session_state.messages   = []
             st.rerun()
 
     st.divider()
 
-    # ── Sample questions ──────────────────────────────────────────────────
-    st.markdown("### 💡 Try a sample question")
+    # Sample questions
+    st.markdown('<div class="sidebar-section">Sample Questions</div>', unsafe_allow_html=True)
     for group, questions in SAMPLE_QUESTIONS.items():
         with st.expander(group, expanded=False):
             for q in questions:
-                if st.button(q, key=f"sample_{q}", use_container_width=True):
+                if st.button(q, key=f"sample_{q}", width="stretch"):
                     st.session_state.pending_question = q
                     st.rerun()
 
-    st.divider()
-    st.markdown("**Backend**")
-    st.code(API_URL, language="text")
-    st.caption("Start: `uvicorn app:app --reload --port 8000`")
 
+# ── Main area ─────────────────────────────────────────────────────────────────
 
-# ── Main layout ──────────────────────────────────────────────────────────────
-st.title("CTE Knowledge Transfer Assistant 🤖")
-st.caption(
-    "Ask anything about company documents, databases, or the live web. "
-    "Charts, calculations, and source citations included."
-)
+# Header
+st.markdown("""
+<div class="app-header">
+    <span class="app-header-icon">🧠</span>
+    <div>
+        <div class="app-header-title">DataDialogue</div>
+        <div class="app-header-subtitle">
+            <span class="status-dot"></span>
+            Ask questions about your documents, database, or the live web
+        </div>
+    </div>
+</div>
+""", unsafe_allow_html=True)
 
-# Render existing conversation history
-for msg in st.session_state.messages:
-    with st.chat_message(msg["role"]):
-        if msg["role"] == "assistant":
-            _render_assistant_message(msg)
-        else:
-            st.markdown(msg["content"])
+# Layout: chat column + optional sources panel
+if st.session_state.sources_open:
+    chat_col, sources_col = st.columns([2, 1], gap="medium")
+else:
+    chat_col = st.container()
+    sources_col = None
 
-# ── Input handling ───────────────────────────────────────────────────────────
-prompt = (
-    st.session_state.pop("pending_question", None)
-    or st.chat_input("Ask a question…")
-)
+with chat_col:
+    # Welcome card (only when no messages)
+    if not st.session_state.messages:
+        st.markdown("""
+        <div class="welcome-card">
+            <div class="welcome-title">What can I help you with?</div>
+            <div style="font-size:0.82rem;color:#64748b;">
+                I can search your documents, query the database, run calculations,
+                generate charts, or look up live web data.
+            </div>
+            <div class="welcome-grid">
+                <div class="welcome-item">📄 Company documents &amp; reports</div>
+                <div class="welcome-item">🗄️ Database queries &amp; analytics</div>
+                <div class="welcome-item">🌐 Live web facts &amp; prices</div>
+                <div class="welcome-item">📊 Charts &amp; calculations</div>
+            </div>
+        </div>
+        """, unsafe_allow_html=True)
+
+    # Conversation history
+    for i, msg in enumerate(st.session_state.messages):
+        with st.chat_message(
+            msg["role"],
+            avatar=":material/psychology:" if msg["role"] == "assistant" else ":material/person:",
+        ):
+            if msg["role"] == "assistant":
+                _render_assistant_message(msg, msg_index=i)
+            else:
+                st.markdown(msg["content"])
+
+# Sources panel
+if sources_col is not None:
+    with sources_col:
+        # Panel header
+        hcol1, hcol2 = st.columns([5, 1])
+        with hcol1:
+            st.markdown(
+                '<div style="font-size:0.82rem;font-weight:700;color:#e2e8f0;'
+                'padding:4px 0 10px 0;letter-spacing:-0.1px;">Sources</div>',
+                unsafe_allow_html=True,
+            )
+        with hcol2:
+            if st.button("✕", key="close_sources"):
+                st.session_state.sources_open   = False
+                st.session_state.active_sources = []
+                st.session_state.active_tools   = []
+                st.rerun()
+
+        st.markdown(
+            '<div style="height:1px;background:#1e2d45;margin-bottom:14px;"></div>',
+            unsafe_allow_html=True,
+        )
+
+        # Tools used
+        if st.session_state.active_tools:
+            st.markdown(
+                '<div class="section-label">Tools used</div>',
+                unsafe_allow_html=True,
+            )
+            for t in st.session_state.active_tools:
+                # Fix #3: use _TOOL_DATASOURCE dict — no fragile string matching
+                ds    = _TOOL_DATASOURCE.get(t, "direct_llm")
+                cfg   = ROUTE_CONFIG.get(ds, ROUTE_CONFIG["direct_llm"])
+                color = cfg.get("color", "#64748b")
+                st.markdown(
+                    f'<div style="display:inline-flex;align-items:center;gap:6px;'
+                    f'background:#0d1320;border:1px solid #1a2540;border-radius:6px;'
+                    f'padding:4px 10px;margin-bottom:10px;margin-right:4px;">'
+                    f'<span style="width:6px;height:6px;background:{color};border-radius:50%;'
+                    f'flex-shrink:0;"></span>'
+                    f'<span style="font-size:0.72rem;color:#94a3b8;font-family:monospace;">{t}</span>'
+                    f'</div>',
+                    unsafe_allow_html=True,
+                )
+
+        # References
+        st.markdown(
+            '<div class="section-label">References</div>',
+            unsafe_allow_html=True,
+        )
+
+        for c in st.session_state.active_sources:
+            source = c.get("source", "")
+            detail = c.get("detail", "")
+            is_url = source.startswith("http")
+
+            if is_url:
+                try:
+                    from urllib.parse import urlparse
+                    parsed = urlparse(source)
+                    domain = parsed.netloc.replace("www.", "")
+                    path   = parsed.path[:40] + "…" if len(parsed.path) > 40 else parsed.path
+                except Exception:
+                    domain = source[:30]
+                    path   = ""
+
+                st.markdown(
+                    f'<a href="{source}" target="_blank" style="text-decoration:none;">'
+                    f'<div class="source-card">'
+                    f'<div class="source-icon">↗</div>'
+                    f'<div class="source-content">'
+                    f'<div class="source-domain">{domain}</div>'
+                    f'<div class="source-detail">{path}</div>'
+                    f'</div></div></a>',
+                    unsafe_allow_html=True,
+                )
+            else:
+                # File source
+                ext = source.rsplit(".", 1)[-1].upper() if "." in source else "FILE"
+                icon_map = {"PDF": "PDF", "DOCX": "DOC", "XLSX": "XLS", "CSV": "CSV", "TXT": "TXT"}
+                icon_label = icon_map.get(ext, "≡")
+                detail_str = detail[:80] if detail else ""
+
+                st.markdown(
+                    f'<div class="source-card" style="cursor:default;">'
+                    f'<div class="source-icon" style="font-size:0.6rem;font-weight:700;'
+                    f'color:#38bdf8;">{icon_label}</div>'
+                    f'<div class="source-content">'
+                    f'<div class="source-domain" style="color:#94a3b8;">{source}</div>'
+                    + (f'<div class="source-detail">{detail_str}</div>' if detail_str else "")
+                    + f'</div></div>',
+                    unsafe_allow_html=True,
+                )
+
+# ── Input ─────────────────────────────────────────────────────────────────────
+typed_input = st.chat_input("Ask anything…", submit_mode="disable")
+prompt = st.session_state.pop("pending_question", None) or typed_input
 
 if not prompt:
     st.stop()
@@ -365,62 +545,121 @@ prompt = prompt.strip()
 if not prompt:
     st.stop()
 
-# Show user message immediately
+# Show user message
 st.session_state.messages.append({"role": "user", "content": prompt})
-with st.chat_message("user"):
-    st.markdown(prompt)
+with chat_col:
+    with st.chat_message("user", avatar=":material/person:"):
+        st.markdown(prompt)
 
-# ── Call the FastAPI backend ─────────────────────────────────────────────────
-with st.chat_message("assistant"):
-    with st.spinner("Thinking…"):
+# Call backend
+with chat_col:
+    with st.chat_message("assistant", avatar=":material/psychology:"):
+        thinking = st.empty()
+        thinking.markdown(THINKING_HTML, unsafe_allow_html=True)
+
         answer     = ""
         datasource = None
         tools_used = []
         citations  = []
         chart_data = None
 
+        # ── Streaming via SSE /stream endpoint ───────────────────────────────
+        # Fix #5: accumulate tokens in batches of _STREAM_BATCH_SIZE before
+        # re-rendering to reduce Streamlit markdown flicker on every token.
+        answer_slot  = st.empty()   # live-updating text area
+        tool_slot    = st.empty()   # "using tool …" indicator
+        token_buffer = 0            # counts tokens since last render
+
         try:
-            response = httpx.post(
-                f"{API_URL.rstrip('/')}/ask",
-                json={
-                    "question":   prompt,
-                    "session_id": st.session_state.session_id,
-                },
+            with httpx.stream(
+                "GET",
+                f"{API_URL.rstrip('/')}/stream",
+                params={"question": prompt, "session_id": st.session_state.session_id},
                 timeout=REQUEST_TIMEOUT,
-            )
-            response.raise_for_status()
-            payload    = response.json()
-            answer     = payload.get("answer") or "I could not generate an answer."
-            datasource = payload.get("datasource")
-            tools_used = payload.get("tools_used") or []
-            citations  = payload.get("citations") or []
-            chart_data = payload.get("chart_data")
+            ) as r:
+                r.raise_for_status()
+                for raw_line in r.iter_lines():
+                    if not raw_line.startswith("data: "):
+                        continue
+                    event = json.loads(raw_line[6:])
+                    etype = event.get("type")
+
+                    if etype == "status":
+                        pass  # keep the thinking spinner
+
+                    elif etype == "token":
+                        if not answer:
+                            thinking.empty()  # clear spinner on first token
+                        answer       += event.get("text", "")
+                        token_buffer += 1
+                        # Fix #5: only re-render every N tokens
+                        if token_buffer >= _STREAM_BATCH_SIZE:
+                            answer_slot.markdown(answer + "▌")
+                            token_buffer = 0
+
+                    elif etype == "tool":
+                        tool_name = event.get("name", "tool")
+                        tool_slot.markdown(
+                            f'<div class="tool-badge" style="color:#a78bfa;'
+                            f'background:#1e1040;border-color:#a78bfa22;">'
+                            f'<span class="badge-icon">⚙</span> using {tool_name}…</div>',
+                            unsafe_allow_html=True,
+                        )
+
+                    elif etype == "done":
+                        payload    = event.get("payload", {})
+                        datasource = payload.get("datasource")
+                        tools_used = payload.get("tools_used") or []
+                        citations  = payload.get("citations") or []
+                        chart_data = payload.get("chart_data")
+                        if not answer:
+                            answer = payload.get("answer") or payload.get("generation", "I could not generate an answer.")
+
+                    elif etype == "error":
+                        if not answer:
+                            answer = f"⚠️ **Agent error:** {event.get('detail', 'Unknown error')}"
+
+                # Flush any remaining buffered tokens
+                if token_buffer > 0 and answer:
+                    answer_slot.markdown(answer + "▌")
+
+            # Fix #1: clear placeholders once — duplicate thinking.empty() removed
+            thinking.empty()
+            answer_slot.empty()
+            tool_slot.empty()
+            # Fix #2: re-check backend status so the pill reflects current state
+            st.session_state.backend_ok = True
 
         except httpx.ConnectError:
+            st.session_state.backend_ok = False  # Fix #2: mark backend offline immediately
             answer = (
                 "⚠️ **Cannot reach the backend.**\n\n"
-                f"Make sure FastAPI is running:\n```\nuvicorn app:app --reload --port 8000\n```\n"
+                f"Make sure FastAPI is running:\n"
+                f"```\nuvicorn app:app --reload --port 8000\n```\n"
                 f"Expected at: `{API_URL}`"
             )
         except httpx.TimeoutException:
             answer = (
-                "⚠️ **Request timed out.** "
-                "The agent may still be processing — try asking again or "
-                "check the backend logs."
+                "⚠️ **Request timed out.**\n\n"
+                "The agent is still processing — try asking again."
             )
         except Exception as exc:
             answer = f"⚠️ **Unexpected error:** {exc}"
+        finally:
+            # Fix #1: single cleanup point — no duplicate calls
+            thinking.empty()
+            answer_slot.empty()
+            tool_slot.empty()
 
-    # Build the message dict so _render_assistant_message can use it
-    assistant_msg = {
-        "role":       "assistant",
-        "content":    answer,
-        "datasource": datasource,
-        "tools_used": tools_used,
-        "citations":  citations,
-        "chart_data": chart_data,
-    }
-    _render_assistant_message(assistant_msg)
+        assistant_msg = {
+            "role":       "assistant",
+            "content":    answer,
+            "datasource": datasource,
+            "tools_used": tools_used,
+            "citations":  citations,
+            "chart_data": chart_data,
+        }
+        msg_index = len(st.session_state.messages)
+        _render_assistant_message(assistant_msg, msg_index=msg_index)
 
-# Persist to session state so the message is re-rendered on the next rerun
 st.session_state.messages.append(assistant_msg)

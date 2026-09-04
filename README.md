@@ -1,351 +1,209 @@
-# KT Agent — Knowledge Transfer Assistant
+# DataDialogue — Knowledge Transfer Assistant
 
-> A conversational AI agent that answers questions about your company by searching internal documents, querying a database, or looking up the live web — all from a single chat interface.
+A conversational AI agent that answers questions about your company files, database, and the live web — with real-time streaming responses.
 
-Built with **LangGraph + LlamaIndex + FastAPI + Streamlit**.
+Built with **LangGraph · LlamaIndex · FastAPI · Streamlit**
 
 ---
 
-## What does it do?
+## What it does
 
-You ask a question in plain English. The agent figures out the best way to answer it:
+Ask questions in plain English. The agent picks the right tool automatically:
 
-| Your question | How the agent answers |
+| Question | What happens |
 |---|---|
-| "What is Python?" | Answers directly from its own knowledge |
-| "What does our KT document say about deployment?" | Searches your company PDFs and DOCX files |
-| "What is in the Q3 revenue Excel sheet?" | Searches your uploaded Excel / CSV files |
-| "What is the status of order #12345?" | Queries the company SQLite database |
-| "What is the weather in Bangalore today?" | Searches the live web via Tavily |
+| "Summarise the annual report" | Reads your uploaded PDF/DOCX |
+| "What is the status of order #12345?" | Queries the company database |
+| "What is 15% of 85000?" | Runs a safe calculator |
+| "Show monthly sales as a bar chart" | Generates an interactive Plotly chart |
+| "What is the USD to INR rate today?" | Searches the live web |
 
-No manual routing. No dropdowns. The LLM reads the available tools and decides which one to use.
-
----
-
-## How it looks
-
-```
-You:   What does the KT document say about the system architecture?
-
-Agent: The KT document describes a three-layer architecture consisting of...
-       [Tool used: search_company_documents]
-```
+Answers stream word-by-word in real time — no waiting for the full response.
 
 ---
 
-## Tech Stack
+## Quick Start
 
-| Layer | Technology |
-|---|---|
-| Chat UI | Streamlit |
-| API backend | FastAPI |
-| Agent loop | LangGraph (ReAct pattern) |
-| LLM | Groq (default) / Google Gemini / Cohere |
-| Document search | LlamaIndex + HuggingFace embeddings |
-| Database queries | Python sqlite3 (MCP-compatible interface) |
-| Web search | Tavily API |
-
----
-
-## Project Structure
-
-```
-kt-agent-using-langgraph/
-│
-├── app.py                        # FastAPI backend — POST /ask endpoint
-├── streamlit_app.py              # Streamlit chat UI
-├── requirements.txt
-├── .env                          # Your API keys (never commit this)
-│
-├── data/                         # PUT YOUR COMPANY FILES HERE
-│   ├── company.db                # SQLite database
-│   ├── your_report.pdf           # PDFs go here
-│   ├── quarterly_data.xlsx       # Excel files go here
-│   └── project_notes.docx        # Word docs go here
-│
-├── indexing_data/                # Auto-generated — vector store (do not edit)
-│
-├── src/
-│   └── agent/
-│       ├── config.py             # Paths and environment setup
-│       ├── chains.py             # LLM factory (Groq / Gemini / Cohere)
-│       ├── rag.py                # Document ingestion and search
-│       ├── tools.py              # search_company_documents, search_web
-│       ├── mcp_client.py         # Database query tools
-│       ├── workflow.py           # LangGraph agent — the core logic
-│       ├── schemas.py            # API request/response models
-│       └── ingest_drive.py       # Optional: sync from Google Drive
-│
-├── docs/
-│   ├── ARCHITECTURE.md           # System architecture and flow diagrams
-│   └── SYSTEM_DESIGN.md          # Component design details
-│
-└── tests/
-    └── test_agents.py            # R&D prototype script
-```
-
----
-
-## Setup Guide (Step by Step)
-
-### Step 1 — Prerequisites
-
-- Python 3.11 or newer
-- At least one LLM API key (Groq is recommended — free tier available)
-- A Tavily API key (free tier available at [tavily.com](https://tavily.com))
-
-Get your free API keys:
-- Groq: https://console.groq.com
-- Tavily: https://tavily.com
-- Google Gemini: https://aistudio.google.com (alternative to Groq)
-
----
-
-### Step 2 — Install dependencies
+### 1. Install dependencies
 
 ```bash
+cd DataDialogue
+python -m venv .venv
+.venv\Scripts\activate        # Windows
 pip install -r requirements.txt
 ```
 
-This installs everything including LangGraph, LlamaIndex, FastAPI, Streamlit, and `openpyxl` for Excel support.
+### 2. Set up `.env`
 
----
+Copy the template and provide your API keys:
 
-### Step 3 — Create your `.env` file
-
-Create a file called `.env` in the project root (same folder as `app.py`):
+```bash
+cp .env.example .env
+```
 
 ```env
-# ── LLM Provider (pick at least ONE) ──────────────────────────────────────
-GROQ_API_KEY=your_groq_api_key_here
+# LLM — pick at least one
+GOOGLE_API_KEY=your_google_api_key_here   # Google Gemini (default)
+GROQ_API_KEY=your_groq_api_key_here       # Groq (optional)
+COHERE_API_KEY=your_cohere_key_here       # Cohere (optional)
 
-# Uncomment to use Google Gemini instead:
-# GOOGLE_API_KEY=your_google_api_key_here
+# Web search — all optional, cascades automatically: Tavily → Serper → DuckDuckGo
+TAVILY_API_KEY=your_key_here      # tavily.com — 1,000 free/month
+SERPER_API_KEY=your_key_here      # serper.dev — 2,500 free, no card
 
-# Uncomment to use Cohere instead:
-# COHERE_API_KEY=your_cohere_api_key_here
+KT_API_URL=http://localhost:8000
 
-# ── Web Search (required) ──────────────────────────────────────────────────
-TAVILY_API_KEY=your_tavily_api_key_here
-
-# ── Optional overrides ────────────────────────────────────────────────────
-# Force a specific LLM even when multiple keys are present:
-# LLM_PROVIDER=groq          # Options: groq, google, cohere
-
-# API URL used by Streamlit to talk to FastAPI:
-# KT_API_URL=http://localhost:8000
-
-# Google Drive folder sync (optional):
-# GOOGLE_DRIVE_FOLDER_ID=your_folder_id_here
+# PostgreSQL — only needed if using pgvector or Postgres memory (optional)
+POSTGRES_URL=postgresql+psycopg://postgres:password@localhost:5432/datadialogue
+USE_PGVECTOR=false
+USE_POSTGRES_MEMORY=false
 ```
 
-> If you have multiple LLM keys, the system auto-selects in this order: **Groq → Google → Cohere**. Set `LLM_PROVIDER` to override.
+> No web search key? DuckDuckGo is used automatically — no signup needed.
+> Leave `USE_PGVECTOR` and `USE_POSTGRES_MEMORY` as `false` to use the default SQLite + JSON setup.
 
----
+### 3. Index your documents
 
-### Step 4 — Add your company data
-
-Place your files inside the `data/` folder. Supported formats:
-
-| Format | Extension |
-|---|---|
-| PDF | `.pdf` |
-| Word document | `.docx`, `.doc` |
-| Excel spreadsheet | `.xlsx`, `.xls` |
-| CSV | `.csv` |
-| Plain text | `.txt` |
-
-Example:
-
-```
-data/
-├── company.db
-├── annual_report_2025.pdf
-├── employee_handbook.docx
-├── product_catalog.xlsx
-└── sales_data_q3.csv
-```
-
-No code changes needed. The system auto-discovers all supported files.
-
----
-
-### Step 5 — Build the document index
-
-Run this **once** to scan your `data/` folder and build the search index:
+Drop files into `data/` (PDF, DOCX, XLSX, CSV, TXT), then build the index:
 
 ```bash
 python -m src.agent.rag
 ```
 
-You will see:
+> **Incremental Uploads**: You can also upload new documents directly via the Streamlit UI or `POST /upload`. The engine uses incremental indexing (`add_documents_to_index`), adding only the new documents without rebuilding the entire store.
 
-```
-Scanning data/ for documents...
-Found 4 file(s): ['annual_report_2025.pdf', 'employee_handbook.docx', 'product_catalog.xlsx', 'sales_data_q3.csv']
-Building index...
-Done. Vector store saved to: indexing_data/
-```
+### 4. Run
 
-> Re-run this command whenever you add, remove, or update files in `data/`.
-
----
-
-### Step 6 — Start the backend API
+Two terminals:
 
 ```bash
-python -m uvicorn app:app --host 0.0.0.0 --port 8000 --reload
+# Terminal 1: FastAPI Backend
+uvicorn app:app --reload --port 8000
+
+# Terminal 2: Streamlit Frontend
+python -m streamlit run streamlit_app.py
 ```
 
-Verify it is running: http://localhost:8000/health should return `{"status": "ok"}`
-
-The interactive API docs are at: http://localhost:8000/docs
+Open **http://localhost:8501**
 
 ---
 
-### Step 7 — Start the chat UI
+## Running Tests
 
-Open a second terminal and run:
+Run the automated test suite with pytest:
 
 ```bash
-python -m streamlit run streamlit_app.py --server.port 8501
+pytest tests/
 ```
 
-Open **http://localhost:8501** in your browser. Start asking questions.
+The test suite covers:
+- **`tests/test_tools.py`**: SQL injection guards, DDL blocking, AST math evaluation, and schema caching TTL.
+- **`tests/test_workflow.py`**: State deduplication, tool tracking, and response serialization compatibility.
+- **`tests/test_api.py`**: FastAPI routes (`/health`, `/ask` validation, `/sessions`, `/upload`).
 
 ---
 
-## Using the Agent
+## PostgreSQL + pgvector (optional upgrade)
 
-Once running, type any question in the chat box. Some examples:
+Replaces the default SQLite memory store and JSON vector store with a single PostgreSQL instance. Recommended when you have 50+ documents or multiple concurrent users.
 
-**Document questions (searches your uploaded files):**
-- "Summarise the annual report"
-- "What does the employee handbook say about leave policy?"
-- "What are the top products in the catalog?"
+### Why upgrade?
 
-**Database questions (queries company.db):**
-- "List all tables in the database"
-- "What is the status of order #12345?"
-- "How many employees are in the engineering department?"
+| | Default (SQLite + JSON) | PostgreSQL + pgvector |
+|---|---|---|
+| Documents | Works up to ~20 files | Scales to 100s of files |
+| Concurrent users | Single user | Multiple users |
+| Retrieval quality | Top 2 chunks | Top 8 chunks |
+| Setup | Zero | Docker required |
 
-**Web search (live internet):**
-- "What is the current USD to INR exchange rate?"
-- "Latest news about OpenAI"
+### Setup
 
-**General questions (answered directly by the LLM):**
-- "What is the difference between SQL and NoSQL?"
-- "Explain what a vector database is"
-
-The response always includes a note about **which tool was used** so you know whether the answer came from your documents, database, web, or the LLM directly.
-
----
-
-## Adding New Documents
-
-1. Copy the file into the `data/` folder
-2. Re-run the indexer:
-   ```bash
-   python -m src.agent.rag
-   ```
-3. Restart the FastAPI server (or it will reload automatically if `--reload` is set)
-
----
-
-## Adding New Capabilities (for developers)
-
-### Add a new tool (e.g., Jira lookup)
-
-1. Open `src/agent/tools.py` and add a new `@tool` function:
-
-```python
-@tool
-def get_jira_ticket(ticket_id: str) -> str:
-    """Look up a Jira ticket by its ID (e.g. 'PROJ-123').
-    Use this when the user asks about a specific ticket, issue, or bug report."""
-    # your implementation here
-    return f"Ticket {ticket_id}: ..."
+**1. Start Docker:**
+```bash
+docker compose up -d
 ```
 
-2. Register it in `src/agent/workflow.py`:
-
-```python
-local_tools = [search_company_documents, search_web, get_jira_ticket]
+**2. Run the migration script (once):**
+```bash
+python migrate_to_pgvector.py
 ```
 
-That's it. No routing changes needed — the LLM will start using the new tool automatically.
+This embeds all your documents and inserts them into pgvector, and creates the LangGraph checkpoint tables. Takes a few minutes depending on document count.
 
-### Switch LLM provider
-
-Update `.env`:
-
+**3. Flip the flags in `.env`:**
 ```env
-LLM_PROVIDER=google
-GOOGLE_API_KEY=your_key_here
+USE_PGVECTOR=true
+USE_POSTGRES_MEMORY=true
 ```
 
-Restart the server.
+**4. Restart FastAPI:**
+```bash
+uvicorn app:app --reload --port 8000
+```
+
+**5. Verify:**
+```bash
+curl http://localhost:8000/health
+# {"status":"ok","memory_backend":"postgres","vector_backend":"pgvector"}
+```
+
+### Rollback
+
+Set both flags back to `false` and restart. SQLite + JSON still work — no data is lost.
 
 ---
 
-## API Reference
+## Telegram Bot
 
-### `POST /ask`
+```bash
+# Add to .env
+TELEGRAM_BOT_TOKEN=your_token_here
 
-Send a question, get an answer with metadata.
-
-**Request:**
-```json
-{ "question": "What does the KT document say about deployment?" }
+# Run (FastAPI must be running first)
+python telegram_bot.py
 ```
 
-**Response:**
-```json
-{
-  "answer": "The KT document describes a three-stage deployment process...",
-  "datasource": "company_docs",
-  "tools_used": ["search_company_documents"]
-}
-```
+Each user gets their own conversation memory automatically.
 
-**`datasource` values:**
+---
 
-| Value | Meaning |
-|---|---|
-| `direct_llm` | LLM answered from its own training data |
-| `company_docs` | Answer came from your uploaded documents |
-| `database` | Answer came from the company database |
-| `web_search` | Answer came from a live web search |
-| `multiple` | More than one tool was used |
+## API Endpoints
 
-### `GET /health`
+| Method | Endpoint | Description |
+|---|---|---|
+| `GET` | `/stream` | Real-time SSE streaming response (`question`, `session_id`) |
+| `POST` | `/ask` | Blocking JSON response (used by Telegram and external integrations) |
+| `GET` | `/health` | Liveness check + active memory and vector backend info |
+| `POST` | `/upload` | Non-blocking incremental document upload & indexing |
+| `GET` | `/documents` | List all indexed files in `data/` |
+| `GET` | `/sessions` | List active sessions from checkpointer |
+| `GET` | `/sessions/{id}/history` | Retrieve conversation turn history for a session |
+| `DELETE` | `/sessions/{id}/history` | Asynchronously clear conversation memory for a session |
 
-```json
-{ "status": "ok" }
-```
+Interactive docs: **http://localhost:8000/docs**
 
 ---
 
 ## Troubleshooting
 
-**"No supported documents found in data/"**
-Make sure your files are inside `kt-agent-using-langgraph/data/` and have a supported extension (`.pdf`, `.docx`, `.xlsx`, `.csv`, `.txt`).
+**Web search not working** — Tavily quota hit. Add `SERPER_API_KEY` to `.env` and restart.
 
-**"ModuleNotFoundError: No module named 'openpyxl'"**
-Run: `pip install openpyxl==3.1.5`
+**DOCX returns empty results** — Run `pip install llama-index-readers-file`
 
-**"ValueError: No LLM API key found"**
-Check that your `.env` file exists and has at least one of `GROQ_API_KEY`, `GOOGLE_API_KEY`, or `COHERE_API_KEY` set.
+**`ModuleNotFoundError: ddgs`** — Run `pip install ddgs==9.16.0` inside your `.venv`
 
-**Index is stale after adding new files**
-Re-run `python -m src.agent.rag` to rebuild the index.
+**Backend offline error in Streamlit** — Start FastAPI first (Terminal 1).
 
-**Streamlit cannot connect to the API**
-Make sure the FastAPI server is running (`uvicorn app:app ...`) and that `KT_API_URL` in `.env` matches the address (default: `http://localhost:8000`).
+**Stale index after adding files** — Re-run `python -m src.agent.rag` or use the Upload button in the sidebar.
+
+**pgvector migration fails** — Make sure Docker is running (`docker compose up -d`) and `POSTGRES_URL` in `.env` matches your container.
+
+**FastAPI falls back to SQLite even with `USE_POSTGRES_MEMORY=true`** — Postgres is unreachable. Check `docker ps` and confirm the container is healthy.
 
 ---
 
-## Documentation
+## Docs
 
-- [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) — How the system is designed and how data flows through it
-- [docs/SYSTEM_DESIGN.md](docs/SYSTEM_DESIGN.md) — Detailed component breakdown and design decisions
+- [Architecture overview](docs/ARCHITECTURE.md)
+- [Component design](docs/SYSTEM_DESIGN.md)
+
