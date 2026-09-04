@@ -2,7 +2,7 @@
 
 Six local tools covering document search, web search, calculation, charting,
 document summarisation, and structured data extraction. Database tools live
-in mcp_client.py.
+in mcp_tools.py.
 
 Quality improvements vs original:
   - Full type annotations on all functions and helpers
