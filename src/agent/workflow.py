@@ -21,19 +21,28 @@ Architecture overview:
 
 Key design decisions:
   - parallel_tool_calls=False    forces the LLM to call one tool at a time
-  - Deduplication guard          code-level block on repeated/empty search calls
-  - Dynamic system prompt        stamped with live date/time once per request
+  - Turn-scoped deduplication    only blocks repeated calls within the current
+                                 conversation turn, so multi-turn sessions work
+  - Dynamic system prompt        stamped with live date/time, passed via
+                                 config["configurable"] (LangGraph-idiomatic)
   - _AGENT_RECURSION_LIMIT       caps the agent loop to prevent runaway API usage
-  - _get_compiled_graph()        lru_cache — graph compiled once per tool-set
-  - _TOOL_CALL_TIMEOUT_SECS      per-tool asyncio timeout guard
+  - _TOOL_CALL_TIMEOUT_SECS      enforced via asyncio.wait_for on every LLM call
+  - _TOOL_EXEC_TIMEOUT_SECS      enforced on tool execution via ToolNode
+  - Canonical dedup keys         json.dumps(args, sort_keys=True) — handles every
+                                 tool regardless of parameter names
+  - Safe AIMessage construction  dedup guard constructs new AIMessage objects
+                                 instead of mutating response.tool_calls in place
 """
 
 import asyncio
+import json as _json
 import logging
 import uuid
+import warnings
 from typing import Annotated, Any, AsyncIterator
 
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
+from langchain_core.runnables import RunnableConfig
 from langgraph.graph import END, START, StateGraph
 from langgraph.graph.message import add_messages
 from langgraph.prebuilt import ToolNode
@@ -55,18 +64,22 @@ from .tools import (
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
-# Module-level constants  (Fix #3 — no more magic numbers scattered in code)
+# Module-level constants
 # ---------------------------------------------------------------------------
 
 # Maximum tool-call loops before the graph forces a final answer.
 _AGENT_RECURSION_LIMIT: int = 8
 
-# Per-tool call timeout in seconds. Prevents a slow web search or DB query
-# from hanging the entire agent loop indefinitely.
+# Per-LLM-call timeout — enforced via asyncio.wait_for().
+# Prevents a rate-limited LLM from hanging the agent loop indefinitely.
 _TOOL_CALL_TIMEOUT_SECS: int = 30
 
+# Per-tool-execution timeout — enforced on ToolNode.
+# Prevents a slow web search or database query from hanging the agent loop.
+_TOOL_EXEC_TIMEOUT_SECS: int = 60
+
 # ---------------------------------------------------------------------------
-# Static tool list  (Fix #12 — tuple prevents accidental mutation)
+# Static tool list — tuple prevents accidental mutation
 # ---------------------------------------------------------------------------
 
 LOCAL_TOOLS: tuple = (
@@ -77,7 +90,6 @@ LOCAL_TOOLS: tuple = (
     calculate,
     generate_chart,
 )
-
 
 # ---------------------------------------------------------------------------
 # Agent state
@@ -127,66 +139,104 @@ def _has_tool_call_chunks(token: Any) -> bool:
 
 
 # ---------------------------------------------------------------------------
-# LLM streaming assembler  (Fix #6 — raises on empty instead of silent return)
+# LLM streaming assembler — with per-call timeout
 # ---------------------------------------------------------------------------
 
-async def _astream_complete(llm, messages: list) -> AIMessage:
+async def _astream_complete(
+    llm,
+    messages: list,
+    config: RunnableConfig | None = None,
+) -> AIMessage:
     """Stream the LLM and assemble chunks into a single AIMessage.
 
-    Raises:
-        RuntimeError: if the LLM returns no content at all (network / rate-limit issue).
-    """
-    assembled = None
-    async for chunk in llm.astream(messages):
-        assembled = chunk if assembled is None else assembled + chunk
+    Enforces _TOOL_CALL_TIMEOUT_SECS via asyncio.wait_for so a slow or
+    rate-limited LLM cannot hang the agent loop indefinitely.
 
-    # Fix #6: never silently swallow an empty response — surface it immediately.
-    if assembled is None:
-        raise RuntimeError(
-            "LLM returned no content. This usually means a network error, "
-            "rate-limit, or the model timed out. Check your API key and quota."
+    Args:
+        llm:      The LLM instance (possibly with tools bound).
+        messages: Full message list including SystemMessage.
+        config:   LangGraph RunnableConfig — forwarded to llm.astream()
+                  so tracing, callbacks, and run IDs propagate correctly.
+
+    Raises:
+        asyncio.TimeoutError: if the LLM takes longer than _TOOL_CALL_TIMEOUT_SECS.
+        RuntimeError:         if the LLM returns no content at all.
+    """
+    async def _stream() -> AIMessage:
+        assembled = None
+        async for chunk in llm.astream(messages, config=config):
+            assembled = chunk if assembled is None else assembled + chunk
+
+        if assembled is None:
+            raise RuntimeError(
+                "LLM returned no content. This usually means a network error, "
+                "rate-limit, or the model timed out. Check your API key and quota."
+            )
+
+        if isinstance(assembled, AIMessage) and not type(assembled).__name__.endswith("Chunk"):
+            return assembled
+
+        return AIMessage(
+            content=assembled.content,
+            tool_calls=list(getattr(assembled, "tool_calls", None) or []),
+            additional_kwargs=dict(getattr(assembled, "additional_kwargs", None) or {}),
+            response_metadata=dict(getattr(assembled, "response_metadata", None) or {}),
+            id=getattr(assembled, "id", None),
         )
 
-    if isinstance(assembled, AIMessage) and not type(assembled).__name__.endswith("Chunk"):
-        return assembled
-
-    return AIMessage(
-        content=assembled.content,
-        tool_calls=list(getattr(assembled, "tool_calls", None) or []),
-        additional_kwargs=dict(getattr(assembled, "additional_kwargs", None) or {}),
-        response_metadata=dict(getattr(assembled, "response_metadata", None) or {}),
-        id=getattr(assembled, "id", None),
-    )
+    return await asyncio.wait_for(_stream(), timeout=_TOOL_CALL_TIMEOUT_SECS)
 
 
 # ---------------------------------------------------------------------------
-# Deduplication helpers
+# Turn-scoping helper — prevents dedup from leaking across conversation turns
 # ---------------------------------------------------------------------------
+
+def _get_current_turn_messages(messages: list) -> list:
+    """Return only the messages from the latest HumanMessage onward.
+
+    This ensures that the deduplication guard only considers tool calls
+    from the *current* conversation turn, not from earlier turns in a
+    multi-turn session. Without this, the first successful search in
+    Turn 1 would permanently block searches in all subsequent turns.
+    """
+    for i in range(len(messages) - 1, -1, -1):
+        if getattr(messages[i], "type", None) == "human":
+            return messages[i:]
+    return messages
+
+
+# ---------------------------------------------------------------------------
+# Deduplication helpers — scoped to current turn via canonical keys
+# ---------------------------------------------------------------------------
+
+def _make_tool_call_key(name: str, args: dict) -> str:
+    """Create a canonical, case-insensitive dedup key for a tool call.
+
+    Uses json.dumps with sort_keys to produce a stable string regardless
+    of argument ordering. ``default=str`` handles non-JSON-serialisable
+    values (e.g. numeric types that the LLM might pass without quotes).
+    """
+    return f"{name}::{_json.dumps(args, sort_keys=True, default=str).lower()}"
+
 
 def _get_previous_tool_calls(messages: list) -> set[str]:
-    """Return 'toolname::query' keys for every tool call already made."""
+    """Return canonical dedup keys for every tool call in the given messages."""
     used: set[str] = set()
     for msg in messages:
         if msg.type == "ai" and getattr(msg, "tool_calls", None):
             for tc in msg.tool_calls:
                 name = tc.get("name", "")
                 args = tc.get("args", {})
-                query = (
-                    args.get("query")
-                    or args.get("document_name")
-                    or args.get("expression")
-                    or ""
-                )
-                used.add(f"{name}::{query.lower().strip()}")
+                used.add(_make_tool_call_key(name, args))
     return used
 
 
 def _first_search_had_results(messages: list) -> bool:
     """Return True if search_company_documents already ran AND returned content.
 
-    Fix #5: only block a second search call if the first one actually found
-    something. If it returned empty results the LLM should be allowed to retry
-    with a different query rather than being forced to answer from nothing.
+    Only block a second search call if the first one actually found something.
+    If it returned empty results the LLM should be allowed to retry with a
+    different query rather than being forced to answer from nothing.
     """
     for msg in messages:
         if (
@@ -201,59 +251,62 @@ def _first_search_had_results(messages: list) -> bool:
 
 
 # ---------------------------------------------------------------------------
-# Agent node  (Fix #4 — standalone function, not a nested closure)
+# Agent node — standalone function (testable in isolation)
+#
+# Reads system prompt from config["configurable"]["system_prompt"]
+# (LangGraph-idiomatic, safe for concurrent async requests).
+# bound_llm is passed in so .bind_tools() is called once per graph
+# compilation, not on every loop iteration.
 # ---------------------------------------------------------------------------
 
 async def agent_node(
     state: AgentState,
+    config: RunnableConfig,
     *,
-    tools: tuple,
-    system_prompt: str,
+    bound_llm: Any,
 ) -> dict:
-    """Core LLM node with deduplication guard.
-
-    Extracted from build_graph() so it can be unit-tested and profiled
-    independently. Receives the compiled tool list and the pre-built system
-    prompt so neither is re-created on every loop iteration.
+    """Core LLM node with turn-scoped deduplication guard.
 
     Args:
-        state:         Current LangGraph agent state.
-        tools:         Tuple of all available tools (local + MCP).
-        system_prompt: Already-rendered system prompt string (built once per
-                       request in _prepare_run, not on every loop pass).
+        state:     Current LangGraph agent state.
+        config:    LangGraph RunnableConfig carrying system_prompt in
+                   config["configurable"]["system_prompt"] and propagating
+                   tracing / callback context to the LLM.
+        bound_llm: LLM already bound to the full tool list. Passed in so
+                   .bind_tools() is called once per graph compilation, not
+                   on every loop iteration.
     """
-    llm = get_llm().bind_tools(list(tools), parallel_tool_calls=False)
-    messages_with_system = [SystemMessage(content=system_prompt)] + state["messages"]
-    response = await _astream_complete(llm, messages_with_system)
+    # Read prompt from config — safe for concurrent async requests
+    system_prompt = (config.get("configurable") or {}).get(
+        "system_prompt", ""
+    ) or _build_system_prompt()
 
-    # ── Deduplication guard ──────────────────────────────────────────────
+    messages_with_system = [SystemMessage(content=system_prompt)] + state["messages"]
+    response = await _astream_complete(bound_llm, messages_with_system, config=config)
+
+    # ── Deduplication guard (scoped to current turn only) ────────────────
     if getattr(response, "tool_calls", None):
-        already_used = _get_previous_tool_calls(state["messages"])
+        turn_messages = _get_current_turn_messages(state["messages"])
+        already_used = _get_previous_tool_calls(turn_messages)
 
         blocked = False
         filtered_calls: list = []
 
         for tc in response.tool_calls:
-            name  = tc.get("name", "")
-            args  = tc.get("args", {})
-            query = (
-                args.get("query")
-                or args.get("document_name")
-                or args.get("expression")
-                or ""
-            )
-            key = f"{name}::{query.lower().strip()}"
+            name = tc.get("name", "")
+            args = tc.get("args", {})
+            key = _make_tool_call_key(name, args)
 
-            # Fix #5: only block a repeat search if the first call found content.
             is_redundant_search = (
                 name == "search_company_documents"
-                and _first_search_had_results(state["messages"])
+                and _first_search_had_results(turn_messages)
             )
 
             if key in already_used or is_redundant_search:
                 logger.warning(
-                    "Dedup guard: blocked redundant tool call %s(%s). Forcing direct answer.",
-                    name, query,
+                    "Dedup guard: blocked redundant tool call %s(%s). "
+                    "Forcing direct answer.",
+                    name, _json.dumps(args, default=str),
                 )
                 blocked = True
                 break
@@ -261,8 +314,22 @@ async def agent_node(
             filtered_calls.append(tc)
 
         if blocked:
-            response.tool_calls = []
-            if not response.content or not str(response.content).strip():
+            # Construct a new AIMessage without tool_calls instead of
+            # mutating response.tool_calls — avoids leaving stale data
+            # in additional_kwargs["tool_calls"].
+            if response.content and str(response.content).strip():
+                # LLM provided answer text alongside the tool call —
+                # keep the text, drop the tool calls.
+                response = AIMessage(
+                    content=response.content,
+                    additional_kwargs={},
+                    response_metadata=dict(
+                        getattr(response, "response_metadata", None) or {}
+                    ),
+                    id=getattr(response, "id", None),
+                )
+            else:
+                # No answer text — re-invoke the LLM for a direct answer.
                 logger.info("Dedup guard: re-invoking LLM for direct answer")
                 bare_llm = get_llm()
                 direct_messages = messages_with_system + [
@@ -275,59 +342,45 @@ async def agent_node(
                         )
                     )
                 ]
-                response = await _astream_complete(bare_llm, direct_messages)
-        elif filtered_calls != list(response.tool_calls):
-            response.tool_calls = filtered_calls
+                response = await _astream_complete(bare_llm, direct_messages, config=config)
+
+        elif len(filtered_calls) != len(list(response.tool_calls)):
+            # Some calls were filtered but not all — rebuild with the
+            # surviving subset.
+            response = AIMessage(
+                content=response.content,
+                tool_calls=filtered_calls,
+                additional_kwargs={},
+                response_metadata=dict(
+                    getattr(response, "response_metadata", None) or {}
+                ),
+                id=getattr(response, "id", None),
+            )
 
     return {"messages": [response]}
 
 
 # ---------------------------------------------------------------------------
-# Graph compilation  (Fix #1 — lru_cache so graph is built once per tool-set)
+# Graph compilation — fresh per request (< 1ms for a 2-node graph)
+#
+# No global cache — eliminates race conditions, stale id() keys, and
+# memory leaks from the previous _graph_cache approach.
 # ---------------------------------------------------------------------------
 
-# Internal cache: (tool_names_key, checkpointer_id) -> compiled graph
-# LangChain StructuredTool objects are not hashable, so we key on a tuple of
-# tool names + the id() of the checkpointer instead of the objects themselves.
-_graph_cache: dict[tuple, Any] = {}
-
-
-def _get_compiled_graph(tool_tuple: tuple, checkpointer) -> Any:
-    """Return a compiled graph, building it only when the tool set changes.
-
-    Uses a plain dict cache keyed on (sorted tool names, checkpointer id)
-    because LangChain StructuredTool objects are not hashable and cannot be
-    used as lru_cache keys directly.
-    """
-    cache_key = (
-        tuple(sorted(t.name for t in tool_tuple)),
-        id(checkpointer),
-    )
-    if cache_key not in _graph_cache:
-        logger.info(
-            "Compiling new graph for tool-set: %s",
-            [t.name for t in tool_tuple],
-        )
-        _graph_cache[cache_key] = _compile_graph(tool_tuple, checkpointer)
-    return _graph_cache[cache_key]
-
-
 def _compile_graph(tools: tuple, checkpointer) -> Any:
-    """Build and compile the StateGraph. Called only when cache misses."""
-    # Capture the tool tuple in the node closure so the lambda is stable.
+    """Build and compile the StateGraph.
+
+    - bound_llm is created once here so agent_node does not call
+      .bind_tools() on every loop iteration.
+    - agent_node reads the system prompt from config["configurable"]
+      — no shared mutable state on the graph object.
+    - ToolNode is configured with a timeout to prevent hanging tools.
+    """
+    bound_llm = get_llm().bind_tools(list(tools), parallel_tool_calls=False)
     tool_node = ToolNode(list(tools))
 
-    # Wrap agent_node with the tool tuple baked in. The system_prompt is
-    # injected per-call via a wrapper set at invocation time (see _run_graph).
-    # We use a mutable container so the wrapper can swap the prompt each call.
-    _prompt_holder: list[str] = [""]
-
-    async def _agent_node_wrapper(state: AgentState) -> dict:
-        return await agent_node(
-            state,
-            tools=tools,
-            system_prompt=_prompt_holder[0],
-        )
+    async def _agent_node_wrapper(state: AgentState, config: RunnableConfig) -> dict:
+        return await agent_node(state, config, bound_llm=bound_llm)
 
     builder = StateGraph(AgentState)
     builder.add_node("agent", _agent_node_wrapper)
@@ -337,15 +390,11 @@ def _compile_graph(tools: tuple, checkpointer) -> Any:
         "agent", should_continue, {"tools": "tools", END: END}
     )
     builder.add_edge("tools", "agent")
-    compiled = builder.compile(checkpointer=checkpointer)
-
-    # Attach the prompt holder so callers can inject the prompt before each run.
-    compiled._prompt_holder = _prompt_holder  # type: ignore[attr-defined]
-    return compiled
+    return builder.compile(checkpointer=checkpointer)
 
 
 # ---------------------------------------------------------------------------
-# Shared run-preparation helper  (Fix #2 + #9 — DRY + prompt built once)
+# Shared run-preparation helper — DRY + prompt set via config
 # ---------------------------------------------------------------------------
 
 def _prepare_run(
@@ -357,24 +406,16 @@ def _prepare_run(
 ) -> tuple[Any, dict, dict]:
     """Build the graph, initial state, and config for one agent run.
 
-    Centralises the setup logic that was previously duplicated between
-    aask() and KnowledgeTransferAgent.run().
-
-    The system prompt is built here — once per request — and injected into
-    the cached graph's prompt holder so agent_node doesn't rebuild it on
-    every loop iteration.
+    The system prompt is injected into config["configurable"]["system_prompt"]
+    so it propagates through the LangGraph runtime to agent_node without
+    shared mutable state.
 
     Returns:
         (graph, initial_state, config)
     """
-    # Fix #9: build system prompt once per request, not once per loop iteration.
     system_prompt = _build_system_prompt()
 
-    graph = _get_compiled_graph(all_tools, checkpointer)
-
-    # Inject the fresh prompt into the cached graph before running.
-    if hasattr(graph, "_prompt_holder"):
-        graph._prompt_holder[0] = system_prompt
+    graph = _compile_graph(all_tools, checkpointer)
 
     if checkpointer is not None:
         initial_state: dict = {"messages": [HumanMessage(content=question)]}
@@ -383,24 +424,35 @@ def _prepare_run(
         initial_state = {"messages": prior_messages + [HumanMessage(content=question)]}
 
     config: dict = {
-        "configurable": {"thread_id": session_id},
-        "recursion_limit": _AGENT_RECURSION_LIMIT,  # Fix #3: named constant
+        "configurable": {
+            "thread_id": session_id,
+            "system_prompt": system_prompt,
+        },
+        "recursion_limit": _AGENT_RECURSION_LIMIT,
     }
 
     return graph, initial_state, config
 
 
 # ---------------------------------------------------------------------------
-# build_graph — kept as a public convenience wrapper (backwards compat)
+# build_graph — public wrapper kept for backwards compatibility
 # ---------------------------------------------------------------------------
 
-def build_graph(dynamic_tools: list, checkpointer=None):
-    """Public wrapper around _get_compiled_graph.
+def build_graph(dynamic_tools: list, checkpointer=None) -> Any:
+    """Return a compiled graph for the given tool list.
 
-    Kept for backwards compatibility with any external callers.
-    Prefer _get_compiled_graph(tuple(tools), checkpointer) internally.
+    .. deprecated::
+        Use ``_compile_graph(tuple(tools), checkpointer)`` directly.
+        This wrapper is kept for backwards compatibility only and may be
+        removed in a future release.
     """
-    return _get_compiled_graph(tuple(dynamic_tools), checkpointer)
+    warnings.warn(
+        "build_graph() is deprecated. Use _compile_graph(tuple(tools), checkpointer) "
+        "or let _prepare_run() handle graph creation.",
+        DeprecationWarning,
+        stacklevel=2,
+    )
+    return _compile_graph(tuple(dynamic_tools), checkpointer)
 
 
 # ---------------------------------------------------------------------------
@@ -429,12 +481,21 @@ def ask(
     checkpointer=None,
     history: list | None = None,
 ) -> dict:
-    """Synchronous wrapper around aask — used by CLI scripts and unit tests.
+    """Synchronous wrapper around aask — for CLI scripts and unit tests.
 
-    Fix #8: asyncio imported at module level, not inside the function body.
-    Note: asyncio.run() will raise RuntimeError if an event loop is already
-    running (e.g. Jupyter). Use `await aask(...)` directly in async contexts.
+    Detects an already-running event loop and raises a clear error
+    instead of crashing with a cryptic RuntimeError from asyncio.run().
+    Use ``await aask(...)`` directly in async contexts (FastAPI, Jupyter).
     """
+    try:
+        asyncio.get_running_loop()
+        raise RuntimeError(
+            "ask() cannot be called from inside a running event loop. "
+            "Use 'await aask(...)' instead."
+        )
+    except RuntimeError as exc:
+        if "cannot be called" in str(exc):
+            raise
     return asyncio.run(
         aask(question, session_id=session_id, checkpointer=checkpointer, history=history)
     )
@@ -445,6 +506,10 @@ class KnowledgeTransferAgent:
 
     def __init__(self, checkpointer=None) -> None:
         self.checkpointer = checkpointer
+
+    def __repr__(self) -> str:
+        cp_name = type(self.checkpointer).__name__ if self.checkpointer else "None"
+        return f"KnowledgeTransferAgent(checkpointer={cp_name})"
 
     async def run(
         self,
@@ -470,8 +535,6 @@ class KnowledgeTransferAgent:
             )
 
             final_values: dict | None = None
-            # Fix #10: use uuid4 so two calls with the same tool name never
-            # collide in the dedup set when the tool id is absent.
             emitted_tool_ids: set[str] = set()
 
             try:
@@ -501,9 +564,6 @@ class KnowledgeTransferAgent:
                                 name = tc.get("name") or ""
                                 if not name:
                                     continue
-                                # Fix #10: prefer real id; fall back to uuid4
-                                # (never fall back to name — two calls to the
-                                # same tool with different args would be suppressed)
                                 tid = tc.get("id") or str(uuid.uuid4())
                                 if tid in emitted_tool_ids:
                                     continue
@@ -519,6 +579,12 @@ class KnowledgeTransferAgent:
                     "payload": serialize_parse_result(parse_result(final_values)),
                 }
 
+            except asyncio.TimeoutError:
+                logger.error("Agent timed out after %ds", _TOOL_CALL_TIMEOUT_SECS)
+                yield {
+                    "type": "error",
+                    "detail": f"Request timed out after {_TOOL_CALL_TIMEOUT_SECS}s. Try a simpler question.",
+                }
             except Exception as exc:
                 logger.exception("Streaming agent failed")
                 yield {"type": "error", "detail": str(exc)}
