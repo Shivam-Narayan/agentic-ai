@@ -35,17 +35,10 @@ pip install -r requirements.txt
 
 ### 2. Set up `.env`
 
-Copy the template and provide your API keys:
-
-```bash
-cp .env.example .env
-```
-
 ```env
 # LLM — pick at least one
-GOOGLE_API_KEY=your_google_api_key_here   # Google Gemini (default)
-GROQ_API_KEY=your_groq_api_key_here       # Groq (optional)
-COHERE_API_KEY=your_cohere_key_here       # Cohere (optional)
+GROQ_API_KEY=your_groq_api_key_here       # groq.com — fast, generous free tier
+GOOGLE_API_KEY=your_google_api_key_here   # Google Gemini (alternative)
 
 # Web search — all optional, cascades automatically: Tavily → Serper → DuckDuckGo
 TAVILY_API_KEY=your_key_here      # tavily.com — 1,000 free/month
@@ -64,23 +57,21 @@ USE_POSTGRES_MEMORY=false
 
 ### 3. Index your documents
 
-Drop files into `data/` (PDF, DOCX, XLSX, CSV, TXT), then build the index:
+Drop files into `data/` (PDF, DOCX, XLSX, CSV, TXT), then:
 
 ```bash
 python -m src.agent.rag
 ```
-
-> **Incremental Uploads**: You can also upload new documents directly via the Streamlit UI or `POST /upload`. The engine uses incremental indexing (`add_documents_to_index`), adding only the new documents without rebuilding the entire store.
 
 ### 4. Run
 
 Two terminals:
 
 ```bash
-# Terminal 1: FastAPI Backend
+# Terminal 1
 uvicorn app:app --reload --port 8000
 
-# Terminal 2: Streamlit Frontend
+# Terminal 2
 python -m streamlit run streamlit_app.py
 ```
 
@@ -88,18 +79,54 @@ Open **http://localhost:8501**
 
 ---
 
-## Running Tests
+## Evaluating Answer Quality
 
-Run the automated test suite with pytest:
+The evaluation script measures how accurate and grounded the agent's answers are using **LLM-as-judge** methodology — the same four metrics as RAGAS, but without any extra dependencies.
+
+| Metric | What it measures |
+|---|---|
+| **Faithfulness** | Answer is grounded in context — no hallucination |
+| **Answer relevancy** | Answer actually addresses the question |
+| **Context precision** | Retrieved chunks are relevant to the question |
+| **Context recall** | All relevant information was retrieved |
+
+**Before running** — open `tests/eval_questions.json` and fill in the `ground_truth` values for your actual documents.
 
 ```bash
-pytest tests/
+# Run all questions
+python tests/evaluate.py
+
+# Only document questions
+python tests/evaluate.py --datasource company_docs
+
+# Verbose — show per-question breakdown
+python tests/evaluate.py --verbose
+
+# Save results to JSON
+python tests/evaluate.py --output tests/results.json
 ```
 
-The test suite covers:
-- **`tests/test_tools.py`**: SQL injection guards, DDL blocking, AST math evaluation, and schema caching TTL.
-- **`tests/test_workflow.py`**: State deduplication, tool tracking, and response serialization compatibility.
-- **`tests/test_api.py`**: FastAPI routes (`/health`, `/ask` validation, `/sessions`, `/upload`).
+FastAPI does **not** need to be running — the script calls `aask()` directly.
+
+Sample output:
+```
+============================================================
+  DataDialogue — RAGAS Evaluation Report
+============================================================
+  Questions evaluated : 9
+  Passed              : 7
+  Failed              : 1
+  Skipped / Errored   : 1
+  Avg latency         : 4.2s
+------------------------------------------------------------
+  Faithfulness        : 0.91 ✅
+  Answer relevancy    : 0.87 ✅
+  Context precision   : 0.74 ⚠️
+  Context recall      : 0.68 ⚠️
+------------------------------------------------------------
+  Weakest: context_recall (0.68)
+  Hint: Increase similarity_top_k in rag.py retrieve_documents()
+```
 
 ---
 

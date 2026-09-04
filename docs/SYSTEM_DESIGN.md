@@ -25,10 +25,9 @@ rag.py  (document layer)                                                │
  ├── _discover_documents()   → scans data/ for supported files          │
  ├── _get_file_extractors()  → registers DocxReader for .docx/.doc      │
  ├── build_index()           → ingests, embeds, persists                │
- ├── add_documents_to_index()→ incremental insertion without rebuild    │
  ├── get_vector_index()      → loads from indexing_data/ or pgvector    │
  ├── rebuild_index()         → rebuilds from scratch + clears lru_cache │
- └── retrieve_documents()   → returns List[Document]                    │
+ └── retrieve_documents()   → returns List[Document] (top_k=8)         │
                                                                          │
 tools.py  (LangChain tools — 6 local tools)                             │
  ├── search_company_documents  → rag.retrieve_documents()               │
@@ -38,25 +37,22 @@ tools.py  (LangChain tools — 6 local tools)                             │
  ├── calculate                 → safe AST evaluator                     │
  └── generate_chart            → Plotly JSON figure                     │
                                                                          │
-mcp_client.py  (database tools — 3 MCP tools + schema cache)            │
- ├── _SCHEMA_CACHE           → in-memory TTL dictionary                 │
- ├── list_database_tables    → discover tables (cached)                 │
- ├── describe_database_table → column schemas (cached)                  │
+mcp_client.py  (database tools — 3 MCP tools)                          │
+ ├── list_database_tables    → discover tables + row counts             │
+ ├── describe_database_table → column schemas + types                   │
  └── query_company_database  → SELECT (or write with ALLOW_DB_WRITES)   │
-                               invalidates schema cache on write         │
                                                                          │
 workflow.py  (LangGraph agent)  ◄── uses all of the above              │
- ├── _build_system_prompt()   (live date/time injection)                │
+ ├── _current_system_prompt  (ContextVar — thread-safe prompt injection)│
  ├── AgentState                                                         │
  ├── _get_previous_tool_calls() (dedup helper)                          │
- ├── build_graph(tools, checkpointer)                                   │
- │    └── agent_node()       (dedup guard + parallel_tool_calls=False)  │
- ├── should_continue()                                                  │
- ├── _extract_citations()                                               │
- ├── _extract_chart()                                                   │
- ├── parse_result()          (walks back for last non-empty answer)     │
- ├── LOCAL_TOOLS = [6 tools]                                            │
- └── aask(question, session_id, checkpointer)  ← all endpoints call    │
+ ├── _first_search_had_results() (smart dedup — only blocks if found)   │
+ ├── _compile_graph(tools, checkpointer)  ← bound_llm created once     │
+ ├── _get_compiled_graph()    ← dict cache, bounded size                │
+ ├── _prepare_run()           ← DRY setup for aask + streaming          │
+ ├── agent_node()             ← standalone, testable, uses ContextVar   │
+ ├── KnowledgeTransferAgent   ← SSE streaming interface                 │
+ └── aask(question, session_id, checkpointer)  ← blocking interface    │
                                                                          │
 schemas.py  (Pydantic models)                                           │
  ├── QuestionRequest / QuestionResponse / Citation   (core API)        │
@@ -126,7 +122,7 @@ def get_llm() -> BaseChatModel:
     provider = os.getenv("LLM_PROVIDER", "").lower()
 
     if provider == "groq" or (not provider and GROQ_API_KEY):
-        return ChatGroq(model="openai/gpt-oss-20b", temperature=0, streaming=True)
+        return ChatGroq(model="openai/gpt-oss-120b", temperature=0, streaming=True)
 
     if provider == "google" or (not provider and GOOGLE_API_KEY):
         return ChatGoogleGenerativeAI(model="gemini-1.5-flash", temperature=0, streaming=True)
@@ -187,16 +183,9 @@ def _get_file_extractors() -> dict:
     return {".docx": DocxReader(), ".doc": DocxReader()}
 ```
 
-### Index cache invalidation and Incremental Indexing
+### Index cache invalidation
 
-`rebuild_index()` calls `get_vector_index.cache_clear()` after every rebuild so the next query loads the fresh index without requiring a server restart.
-
-`add_documents_to_index(document_paths: List[Path])`:
-- Ingests and embeds only newly added files.
-- Calls `index.insert(doc)` to update the live vector index.
-- Persists the updated storage context to disk (`indexing_data/`) or inserts into `pgvector`.
-- Clears `get_vector_index.cache_clear()` so retrievers immediately see the new nodes.
-- Falls back to `rebuild_index()` if the vector store does not exist yet.
+`rebuild_index()` calls `get_vector_index.cache_clear()` after every rebuild so the next query loads the fresh index without requiring a server restart. Files uploaded via `POST /upload` also trigger a full rebuild automatically.
 
 ---
 
@@ -222,25 +211,21 @@ Builds a Plotly `go.Figure` and returns `CHART_JSON::{figure_json}`. The `_extra
 
 ---
 
-## `mcp_client.py` — Database Tools & Schema Caching
+## `mcp_client.py` — Database Tools
 
 Three LangChain tools wrapped in an MCP-compatible `asynccontextmanager`:
 
 ```python
-list_database_tables()               # discover available tables (cached with TTL)
-describe_database_table(table_name)  # get column names and types (cached with TTL)
+list_database_tables()               # discover available tables with row counts
+describe_database_table(table_name)  # get column names, types, constraints
 query_company_database(sql_query)    # run queries (SELECT or write if ALLOW_DB_WRITES=true)
 ```
 
 **Safety & Validation:**
-- `_sanitise_identifier()`: Strict regex check (`^[a-zA-Z0-9_]+$`) on table and column names before running PRAGMAs or schema queries to block SQL injection.
-- `_is_blocked_statement()`: Disallows destructive DDL (`DROP`, `TRUNCATE`, `ALTER`, `CREATE`).
-- Read-only by default: `INSERT`, `UPDATE`, and `DELETE` require `ALLOW_DB_WRITES=true` in `.env`.
-
-**Schema Caching:**
-- Metadata queries (`list_database_tables` and `describe_database_table`) are cached in `_SCHEMA_CACHE` with a 5-minute TTL (`DB_SCHEMA_CACHE_TTL`).
-- Multi-step LLM reasoning loops reuse cached schemas without hitting the database repeatedly.
-- Executing a write query automatically invokes `clear_schema_cache()`.
+- `_sanitise_identifier()` — strict regex `^\w+$` on table/column names before any PRAGMA or schema query — blocks SQL injection.
+- `_is_blocked_statement()` — disallows DDL (`DROP`, `TRUNCATE`, `ALTER`, `CREATE`) regardless of `ALLOW_DB_WRITES`.
+- Read-only by default — `INSERT`, `UPDATE`, `DELETE` require `ALLOW_DB_WRITES=true` in `.env`.
+- Both SQLite and PostgreSQL backends supported — branches on `USE_PGVECTOR` flag.
 
 **MCP compatibility:** The entire database layer can be replaced with a real MCP server by swapping only `mcp_server_context()`. `workflow.py` does not change.
 
@@ -250,44 +235,25 @@ query_company_database(sql_query)    # run queries (SELECT or write if ALLOW_DB_
 
 **Purpose:** Assembles all tools, runs the ReAct loop, and parses the final result.
 
-### Signature change: checkpointer added
+### Key improvements over original design
+
+- **Thread-safe prompts** — `_current_system_prompt` is a `ContextVar`. Each async Task gets its own value so concurrent requests never corrupt each other's system prompt.
+- **Graph cached** — `_get_compiled_graph()` uses a bounded dict cache keyed on `(sorted tool names, checkpointer id)`. Graph is compiled once per tool-set, not on every request.
+- **LLM bound once** — `bound_llm = get_llm().bind_tools(...)` runs in `_compile_graph()` at compile time, not on every loop iteration.
+- **Timeout enforced** — `_astream_complete()` wraps the LLM stream in `asyncio.wait_for(timeout=30)`.
+- **Smart dedup** — `_first_search_had_results()` only blocks a second search if the first one returned content. If retrieval returned empty, the LLM can retry with a different query.
+
+### Public interface
 
 ```python
-# Old (in-memory only)
-async def aask(question: str, history: list | None = None) -> dict
+# Blocking — called by POST /ask and Telegram
+async def aask(question, session_id, checkpointer, history) -> dict
 
-# New (persistent memory)
-async def aask(question: str, session_id: str = "default",
-               checkpointer=None, history: list | None = None) -> dict
+# Streaming — called by GET /stream
+class KnowledgeTransferAgent:
+    async def run(question, session_id, history) -> AsyncIterator[dict]
+    # yields: status | token | tool | done | error events
 ```
-
-When a checkpointer is provided, LangGraph automatically loads and saves the full message history using `session_id` as the `thread_id`. No manual history management needed.
-
-### build_graph now accepts checkpointer
-
-```python
-def build_graph(dynamic_tools: list, checkpointer=None):
-    ...
-    return builder.compile(checkpointer=checkpointer)
-```
-
-The checkpointer is compiled into the graph — LangGraph handles all persistence transparently.
-
-### Dynamic System Prompt
-
-```python
-def _build_system_prompt() -> str:
-    now = datetime.now()
-    date_str = now.strftime("%A, %d %B %Y")
-    time_str = now.strftime("%H:%M")
-    return f"...CURRENT DATE AND TIME: {date_str}, {time_str}..."
-```
-
-Called fresh on every agent invocation — live date is always accurate.
-
-### Deduplication guard
-
-Runs inside `agent_node` after every LLM response. Blocks `search_company_documents` from running more than once per question, preventing rate limit exhaustion. If the LLM response is empty after blocking, re-invokes without tools to force a text answer.
 
 ### Streaming: `KnowledgeTransferAgent`
 
@@ -608,14 +574,28 @@ Same flow applies for Streamlit (renders as badge + citation pill + markdown) an
 
 ---
 
-## Automated Testing Architecture (pytest)
+## Evaluation
 
-The project includes an automated test suite executed with `pytest tests/`:
+The project ships with an LLM-as-judge evaluation script at `tests/evaluate.py`.
 
-| Test Module | Coverage Area | Key Assertions |
+```bash
+python tests/evaluate.py                          # all questions
+python tests/evaluate.py --datasource company_docs  # filter by type
+python tests/evaluate.py --verbose                  # per-question detail
+python tests/evaluate.py --output tests/results.json
+```
+
+Test questions live in `tests/eval_questions.json`. Fill in `ground_truth` values for your actual documents before running.
+
+Metrics measured — all scored 0.0–1.0:
+
+| Metric | What low score means | Fix |
 |---|---|---|
-| `tests/test_tools.py` | Local and Database Tools | Identifier sanitization, DDL blocking (`DROP`, `TRUNCATE`, `CREATE`), AST math evaluation in `calculate`, Plotly chart validation, schema caching TTL & invalidation |
-| `tests/test_workflow.py` | LangGraph Engine & Parsers | Stable dedup key hashing (`_make_tool_call_key`), tool tracking, citation extraction, UI compatibility (`answer` and `generation` in `serialize_parse_result`) |
-| `tests/test_api.py` | FastAPI Endpoints | `/health` backend check, `/ask` validation, `/sessions` listing, `/sessions/{id}/history` clear, file upload format validation |
-| `tests/test_agents.py` | Agent Diagnostics | Directory validation and HuggingFace embedding initialization smoke tests |
-| `tests/test_tavily.py` | External Web Search | Optional live search connectivity test (guarded with `RUN_LIVE_API_TESTS=true`) |
+| `faithfulness` | LLM hallucinating | Tighten system prompt in `prompt.py` |
+| `answer_relevancy` | LLM going off-topic | Reduce recursion limit in `workflow.py` |
+| `context_precision` | Wrong chunks retrieved | Reduce `chunk_size` in `rag.py` |
+| `context_recall` | Missing relevant chunks | Increase `similarity_top_k` in `rag.py` |
+
+FastAPI does not need to be running — the script calls `aask()` directly.
+
+The `tests/test_agents.py` file contains smoke tests for embedding model initialisation and data directory validation, runnable with `pytest tests/`.
