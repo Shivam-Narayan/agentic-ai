@@ -206,4 +206,3 @@ Interactive docs: **http://localhost:8000/docs**
 
 - [Architecture overview](docs/ARCHITECTURE.md)
 - [Component design](docs/SYSTEM_DESIGN.md)
-
