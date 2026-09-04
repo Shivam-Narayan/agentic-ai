@@ -10,6 +10,7 @@ Backend selection (controlled via .env):
   USE_PGVECTOR=true   →  PostgreSQL  (POSTGRES_URL)
 """
 
+import concurrent.futures
 import logging
 import os
 import re
@@ -132,11 +133,17 @@ def _sanitise_identifier(name: str) -> str:
 
 
 def _is_blocked_statement(sql_upper: str) -> bool:
-    """Return True if the SQL starts with or contains an always-blocked keyword."""
-    for kw in _ALWAYS_BLOCKED:
-        if sql_upper.startswith(kw) or f" {kw} " in sql_upper:
-            return True
-    return False
+    """Return True if the first meaningful SQL token is a blocked DDL keyword.
+
+    Only inspects the *first* token so that blocked keywords appearing inside
+    string literals (e.g. WHERE bio = 'DROP TABLE ...') do not trigger a false
+    positive. DDL is always the leading verb, never a column value.
+    """
+    # Strip leading comments (-- ... and /* ... */) before checking first token
+    stripped = re.sub(r"/\*.*?\*/", "", sql_upper, flags=re.DOTALL)
+    stripped = re.sub(r"--[^\n]*", "", stripped).strip()
+    first_token = stripped.split()[0] if stripped.split() else ""
+    return first_token in _ALWAYS_BLOCKED
 
 
 # ---------------------------------------------------------------------------
@@ -181,6 +188,109 @@ def _get_conn():
 
 
 # ---------------------------------------------------------------------------
+# Async DB execution helpers
+# ---------------------------------------------------------------------------
+
+def _run_list_tables() -> str:
+    """Blocking implementation of list_database_tables (runs in a thread)."""
+    conn = _get_conn()
+    try:
+        if USE_PGVECTOR:
+            cur = conn.execute(
+                """
+                SELECT table_name
+                FROM   information_schema.tables
+                WHERE  table_schema = 'public'
+                  AND  table_type   = 'BASE TABLE'
+                ORDER  BY table_name
+                """
+            )
+            table_names: list[str] = [row[0] for row in cur.fetchall()]
+        else:
+            cur = conn.execute(
+                "SELECT name FROM sqlite_master "
+                "WHERE type = 'table' ORDER BY name"
+            )
+            table_names = [row[0] for row in cur.fetchall()]
+
+        if not table_names:
+            return "No tables found in the database."
+
+        lines: list[str] = ["Available tables:\n"]
+        for name in table_names:
+            safe = _sanitise_identifier(name)
+            try:
+                count_cur = conn.execute(f"SELECT COUNT(*) FROM {safe}")  # noqa: S608
+                count: int = count_cur.fetchone()[0]
+                lines.append(f"  \u2022 {name}  ({count:,} rows)")
+            except Exception:
+                lines.append(f"  \u2022 {name}")
+
+        return "\n".join(lines)
+    finally:
+        conn.close()
+
+
+def _run_describe_table(safe_name: str, table_name: str) -> str:
+    """Blocking implementation of describe_database_table (runs in a thread)."""
+    conn = _get_conn()
+    try:
+        if USE_PGVECTOR:
+            cur = conn.execute(
+                """
+                SELECT column_name, data_type,
+                       is_nullable, column_default
+                FROM   information_schema.columns
+                WHERE  table_schema = 'public'
+                  AND  table_name   = %s
+                ORDER  BY ordinal_position
+                """,
+                (safe_name,),
+            )
+            rows = cur.fetchall()
+            if not rows:
+                return f"Table '{table_name}' not found or has no columns."
+            cols_info: list[str] = [
+                f"  {r[0]}  {r[1]}"
+                + (" NOT NULL"      if r[2] == "NO" else "")
+                + (f"  DEFAULT {r[3]}" if r[3]        else "")
+                for r in rows
+            ]
+        else:
+            cur = conn.execute(f"PRAGMA table_info({safe_name})")  # noqa: S608
+            rows = cur.fetchall()
+            if not rows:
+                return f"Table '{table_name}' not found or has no columns."
+            cols_info = [
+                f"  {r[1]}  {r[2]}"
+                + (" NOT NULL"          if r[3]           else "")
+                + (f"  DEFAULT {r[4]}"  if r[4] is not None else "")
+                + (" PRIMARY KEY"        if r[5]           else "")
+                for r in rows
+            ]
+        return f"Table '{table_name}' columns:\n" + "\n".join(cols_info)
+    finally:
+        conn.close()
+
+
+def _run_query(stripped: str, is_select: bool) -> str:
+    """Blocking implementation of query_company_database (runs in a thread)."""
+    conn = _get_conn()
+    try:
+        if is_select:
+            cursor = conn.execute(stripped)
+            rows = cursor.fetchall()
+            columns = [desc[0] for desc in cursor.description]
+            return _format_rows(columns, [list(r) for r in rows])
+        else:
+            cursor = conn.execute(stripped)
+            conn.commit()
+            return f"Query executed. Rows affected: {cursor.rowcount}"
+    finally:
+        conn.close()
+
+
+# ---------------------------------------------------------------------------
 # Tools
 # ---------------------------------------------------------------------------
 
@@ -198,46 +308,11 @@ def list_database_tables() -> str:
         return cached
 
     try:
-        conn = _get_conn()
-        try:
-            if USE_PGVECTOR:
-                cur = conn.execute(
-                    """
-                    SELECT table_name
-                    FROM   information_schema.tables
-                    WHERE  table_schema = 'public'
-                      AND  table_type   = 'BASE TABLE'
-                    ORDER  BY table_name
-                    """
-                )
-                table_names: list[str] = [row[0] for row in cur.fetchall()]
-            else:
-                cur = conn.execute(
-                    "SELECT name FROM sqlite_master "
-                    "WHERE type = 'table' ORDER BY name"
-                )
-                table_names = [row[0] for row in cur.fetchall()]
-
-            if not table_names:
-                return "No tables found in the database."
-
-            lines: list[str] = ["Available tables:\n"]
-            for name in table_names:
-                safe = _sanitise_identifier(name)
-                try:
-                    count_cur = conn.execute(f"SELECT COUNT(*) FROM {safe}")  # noqa: S608
-                    count: int = count_cur.fetchone()[0]
-                    lines.append(f"  \u2022 {name}  ({count:,} rows)")
-                except Exception:
-                    lines.append(f"  \u2022 {name}")
-
-            result = "\n".join(lines)
-            set_cached_schema("all_tables", result)
-            return result
-
-        finally:
-            conn.close()
-
+        result = concurrent.futures.ThreadPoolExecutor(max_workers=1).submit(
+            _run_list_tables
+        ).result(timeout=30)
+        set_cached_schema("all_tables", result)
+        return result
     except Exception as exc:
         logger.exception("list_database_tables failed")
         return f"Error listing tables: {exc}"
@@ -261,50 +336,11 @@ def describe_database_table(table_name: str) -> str:
             logger.debug("Returning cached schema for %s", safe_name)
             return cached
 
-        conn = _get_conn()
-        try:
-            if USE_PGVECTOR:
-                cur = conn.execute(
-                    """
-                    SELECT column_name, data_type,
-                           is_nullable, column_default
-                    FROM   information_schema.columns
-                    WHERE  table_schema = 'public'
-                      AND  table_name   = %s
-                    ORDER  BY ordinal_position
-                    """,
-                    (safe_name,),
-                )
-                rows = cur.fetchall()
-                if not rows:
-                    return f"Table '{table_name}' not found or has no columns."
-                cols_info: list[str] = [
-                    f"  {r[0]}  {r[1]}"
-                    + (" NOT NULL"      if r[2] == "NO" else "")
-                    + (f"  DEFAULT {r[3]}" if r[3]        else "")
-                    for r in rows
-                ]
-            else:
-                # PRAGMA does not support parameterised queries —
-                # _sanitise_identifier() already guarantees safe_name is clean.
-                cur = conn.execute(f"PRAGMA table_info({safe_name})")  # noqa: S608
-                rows = cur.fetchall()
-                if not rows:
-                    return f"Table '{table_name}' not found or has no columns."
-                cols_info = [
-                    f"  {r[1]}  {r[2]}"
-                    + (" NOT NULL"          if r[3]           else "")
-                    + (f"  DEFAULT {r[4]}"  if r[4] is not None else "")
-                    + (" PRIMARY KEY"        if r[5]           else "")
-                    for r in rows
-                ]
-
-            result = f"Table '{table_name}' columns:\n" + "\n".join(cols_info)
-            set_cached_schema(f"table:{safe_name}", result)
-            return result
-
-        finally:
-            conn.close()
+        result = concurrent.futures.ThreadPoolExecutor(max_workers=1).submit(
+            _run_describe_table, safe_name, table_name
+        ).result(timeout=30)
+        set_cached_schema(f"table:{safe_name}", result)
+        return result
 
     except ValueError as exc:
         return f"Invalid table name: {exc}"
@@ -350,30 +386,18 @@ def query_company_database(sql: str) -> str:
             "Set ALLOW_DB_WRITES=true in .env to enable write operations."
         )
 
+    # Auto-inject LIMIT to prevent context window overflow.
+    if is_select and "LIMIT" not in sql_upper:
+        stripped = f"{stripped.rstrip(';')} LIMIT {MAX_ROWS}"
+        logger.debug("Auto-added LIMIT %d to query", MAX_ROWS)
+
     try:
-        conn = _get_conn()
-        try:
-            if is_select:
-                # Auto-inject LIMIT to prevent context window overflow.
-                if "LIMIT" not in sql_upper:
-                    stripped = f"{stripped.rstrip(';')} LIMIT {MAX_ROWS}"
-                    logger.debug("Auto-added LIMIT %d to query", MAX_ROWS)
-
-                cursor  = conn.execute(stripped)
-                rows    = cursor.fetchall()
-                columns = [desc[0] for desc in cursor.description]
-                return _format_rows(columns, [list(r) for r in rows])
-
-            else:
-                # Write operation — only reachable when ALLOW_DB_WRITES=true.
-                cursor = conn.execute(stripped)
-                conn.commit()
-                clear_schema_cache()
-                return f"Query executed. Rows affected: {cursor.rowcount}"
-
-        finally:
-            conn.close()
-
+        result = concurrent.futures.ThreadPoolExecutor(max_workers=1).submit(
+            _run_query, stripped, is_select
+        ).result(timeout=30)
+        if not is_select:
+            clear_schema_cache()
+        return result
     except Exception as exc:
         logger.exception("query_company_database failed")
         return f"Query error: {exc}"

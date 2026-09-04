@@ -3,7 +3,7 @@ Unit tests for local and database tools.
 """
 import json
 import pytest
-from src.agent.mcp_client import (
+from src.agent.mcp_tools import (
     _sanitise_identifier,
     _is_blocked_statement,
     _format_rows,
