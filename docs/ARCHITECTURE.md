@@ -2,7 +2,7 @@
 
 ## What this system is
 
-The KT Agent is an **Enterprise Knowledge Transfer Assistant**. It is a conversational AI that answers questions about your company by searching internal documents, querying a structured database, or looking up the live web — all from a single chat interface.
+The KT Agent is an **Enterprise Knowledge Transfer Assistant**. It is a conversational AI that answers questions about your company by searching internal documents, querying a structured database, or looking up the live web — all from multiple interfaces including a web UI and Telegram.
 
 The key design principle: **there is no hard-coded routing**. The LLM itself reads the available tools and decides at runtime which one(s) to use. Adding a new data source means writing one Python function — nothing else changes.
 
@@ -11,82 +11,226 @@ The key design principle: **there is no hard-coded routing**. The LLM itself rea
 ## High-Level System Overview
 
 ```
-┌─────────────────────────────────────────────────────────────────┐
-│                        USER'S BROWSER                           │
-│                    http://localhost:8501                         │
-│                  ┌──────────────────────┐                       │
-│                  │   Streamlit Chat UI  │                       │
-│                  │   (streamlit_app.py) │                       │
-│                  └──────────┬───────────┘                       │
-└─────────────────────────────│───────────────────────────────────┘
-                              │  HTTP POST /ask  (question + session_id)
-                              ▼
-┌─────────────────────────────────────────────────────────────────┐
-│                        FASTAPI BACKEND                          │
-│                    http://localhost:8000                         │
-│                       (app.py)                                  │
-│   POST /ask  ──►  aask(question, history)                       │
-│   GET  /health                                                  │
-│   POST /upload                                                  │
-│   GET  /documents                                               │
-│   GET  /sessions/{id}/history                                   │
-│   DELETE /sessions/{id}/history                                 │
-└─────────────────────────────┬───────────────────────────────────┘
-                              │
-                              ▼
-┌─────────────────────────────────────────────────────────────────┐
-│                    LANGGRAPH AGENT LOOP                         │
-│                      (workflow.py)                              │
-│                                                                 │
-│   ┌─────────────────────────────────────────────────────────┐   │
-│   │  AgentState = { messages: [SystemMessage, ...history,   │   │
-│   │                             HumanMessage, ...] }        │   │
-│   │                                                         │   │
-│   │   START ──► Agent Node ──► (has tool calls?)            │   │
-│   │               ▲                │                        │   │
-│   │               │      YES ──►  Tool Node                 │   │
-│   │               └───────────────┘                        │   │
-│   │                       NO ──► END                        │   │
-│   └─────────────────────────────────────────────────────────┘   │
-│                                                                 │
-│   Deduplication guard in agent_node:                            │
-│   • blocks search_company_documents being called > once         │
-│   • prevents repeated identical tool+query pairs               │
-│   • re-invokes LLM without tools if response content is empty  │
-│                                                                 │
-│   Local tools (tools.py):                                       │
-│   ┌──────────────────────┐  ┌──────────────────────────────┐   │
-│   │ search_company_docs  │  │ summarise_document           │   │
-│   │ (LlamaIndex RAG)     │  │ extract_structured_data      │   │
-│   └──────────────────────┘  └──────────────────────────────┘   │
-│   ┌──────────────────────┐  ┌──────────────────────────────┐   │
-│   │ search_web           │  │ calculate                    │   │
-│   │ (Tavily API)         │  │ generate_chart (Plotly)      │   │
-│   └──────────────────────┘  └──────────────────────────────┘   │
-│                                                                 │
-│   MCP tools (mcp_client.py):                                    │
-│   ┌──────────────────────────────────────────────────────────┐  │
-│   │ list_database_tables  describe_database_table            │  │
-│   │ query_company_database                                   │  │
-│   └──────────────────────────────────────────────────────────┘  │
-└─────────────────────────────┬───────────────────────────────────┘
+┌──────────────────────────────────────────────────────────────────────────┐
+│                          ACCESS CHANNELS                                 │
+│                                                                          │
+│  ┌──────────────────────┐   ┌─────────────────┐   ┌──────────────────┐  │
+│  │   Streamlit Chat UI  │   │  Telegram Bot   │   │  OpenClaw        │  │
+│  │  (streamlit_app.py)  │   │ (telegram_bot.py│   │  Webhook         │  │
+│  │  http://localhost    │   │  @shivam_llm_bot│   │  (any channel)   │  │
+│  │  :8501               │   │                 │   │                  │  │
+│  └──────────┬───────────┘   └────────┬────────┘   └────────┬─────────┘  │
+└─────────────│────────────────────────│────────────────────│─────────────┘
+              │ GET /stream (SSE)      │ POST /ask           │ POST /openclaw
+              │ session_id=<uuid>      │ session_id=         │ /webhook
+              │ (token-by-token)       │ telegram_<user_id>  │ session_id=
+              │                        │                     │ <oc_session>
+              └────────────────────────┴─────────────────────┘
+                                       │
+                                       ▼
+┌──────────────────────────────────────────────────────────────────────────┐
+│                         FASTAPI BACKEND (app.py)                         │
+│                          http://localhost:8000                           │
+│                                                                          │
+│  GET  /stream             →  KnowledgeTransferAgent.run() SSE stream    │
+│  POST /ask                →  aask(question, session_id, checkpointer)   │
+│  GET  /health             →  liveness & active backend status           │
+│  POST /upload             →  add_documents_to_index() (incremental)    │
+│  GET  /documents          →  list indexed files                         │
+│  GET  /sessions           →  list active sessions (threadpool query)    │
+│  GET  /sessions/{id}/hist →  session turn history                       │
+│  DELETE /sessions/{id}/...→  aput() empty checkpoint (async reset)     │
+│  GET  /openclaw/health    →  OpenClaw health check                      │
+│  POST /openclaw/webhook   →  aask() via OpenClaw session                │
+└─────────────────────────────────┬────────────────────────────────────────┘
+                                  │
+                                  ▼
+┌──────────────────────────────────────────────────────────────────────────┐
+│                    LANGGRAPH AGENT LOOP (workflow.py)                    │
+│                                                                          │
+│   ┌──────────────────────────────────────────────────────────────────┐  │
+│   │  AgentState = { messages: [SystemMessage, ...history,            │  │
+│   │                             HumanMessage, ToolMessage, ...] }    │  │
+│   │                                                                  │  │
+│   │   START ──► Agent Node ──► (has tool calls?)                     │  │
+│   │               ▲                │                                 │  │
+│   │               │      YES ──►  Tool Node                          │  │
+│   │               └───────────────┘                                  │  │
+│   │                       NO ──► END                                 │  │
+│   └──────────────────────────────────────────────────────────────────┘  │
+│                                                                          │
+│   Deduplication guard in agent_node:                                     │
+│   • blocks search_company_documents being called > once                  │
+│   • prevents repeated identical tool+query pairs                        │
+│   • re-invokes LLM without tools if response content is empty           │
+│                                                                          │
+│   Local tools (tools.py):                                                │
+│   ┌──────────────────────┐  ┌──────────────────────────────┐           │
+│   │ search_company_docs  │  │ summarise_document           │           │
+│   │ (LlamaIndex RAG)     │  │ extract_structured_data      │           │
+│   └──────────────────────┘  └──────────────────────────────┘           │
+│   ┌──────────────────────┐  ┌──────────────────────────────┐           │
+│   │ search_web           │  │ calculate                    │           │
+│   │ (Tavily→Serper→DDG)  │  │ generate_chart (Plotly)      │           │
+│   └──────────────────────┘  └──────────────────────────────┘           │
+│                                                                          │
+│   MCP tools (mcp_client.py):                                             │
+│   ┌──────────────────────────────────────────────────────────────────┐  │
+│   │ list_database_tables (cached)  describe_database_table (cached)  │  │
+│   │ query_company_database (write-invalidated cache + DDL blocked)   │  │
+│   └──────────────────────────────────────────────────────────────────┘  │
+└─────────────────────────────┬────────────────────────────────────────────┘
                               │
               ┌───────────────┼────────────────┐
               ▼               ▼                ▼
-┌─────────────────┐  ┌──────────────┐  ┌───────────────┐
-│  VECTOR STORE   │  │  SQLITE DB   │  │  TAVILY API   │
-│  indexing_data/ │  │  data/*.db   │  │  (live web)   │
-│  (LlamaIndex)   │  │  (sqlite3)   │  └───────────────┘
+┌─────────────────┐  ┌──────────────┐  ┌───────────────────────────────┐
+│  VECTOR STORE   │  │  SQLITE DB   │  │  WEB SEARCH (fallback chain)  │
+│  indexing_data/ │  │  data/*.db   │  │  Tavily → Serper → DuckDuckGo │
+│  (LlamaIndex)   │  │  (sqlite3)   │  └───────────────────────────────┘
 └─────────────────┘  └──────────────┘
         ▲
         │ indexed from
-┌───────────────────┐
-│   data/ folder    │
-│  *.pdf *.docx     │  ← DocxReader (llama-index-readers-file)
-│  *.xlsx *.csv     │
-│  *.txt            │
-└───────────────────┘
+┌───────────────────┐          ┌────────────────────────┐
+│   data/ folder    │          │  memory_store/         │
+│  *.pdf *.docx     │          │  conversations.db      │
+│  *.xlsx *.csv     │          │  (AsyncSqliteSaver)    │
+│  *.txt            │          │  per session_id thread │
+└───────────────────┘          └────────────────────────┘
 ```
+
+---
+
+## Channel Architecture
+
+The agent supports three independent access channels. Each channel maps to its own session namespace so conversation memory never leaks between channels.
+
+### Channel 1 — Streamlit Web UI
+
+```
+Browser → streamlit_app.py
+        → GET /stream?question=...&session_id=<uuid>  (SSE)
+        → KnowledgeTransferAgent.run() async generator
+        → token events streamed word-by-word
+        → done event carries datasource + citations + chart_data
+        → render live in chat UI with blinking cursor
+```
+
+- Session ID is a UUID generated once per browser tab
+- Tokens render live with a `▌` blinking cursor as the LLM generates them
+- Tool-use indicator ("⚙ using search_web…") shown during tool calls
+- Charts render inline as interactive Plotly figures on the `done` event
+- Datasource badges (📄 🌐 🧮 📊 🗄️) shown under each answer
+- Citation pills show exact filename, URL, or SQL
+- Falls back to `POST /ask` (blocking) when SSE is not available
+
+### Channel 2 — Telegram Bot (Direct)
+
+```
+Telegram user → @shivam_llm_bot
+             → python-telegram-bot polling
+             → telegram_bot.py handle_message()
+             → POST /ask {question, session_id=telegram_<user_id>}
+             → aask(question, session_id, checkpointer)
+             → LangGraph agent
+             → reply with answer + citations + tool emoji
+```
+
+- Each Telegram user ID gets its own session — memory is per-user
+- All 9 tools work — RAG, web search, calculator, database, charts
+- Citation sources appended to reply text
+- Running: `python telegram_bot.py` (FastAPI must be running first)
+
+### Channel 3 — OpenClaw Webhook (Multi-channel gateway)
+
+```
+WhatsApp / Discord / Slack
+        → OpenClaw Gateway (port 18789)
+        → POST /openclaw/webhook {channel, user_id, session_id, message}
+        → openclaw_webhook() in app.py
+        → aask(question, session_id=oc_session, checkpointer)
+        → LangGraph agent
+        → OpenClawWebhookResponse (response + tools_used + citations)
+        → OpenClaw sends reply back to originating channel
+```
+
+- OpenClaw's session_id is used directly as the LangGraph thread_id
+- Supports any channel OpenClaw connects to (Telegram, WhatsApp, Discord, Slack)
+- Health check: `GET /openclaw/health`
+
+---
+
+## Real-Time Streaming
+
+`KnowledgeTransferAgent` in `workflow.py` is an async generator that yields SSE events as the LangGraph graph runs:
+
+```
+GET /stream?question=...&session_id=...
+        │
+        ▼
+KnowledgeTransferAgent.run(question, session_id)
+        │
+        ├── yield {"type": "status", "stage": "thinking"}
+        │
+        ├── graph.astream(state, stream_mode=["messages", "values"])
+        │       │
+        │       ├── "messages" mode → agent node only
+        │       │       └── yield {"type": "token", "text": "..."}  per chunk
+        │       │
+        │       └── "values" mode → tool call events
+        │               └── yield {"type": "tool", "name": "..."}
+        │
+        └── yield {"type": "done", "payload": {datasource, citations, ...}}
+```
+
+The Streamlit UI consumes this with `httpx.stream()`, accumulating tokens into a live `st.empty()` slot. The `POST /ask` endpoint still exists for Telegram and other non-streaming callers.
+
+---
+
+## Web Search Fallback Chain
+
+The `search_web` tool uses `_FallbackSearchTool` — a `BaseTool` wrapper that tries each provider in order and cascades on any runtime error including quota exhaustion:
+
+```
+search_web("query")
+        │
+        ▼ try TavilySearch
+        │   ✓ returns result → done
+        │   ✗ quota/error (including {"error": ...} dict response) →
+        ▼ try GoogleSerperRun
+        │   ✓ returns result → done
+        │   ✗ error →
+        ▼ DuckDuckGoSearchRun
+            ✓ always available (no key needed)
+```
+
+Provider selection at startup (logged on first request):
+```
+INFO | Web search primary: Tavily
+INFO | Web search fallback #1: Serper
+INFO | Web search fallback #2: DuckDuckGo
+```
+
+---
+
+## Conversation Memory (persistent)
+
+```
+Request arrives with session_id
+        │
+        ▼
+AsyncSqliteSaver.aget_tuple(thread_id=session_id)
+        │
+        ▼
+LangGraph loads full message history from memory_store/conversations.db
+        │
+        ▼
+Agent runs with full history context
+        │
+        ▼
+AsyncSqliteSaver automatically saves updated state after each run
+```
+
+Previously memory was in-memory (`_sessions` dict) and lost on server restart. The checkpointer replaces this entirely — no manual session management needed.
 
 ---
 
@@ -95,16 +239,16 @@ The key design principle: **there is no hard-coded routing**. The LLM itself rea
 The entire agent is a two-node LangGraph `StateGraph`. There are no other nodes — no classifier, no pre-router, no if/else logic.
 
 ```
-User question
+User question (from any channel)
      │
      ▼
-FastAPI POST /ask
+FastAPI endpoint (POST /ask or POST /openclaw/webhook)
      │
      ▼
-aask(question, history)   ← workflow.py
+aask(question, session_id, checkpointer)   ← workflow.py
      │
      ▼
-build_graph(all_tools)    ← fresh graph per request
+build_graph(all_tools, checkpointer)
      │
      ▼
 ┌────────────────────────────────────────────────────┐
@@ -121,7 +265,7 @@ build_graph(all_tools)    ← fresh graph per request
 parse_result()   → answer, datasource, tools_used, citations, chart_data
      │
      ▼
-QuestionResponse → Streamlit
+Response → channel (Streamlit / Telegram / OpenClaw)
 ```
 
 ### Why two nodes?
@@ -145,15 +289,14 @@ The prompt also enforces:
 - **No redundant tool calls** — `search_company_documents` must be called at most once per question
 - **Citations** — always cite source filenames, SQL queries, or URLs
 - **Accuracy** — use the `calculate` tool for all arithmetic
-- **Web search caveats** — quote the value, not the date shown in snippets
 
-This is backed up at the code level by the **deduplication guard** (see below) — the prompt alone is not reliable enough.
+This is backed up at the code level by the **deduplication guard** — the prompt alone is not reliable enough.
 
 ---
 
 ## Deduplication Guard
 
-The LLM was observed calling `search_company_documents` 4+ times per question with slightly different queries ("Shivam skills", "Shivam profile", "Shivam", ...). Each call consumes a Groq API request, burning through the 30 RPM free-tier limit in seconds.
+The LLM was observed calling `search_company_documents` 4+ times per question with slightly different queries. Each call consumes a Groq API request, burning through the free-tier rate limit in seconds.
 
 The guard runs inside `agent_node` after every LLM response:
 
@@ -175,8 +318,6 @@ Count prior search_company_documents calls in message history
                YES → re-invoke LLM without tools to get a real answer
 ```
 
-This is a code-level guarantee — the model cannot bypass it regardless of what the prompt says.
-
 ---
 
 ## The 9 Tools
@@ -193,13 +334,11 @@ This is a code-level guarantee — the model cannot bypass it regardless of what
 | `describe_database_table` | `mcp_client.py` | LLM needs column names before writing a query |
 | `query_company_database` | `mcp_client.py` | Question requires structured data from the database |
 
-The LLM learns what each tool does from its **docstring**. Well-written docstrings are critical to correct routing.
-
 ---
 
 ## The 7 Answer Paths
 
-Every API response includes a `datasource` field:
+Every API response includes a `datasource` field that all channels use for display:
 
 ```
 datasource = "direct_llm"     → LLM answered from training data / live date prompt
@@ -211,117 +350,43 @@ datasource = "chart"          → generate_chart was called
 datasource = "multiple"       → more than one tool category was used
 ```
 
-### Path 1 — Direct LLM (including date/time)
-```
-User: "What is a vector database?"  OR  "What day is today?"
-LLM:  Answers directly — system prompt contains live date/time
-→ datasource: "direct_llm"
-```
-
-### Path 2 — Company Documents (RAG)
-```
-User: "What are Shivam's technical skills?"
-LLM:  Calls search_company_documents("Shivam technical skills")
-      Tool → LlamaIndex vector store (indexed with DocxReader) → top 4 chunks
-LLM:  Synthesises answer, cites filename
-→ datasource: "company_docs"
-```
-
-### Path 3 — Database
-```
-User: "What is the status of order #12345?"
-LLM:  Calls list_database_tables() → calls describe_database_table("orders")
-      Calls query_company_database("SELECT * FROM orders WHERE id = 12345")
-LLM:  Formats result, shows SQL in code block
-→ datasource: "database"
-```
-
-### Path 4 — Web Search
-```
-User: "What is the current USD to INR exchange rate?"
-LLM:  Calls search_web("USD to INR exchange rate today")
-      → TavilySearch returns structured results with URLs
-LLM:  Extracts rate value, cites source URL
-→ datasource: "web_search"
-```
-
-### Path 5 — Calculation
-```
-User: "What is 15% of 85000?"
-LLM:  Calls calculate("85000 * 0.15") → "85000 * 0.15 = 12750"
-→ datasource: "calculation"
-```
-
-### Path 6 — Chart
-```
-User: "Show monthly sales as a bar chart: Jan=1200, Feb=1500"
-LLM:  Calls generate_chart(data_json='[...]', chart_type='bar', title='Monthly Sales')
-Streamlit: renders Plotly chart inline in the chat
-→ datasource: "chart"
-```
-
----
-
-## Conversation Memory
-
-The agent supports multi-turn conversation via `session_id`. FastAPI stores message history per session in `_sessions` (in-memory dict). On each request:
-
-1. FastAPI reconstructs prior `HumanMessage` / `AIMessage` objects
-2. `aask(question, history=history)` prepends history before the new question
-3. `_build_system_prompt()` is called fresh — date is always current
-4. After the answer, FastAPI stores the new exchange
-
-Session history is capped at 20 turns (40 messages) to stay within context limits.
-
----
-
-## Citations
-
-Every response includes a `citations` list. `_extract_citations()` walks all `ToolMessage` objects in the final state:
-
-| Tool | Citation source |
-|---|---|
-| `search_company_documents` | `[Source: filename]` markers in tool output |
-| `search_web` | `[Source: url]` markers in tool output |
-| `query_company_database` | The SQL query used, shown as `detail` |
-| `calculate` | The expression and result |
-| `summarise_document` | The filename from `[Full text of ...]` prefix |
-| `extract_structured_data` | `[Source: filename]` markers |
-| `list_database_tables` / `describe_database_table` | `"schema lookup via <tool_name>"` |
-
 ---
 
 ## Data Stores
 
-### Vector Store (for documents)
+### Vector Store (document search)
 
 ```
 data/                          ← put your files here
   ├── report.pdf
-  ├── handbook.docx            ← parsed by DocxReader (requires llama-index-readers-file)
+  ├── handbook.docx            ← parsed by DocxReader (llama-index-readers-file)
   ├── catalog.xlsx
   └── notes.txt
        │
-       │  python -m src.agent.rag  OR  POST /upload from Streamlit
+       │  python -m src.agent.rag  OR  POST /upload
        ▼
 indexing_data/                 ← auto-generated, do not edit
   ├── default__vector_store.json
   ├── docstore.json
-  ├── index_store.json
   └── ...
 ```
 
-- **Supported formats:** PDF, DOCX, DOC, XLSX, XLS, CSV, TXT
-- **DOCX parsing:** `DocxReader` from `llama-index-readers-file` (backed by `docx2txt`)
-- **Embedding model:** `BAAI/bge-small-en-v1.5` — runs locally, no API key needed
-- **Chunk size:** 512 tokens, 50 token overlap
-- **Cache invalidation:** `get_vector_index.cache_clear()` is called after every index rebuild, so new files are searchable immediately on the next query
+### Conversation Memory (per-session history)
 
-### Company Database
+```
+memory_store/
+  └── conversations.db         ← SQLite, managed by AsyncSqliteSaver
+       │
+       │  keyed by thread_id = session_id
+       │  persists across server restarts
+       │  shared across all channels (Streamlit, Telegram, OpenClaw)
+```
 
-- **Location:** `data/company.db`
-- **Technology:** SQLite (swappable with Postgres via real MCP server)
-- **Access:** Read-only — `query_company_database` rejects any SQL that is not a `SELECT`
+### Company Database (structured queries)
+
+```
+data/company.db                ← SQLite, read-only via SELECT
+```
 
 ---
 
@@ -329,16 +394,18 @@ indexing_data/                 ← auto-generated, do not edit
 
 | File | Layer | What it does |
 |---|---|---|
-| `streamlit_app.py` | UI | Chat interface, session state, datasource badges, citation pills, Plotly chart rendering, document upload, sidebar sample questions |
-| `app.py` | API | FastAPI — `/ask`, `/health`, `/upload`, `/documents`, `/sessions/*`, in-memory session store |
-| `workflow.py` | Agent | Builds the LangGraph, dynamic system prompt with live date, deduplication guard, agent node, tool node, routing, citation/chart extraction, result parsing |
-| `chains.py` | LLM | Factory: auto-selects Groq / Gemini / Cohere; provides `TavilySearch` web tool |
-| `tools.py` | Tools | 6 local tools: `search_company_documents`, `summarise_document`, `extract_structured_data`, `search_web`, `calculate`, `generate_chart` |
-| `rag.py` | RAG | Auto-discovers files in `data/`, registers `DocxReader`, builds/loads LlamaIndex vector store |
-| `mcp_client.py` | DB | Three database tools behind an MCP-compatible `asynccontextmanager` |
-| `config.py` | Config | `DATA_DIR`, `INDEX_DIR` paths; env key validation |
-| `schemas.py` | Models | `QuestionRequest` (with `session_id`), `QuestionResponse` (with `citations`, `chart_data`) |
-| `ingest_drive.py` | Ingestion | Optional: pulls documents from Google Drive into the vector store |
+| `streamlit_app.py` | UI | Chat UI — SSE streaming, badges, citations, Plotly charts, file upload, session controls |
+| `telegram_bot.py` | Channel | Telegram bot — polls for messages, calls `/ask`, replies with answer + citations |
+| `app.py` | API | FastAPI — `/stream` (SSE), `/ask`, `/health`, `/upload`, `/documents`, `/sessions/*`, `/openclaw/*` |
+| `workflow.py` | Agent | LangGraph graph, `KnowledgeTransferAgent` async generator, system prompt, dedup guard, citations |
+| `chains.py` | LLM + Search | LLM factory (Groq/Gemini/Cohere); `_FallbackSearchTool` (Tavily→Serper→DuckDuckGo) |
+| `tools.py` | Tools | 6 local tools: search, summarise, extract, web search, calculate, chart |
+| `rag.py` | RAG | File discovery, DocxReader, LlamaIndex vector store build/load/retrieve/incremental indexing |
+| `mcp_client.py` | DB | 3 database tools behind MCP-compatible asynccontextmanager + TTL schema caching |
+| `schemas.py` | Models | QuestionRequest/Response + OpenClawWebhookRequest/Response/HealthResponse |
+| `config.py` | Config | DATA_DIR, INDEX_DIR paths; LLM key validation; web search key warning |
+| `tests/` | Tests | Pytest test suite: `test_tools.py`, `test_workflow.py`, `test_api.py` |
+
 
 ---
 
@@ -355,8 +422,6 @@ LLM_PROVIDER=google       →  forces Google regardless of other keys
 
 Priority order: **Groq → Google → Cohere**. All providers use LangChain's `BaseChatModel` — `workflow.py` never references a specific provider.
 
-> **Note on Groq rate limits:** The free tier allows 30 RPM. The deduplication guard and `parallel_tool_calls=False` keep most questions within 2–3 API calls.
-
 ---
 
 ## Technology Stack
@@ -364,19 +429,25 @@ Priority order: **Groq → Google → Cohere**. All providers use LangChain's `B
 | Technology | Role |
 |---|---|
 | **LangGraph** | Stateful ReAct agent loop (two-node StateGraph) |
+| **LangGraph AsyncSqliteSaver** | Persistent conversation memory per session_id |
 | **LangChain** | `@tool` decorator, `ToolNode`, `BaseChatModel` interface |
-| **LlamaIndex** | Document ingestion, chunking, HuggingFace embeddings, persisted vector store |
+| **LlamaIndex** | Document ingestion, chunking, HuggingFace embeddings, vector store |
 | **llama-index-readers-file** | `DocxReader` for proper Word document text extraction |
-| **FastAPI** | Async HTTP API with Pydantic request/response validation; in-memory session store |
-| **Streamlit** | Chat UI with session memory, datasource badges, citation pills, Plotly charts, document upload |
-| **Groq** | Default LLM — `openai/gpt-oss-20b`, fast free-tier, tool-calling support |
-| **Google Gemini** | Alternative LLM — `gemini-1.5-flash` |
-| **Cohere** | Alternative LLM — `command-r-plus` |
-| **langchain-tavily** | Real-time web search (`TavilySearch`) |
+| **FastAPI** | Async HTTP API — `/stream` (SSE), `/ask`, `/upload`, `/openclaw/webhook`, session endpoints |
+| **Server-Sent Events (SSE)** | Real-time token streaming via `GET /stream` + `StreamingResponse` |
+| **Streamlit** | Web chat UI — SSE consumer, live token rendering, badges, charts, upload |
+| **python-telegram-bot** | Telegram channel — polls Telegram and calls FastAPI `/ask` |
+| **Groq** | Default LLM — `openai/gpt-oss-20b`, streaming enabled |
+| **Google Gemini** | Alternative LLM — `gemini-1.5-flash`, streaming enabled |
+| **Cohere** | Alternative LLM — `command-r-plus`, streaming enabled |
+| **Tavily** | Web search primary — AI-optimised results via `langchain-tavily` |
+| **Serper** | Web search fallback #1 — real Google results, 2,500 free credits |
+| **DuckDuckGo** | Web search fallback #2 — always free, no key required |
 | **HuggingFace** | `BAAI/bge-small-en-v1.5` local embedding model |
-| **Plotly** | Interactive chart generation and rendering |
-| **SQLite** | Company database — swappable to Postgres via MCP |
-| **docx2txt** | Underlying DOCX text extractor used by DocxReader |
+| **Plotly** | Interactive chart generation |
+| **SQLite** | Company database + conversation memory store |
+| **OpenClaw** | Optional multi-channel gateway (WhatsApp, Discord, Slack) |
+| **pytest** | Automated test suite (22 unit & integration tests) |
 
 ---
 
@@ -396,11 +467,17 @@ def get_jira_ticket(ticket_id: str) -> str:
 LOCAL_TOOLS = [search_company_documents, search_web, ..., get_jira_ticket]
 ```
 
-No routing changes. The LLM starts using it automatically.
+No routing changes. The LLM starts using it automatically across all channels.
+
+### Add a new channel
+
+1. Create a new file (e.g. `discord_bot.py`)
+2. Call `POST /ask` with a unique `session_id` prefix (e.g. `discord_<user_id>`)
+3. Memory is automatically maintained per session via the checkpointer
 
 ### Add a new document type
 
-Add the extension to `SUPPORTED_EXTENSIONS` in `src/agent/rag.py` and register its reader in `_get_file_extractors()`:
+Add the extension to `SUPPORTED_EXTENSIONS` in `src/agent/rag.py` and register its reader:
 
 ```python
 SUPPORTED_EXTENSIONS = {".pdf", ".docx", ".doc", ".xlsx", ".xls", ".csv", ".txt", ".md"}

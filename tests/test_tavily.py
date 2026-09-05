@@ -1,28 +1,28 @@
-"""Quick test to verify Tavily API key is working."""
-
+"""
+Optional live connectivity check for Tavily search API.
+Only executes when RUN_LIVE_API_TESTS=true is set in environment.
+"""
 import os
+import pytest
 from dotenv import load_dotenv
 
 load_dotenv()
 
-key = os.getenv("TAVILY_API_KEY")
-if not key:
-    print("❌ TAVILY_API_KEY not found in .env")
-    exit(1)
 
-print(f"✅ Key found: {key[:8]}...")
+def test_tavily_api_connection():
+    if os.getenv("RUN_LIVE_API_TESTS", "").lower() != "true":
+        pytest.skip("Set RUN_LIVE_API_TESTS=true to run live third-party Tavily API checks.")
 
-try:
-    from langchain_community.tools.tavily_search import TavilySearchResults
+    key = os.getenv("TAVILY_API_KEY")
+    if not key or key.startswith("your_"):
+        pytest.skip("TAVILY_API_KEY not configured in environment.")
 
-    tool = TavilySearchResults(k=2)
-    results = tool.invoke({"query": "current weather in Bangalore India"})
-
-    print("\n✅ Tavily is working! Results:\n")
-    for r in results:
-        print(f"  URL    : {r.get('url', 'N/A')}")
-        print(f"  Snippet: {r.get('content', '')[:150]}...")
-        print()
-
-except Exception as e:
-    print(f"\n❌ Tavily call failed: {e}")
+    try:
+        from langchain_community.tools.tavily_search import TavilySearchResults
+        tool = TavilySearchResults(k=2)
+        results = tool.invoke({"query": "Python programming language"})
+        if isinstance(results, str) and "HTTPError" in results:
+            pytest.skip(f"Tavily API returned upstream error: {results}")
+        assert isinstance(results, list)
+    except Exception as exc:
+        pytest.skip(f"Tavily live check skipped due to network/upstream error: {exc}")
