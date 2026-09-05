@@ -14,7 +14,7 @@ load_dotenv()
 
 # ── Config ───────────────────────────────────────────────────────────────────
 API_URL         = os.getenv("KT_API_URL", "http://localhost:8000")
-REQUEST_TIMEOUT = 180.0
+REQUEST_TIMEOUT = 300.0
 
 # ── Sample questions ─────────────────────────────────────────────────────────
 SAMPLE_QUESTIONS: dict[str, list[str]] = {

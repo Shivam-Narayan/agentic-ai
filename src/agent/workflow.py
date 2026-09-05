@@ -53,6 +53,7 @@ from .mcp_tools import mcp_server_context
 from .parser import parse_result, serialize_parse_result
 from .prompt import _build_system_prompt
 from .tools import (
+    analyse_csv,
     calculate,
     extract_structured_data,
     generate_chart,
@@ -72,7 +73,7 @@ _AGENT_RECURSION_LIMIT: int = 8
 
 # Per-LLM-call timeout — enforced via asyncio.wait_for().
 # Prevents a rate-limited LLM from hanging the agent loop indefinitely.
-_TOOL_CALL_TIMEOUT_SECS: int = 30
+_TOOL_CALL_TIMEOUT_SECS: int = 90
 
 # Per-tool-execution timeout — enforced on ToolNode.
 # Prevents a slow web search or database query from hanging the agent loop.
@@ -89,6 +90,7 @@ LOCAL_TOOLS: tuple = (
     extract_structured_data,
     calculate,
     generate_chart,
+    analyse_csv,
 )
 
 # ---------------------------------------------------------------------------

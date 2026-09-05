@@ -387,3 +387,153 @@ def generate_chart(data_json: str, chart_type: str, title: str) -> str:
     except Exception as exc:
         logger.exception("generate_chart failed")
         return f"Error generating chart: {exc}"
+
+
+# ---------------------------------------------------------------------------
+# 7. analyse_csv
+# ---------------------------------------------------------------------------
+
+def _basic_csv_context(df, question: str) -> str:
+    """Fallback basic context if LLM code generation fails."""
+    import io
+    lines: list[str] = []
+    lines.append(f"Shape: {df.shape[0]:,} rows, {df.shape[1]} columns")
+    lines.append(f"Columns: {', '.join(str(c) for c in df.columns.tolist())}")
+    
+    num_cols = df.select_dtypes(include="number").columns.tolist()
+    if num_cols:
+        buf = io.StringIO()
+        df[num_cols].describe().round(2).to_string(buf)
+        lines.append(f"\nNumeric summary:\n{buf.getvalue()}")
+        
+    return "\n".join(lines)
+
+
+@tool
+def analyse_csv(filename: str, question: str) -> str:
+    """Analyse a CSV file using Pandas to answer statistical and aggregation questions.
+
+    Use this tool — NOT search_company_documents — for questions that require
+    counting, grouping, averaging, ranking, or trend analysis over tabular data.
+
+    Examples:
+      "What is the average absenteeism rate by department?"
+      "Which employee had the most absences?"
+      "How many overtime days did each employee have?"
+      "Show absenteeism trend over months"
+
+    Args:
+        filename: CSV filename in the data/ directory
+                  (e.g. 'absenteeism_data_historical.csv').
+        question: The analysis question to answer.
+    """
+    logger.info("Tool analyse_csv: file=%s question=%s", filename, question)
+
+    try:
+        import pandas as pd
+    except ImportError:
+        return "Error: pandas is not installed. Run: pip install pandas"
+
+    # Locate file — case-insensitive fallback
+    candidate = DATA_DIR / filename
+    if not candidate.exists():
+        matches = [
+            p for p in DATA_DIR.iterdir()
+            if p.suffix.lower() == ".csv" and p.name.lower() == filename.lower()
+        ]
+        if not matches:
+            available = sorted(
+                p.name for p in DATA_DIR.iterdir()
+                if p.suffix.lower() == ".csv"
+            )
+            return (
+                f"CSV file '{filename}' not found. "
+                f"Available CSV files: {', '.join(available) or 'none'}"
+            )
+        candidate = matches[0]
+
+    try:
+        df = pd.read_csv(str(candidate))
+    except Exception as exc:
+        return f"Error reading '{filename}': {exc}"
+
+    if df.empty:
+        return f"'{filename}' is empty — no data to analyse."
+
+    try:
+        from .chains import get_llm
+        from langchain_core.messages import HumanMessage
+        llm = get_llm()
+    except Exception as exc:
+        logger.warning("Could not get LLM for analyse_csv, using basic fallback: %s", exc)
+        return (
+            f"[CSV Analysis (Fallback): {candidate.name}]\n\n"
+            f"{_basic_csv_context(df, question)}\n\n"
+            f"Please answer based on the basic schema above or specify columns to filter."
+        )
+
+    df_info = df.dtypes.to_string()
+    df_head = df.head(3).to_string()
+
+    prompt = f"""You are a data analyst using Python and Pandas.
+You need to answer the following user question based on a dataset.
+The dataset is already loaded as a pandas DataFrame named `df`.
+
+DataFrame Schema (Columns and Dtypes):
+{df_info}
+
+Sample Data (first 3 rows):
+{df_head}
+
+User Question: {question}
+
+Instructions:
+1. Write Python code using Pandas to compute the precise answer to the question.
+2. Do NOT include `import pandas` or load the CSV; `df` and `pd` are already available.
+3. Assign the final result to a variable named `result`.
+4. Make sure `result` is formatted clearly as a string, number, or JSON string (if returning data for charting/trends).
+5. Output ONLY the Python code block enclosed in ```python ... ```, no explanations.
+
+Example 1 (Aggregation):
+```python
+dept_avg = df.groupby('Department')['Absenteeism'].mean()
+result = f"Average Absenteeism by Department:\\n{{dept_avg.to_string()}}"
+```
+
+Example 2 (Trend/Charting):
+```python
+trend = df.groupby('Month')['Absences'].sum().reset_index()
+result = trend.to_json(orient='records')
+```
+"""
+
+    try:
+        response = llm.invoke([HumanMessage(content=prompt)])
+        code = response.content
+
+        # Extract code from markdown
+        if "```python" in code:
+            code = code.split("```python")[1].split("```")[0].strip()
+        elif "```" in code:
+            code = code.split("```")[1].split("```")[0].strip()
+
+        # Execute code in restricted local environment
+        local_vars = {"df": df, "pd": pd}
+        exec(code, {}, local_vars)
+
+        if "result" in local_vars:
+            ans = local_vars["result"]
+            return (
+                f"[CSV Analysis Result for '{candidate.name}']\n"
+                f"Question: {question}\n\n"
+                f"{ans}"
+            )
+        else:
+            return (
+                f"Error: Generated analysis code did not assign to 'result' variable.\n"
+                f"Generated code:\n{code}"
+            )
+
+    except Exception as exc:
+        logger.exception("Error executing generated Pandas code in analyse_csv.")
+        return f"Error executing data analysis: {exc}"
