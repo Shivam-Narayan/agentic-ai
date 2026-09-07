@@ -1,0 +1,39 @@
+version: "3.9"
+
+# DataDialogue — PostgreSQL + pgvector
+#
+# Starts a single Postgres 16 container with the pgvector extension.
+# This handles both:
+#   - Document embeddings  (pgvector table)
+#   - Conversation memory  (LangGraph AsyncPostgresSaver checkpoints)
+#
+# Usage:
+#   docker compose up -d          # start in background
+#   docker compose down           # stop (data preserved in pgdata volume)
+#   docker compose down -v        # stop AND wipe all data
+
+services:
+  postgres:
+    image: pgvector/pgvector:pg16
+    container_name: datadialogue_db
+    environment:
+      POSTGRES_DB:       datadialogue
+      POSTGRES_USER:     postgres
+      POSTGRES_PASSWORD: password
+    ports:
+      - "5432:5432"
+    volumes:
+      # Persist data across container restarts
+      - pgdata:/var/lib/postgresql/data
+      # Run init.sql once on first boot to create extensions + tables
+      - ./init.sql:/docker-entrypoint-initdb.d/init.sql
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d datadialogue"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  pgdata:
+    driver: local

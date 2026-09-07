@@ -1,0 +1,54 @@
+# Premium dark theme for DataDialogue
+[theme]
+base = "dark"
+primaryColor = "#818CF8"
+backgroundColor = "#07090F"
+secondaryBackgroundColor = "#12151F"
+codeBackgroundColor = "#0B0E16"
+textColor = "#E8ECF4"
+linkColor = "#A5B4FC"
+borderColor = "#252A3A"
+codeTextColor = "#C7D2FE"
+showWidgetBorder = true
+showSidebarBorder = true
+baseRadius = "0.85rem"
+buttonRadius = "0.75rem"
+
+font = "'Plus Jakarta Sans':https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700&display=swap"
+headingFont = "'Plus Jakarta Sans':https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@600;700&display=swap"
+codeFont = "'JetBrains Mono':https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500&display=swap"
+baseFontSize = 14
+baseFontWeight = 400
+codeFontSize = "0.85rem"
+headingFontSizes = ["28px", "22px", "18px", "16px", "14px", "12px"]
+headingFontWeights = [700, 600, 600, 600, 500, 500]
+linkUnderline = false
+
+violetColor = "#A78BFA"
+blueColor = "#818CF8"
+greenColor = "#34D399"
+yellowColor = "#FBBF24"
+orangeColor = "#FB923C"
+redColor = "#F87171"
+grayColor = "#94A3B8"
+
+chartCategoricalColors = [
+    "#818CF8",
+    "#22D3EE",
+    "#A78BFA",
+    "#34D399",
+    "#F472B6",
+    "#FBBF24",
+    "#60A5FA",
+]
+
+dataframeBorderColor = "#252A3A"
+dataframeHeaderBackgroundColor = "#12151F"
+
+[theme.sidebar]
+backgroundColor = "#0A0C14"
+secondaryBackgroundColor = "#12151F"
+codeBackgroundColor = "#0B0E16"
+textColor = "#E8ECF4"
+borderColor = "#1C2130"
+primaryColor = "#818CF8"

@@ -1,0 +1,65 @@
+[
+  {
+    "id": "doc_001",
+    "question": "What is the KT agent project about?",
+    "ground_truth": "The KT agent is a knowledge transfer assistant that answers questions about company documents, databases, and the web using an agentic AI system.",
+    "datasource": "company_docs",
+    "notes": "Basic project overview from KT design document"
+  },
+  {
+    "id": "doc_002",
+    "question": "What tech stack is used in the Knowledge Transfer Agent?",
+    "ground_truth": "The project uses LangGraph, LlamaIndex, FastAPI, Streamlit, and supports multiple LLMs including Groq, Google Gemini, and Cohere.",
+    "datasource": "company_docs",
+    "notes": "Tech stack question from KT document"
+  },
+  {
+    "id": "doc_003",
+    "question": "Summarise the Knowledge Transfer Agent Design Plans document",
+    "ground_truth": "The document describes an agentic AI system for knowledge transfer, covering architecture, tools, memory management, and deployment plans.",
+    "datasource": "company_docs",
+    "notes": "Full document summary — update ground_truth after reading the actual PDF"
+  },
+  {
+    "id": "doc_004",
+    "question": "What are Shivam Narayan's technical skills?",
+    "ground_truth": "Python, FastAPI, LangChain, LangGraph, LlamaIndex, SQL, and AI/ML development.",
+    "datasource": "company_docs",
+    "notes": "Resume document — update ground_truth with actual skills from the DOCX"
+  },
+  {
+    "id": "db_001",
+    "question": "List all tables in the database",
+    "ground_truth": "The database contains tables available in company.db.",
+    "datasource": "database",
+    "notes": "Update ground_truth with actual table names from your company.db"
+  },
+  {
+    "id": "calc_001",
+    "question": "What is 15% of 85000?",
+    "ground_truth": "15% of 85000 is 12750.",
+    "datasource": "calculation",
+    "notes": "Pure calculation — deterministic"
+  },
+  {
+    "id": "calc_002",
+    "question": "Calculate (250 + 300) * 12 / 100",
+    "ground_truth": "(250 + 300) * 12 / 100 = 66.0",
+    "datasource": "calculation",
+    "notes": "Pure calculation — deterministic"
+  },
+  {
+    "id": "llm_001",
+    "question": "What is a vector database?",
+    "ground_truth": "A vector database stores data as high-dimensional vectors and enables fast similarity search, commonly used in AI applications for semantic search and RAG systems.",
+    "datasource": "direct_llm",
+    "notes": "General knowledge — no tools needed"
+  },
+  {
+    "id": "llm_002",
+    "question": "What is the difference between SQL and NoSQL?",
+    "ground_truth": "SQL databases are relational and use structured schemas with tables, while NoSQL databases are non-relational and support flexible schemas including documents, key-value pairs, and graphs.",
+    "datasource": "direct_llm",
+    "notes": "General knowledge — no tools needed"
+  }
+]

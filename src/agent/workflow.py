@@ -20,27 +20,40 @@ Architecture overview:
   [ END ]  -> parse_result() -> FastAPI response
 
 Key design decisions:
-  - parallel_tool_calls=False  : forces the LLM to call one tool at a time
-  - Deduplication guard        : code-level block on repeated search_company_documents calls
-  - Dynamic system prompt      : stamped with live date/time on every request
-  - recursion_limit=8          : caps the agent loop to prevent runaway API usage
+  - parallel_tool_calls=False    forces the LLM to call one tool at a time
+  - Turn-scoped deduplication    only blocks repeated calls within the current
+                                 conversation turn, so multi-turn sessions work
+  - Dynamic system prompt        stamped with live date/time, passed via
+                                 config["configurable"] (LangGraph-idiomatic)
+  - _AGENT_RECURSION_LIMIT       caps the agent loop to prevent runaway API usage
+  - _TOOL_CALL_TIMEOUT_SECS      enforced via asyncio.wait_for on every LLM call
+  - _TOOL_EXEC_TIMEOUT_SECS      enforced on tool execution via ToolNode
+  - Canonical dedup keys         json.dumps(args, sort_keys=True) — handles every
+                                 tool regardless of parameter names
+  - Safe AIMessage construction  dedup guard constructs new AIMessage objects
+                                 instead of mutating response.tool_calls in place
 """
 
-import json
+import asyncio
+import json as _json
 import logging
-import re
-from datetime import datetime
-from typing import Annotated
+import uuid
+import warnings
+from typing import Annotated, Any, AsyncIterator
 
-from langchain_core.messages import HumanMessage, SystemMessage
+from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
+from langchain_core.runnables import RunnableConfig
 from langgraph.graph import END, START, StateGraph
 from langgraph.graph.message import add_messages
 from langgraph.prebuilt import ToolNode
 from typing_extensions import TypedDict
 
 from .chains import get_llm
-from .mcp_client import mcp_server_context
+from .mcp_tools import mcp_server_context
+from .parser import parse_result, serialize_parse_result
+from .prompt import _build_system_prompt
 from .tools import (
+    analyse_csv,
     calculate,
     extract_structured_data,
     generate_chart,
@@ -51,80 +64,37 @@ from .tools import (
 
 logger = logging.getLogger(__name__)
 
-
 # ---------------------------------------------------------------------------
-# System prompt
-#
-# Built fresh on every agent invocation so the date/time is always accurate.
-# Contains three key sections:
-#   1. When to answer directly vs. use a tool  (prevents unnecessary tool calls)
-#   2. Hard constraints on tool usage           (prevents the loop/rate-limit problem)
-#   3. Output and citation rules
+# Module-level constants
 # ---------------------------------------------------------------------------
 
-def _build_system_prompt() -> str:
-    """Return the system prompt with the current server date/time embedded."""
-    now = datetime.now()
-    date_str = now.strftime("%A, %d %B %Y")  # e.g. "Wednesday, 26 August 2026"
-    time_str = now.strftime("%H:%M")
+# Maximum tool-call loops before the graph forces a final answer.
+_AGENT_RECURSION_LIMIT: int = 8
 
-    return f"""You are the CTE Knowledge Transfer Assistant -- an expert at helping
-team members find information about company projects, documents, databases, and data.
+# Per-LLM-call timeout — enforced via asyncio.wait_for().
+# Prevents a rate-limited LLM from hanging the agent loop indefinitely.
+_TOOL_CALL_TIMEOUT_SECS: int = 90
 
-CURRENT DATE AND TIME: {date_str}, {time_str} (server local time)
-Always use the date and day above when answering questions about today's date or day.
-Never guess or infer the day of the week from your training data.
+# Per-tool-execution timeout — enforced on ToolNode.
+# Prevents a slow web search or database query from hanging the agent loop.
+_TOOL_EXEC_TIMEOUT_SECS: int = 60
 
-WHEN TO USE TOOLS vs ANSWER DIRECTLY:
+# ---------------------------------------------------------------------------
+# Static tool list — tuple prevents accidental mutation
+# ---------------------------------------------------------------------------
 
-Answer DIRECTLY from your own knowledge (NO tools needed) when the question is about:
-- General technology concepts: "What is a vector database?", "Explain RAG", "What is Python?"
-- Programming, software engineering, or AI/ML concepts
-- Definitions, explanations, how-things-work questions
-- Today's date or day of the week (use the CURRENT DATE AND TIME above)
-- Anything that doesn't reference a specific internal document, person, or company data
-
-Use tools ONLY when the question refers to:
-- A specific internal document, file, or uploaded content ("Shivam's resume", "the KT doc")
-- Company-specific data, projects, or people
-- A live web fact (prices, news, current events)
-- A calculation or chart request
-
-CRITICAL CONSTRAINTS:
-
-1. NO REDUNDANT TOOL CALLS -- NEVER call the same tool more than once per question.
-   Call a search tool ONCE, get the result, then write your final answer. Do not
-   re-search with different wording.
-
-2. SINGLE TOOL PER STEP -- Call exactly ONE tool per reasoning step.
-
-3. STOP AFTER ONE SEARCH -- After receiving tool results, your next message must be
-   your final answer. Never call another search tool after getting results.
-
-TOOL SELECTION GUIDE (only when a tool is actually needed):
-- Internal document/person/file question -> search_company_documents ONCE
-- "Summarise [filename]" -> summarise_document ONCE
-- "Extract [fields] from [doc]" -> extract_structured_data ONCE
-- Live web fact -> search_web ONCE
-- Math calculation -> calculate ONCE
-- Chart/graph request -> generate_chart ONCE
-
-RULES:
-- Always cite sources for document/database/web answers (filename, SQL, URL)
-- For web search results: quote the VALUE from the source (price, rate, number) and cite
-  the URL. Do NOT repeat dates shown inside snippets -- just say "as of the latest data"
-  unless the source explicitly states today's date
-- Never guess numbers -- use calculate tool for arithmetic
-- Use conversation history for follow-up questions without re-calling tools
-"""
-
+LOCAL_TOOLS: tuple = (
+    search_company_documents,
+    search_web,
+    summarise_document,
+    extract_structured_data,
+    calculate,
+    generate_chart,
+    analyse_csv,
+)
 
 # ---------------------------------------------------------------------------
 # Agent state
-#
-# LangGraph passes this TypedDict between every node in the graph.
-# `add_messages` is a reducer that appends new messages to the list
-# instead of replacing it, which gives us the full conversation history.
 # ---------------------------------------------------------------------------
 
 class AgentState(TypedDict):
@@ -133,9 +103,6 @@ class AgentState(TypedDict):
 
 # ---------------------------------------------------------------------------
 # Router: decides whether to run another tool or stop
-#
-# Called after every agent_node run. If the LLM produced tool_calls, we
-# route to the tool node. If it produced a plain text response, we're done.
 # ---------------------------------------------------------------------------
 
 def should_continue(state: AgentState) -> str:
@@ -145,460 +112,481 @@ def should_continue(state: AgentState) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Deduplication helper
-#
-# Scans all previous AI messages to build a set of "toolname::query" keys
-# for every tool call that has already been executed in this conversation.
-# Used by the dedup guard inside agent_node.
+# Streaming helpers
 # ---------------------------------------------------------------------------
 
-def _get_previous_tool_calls(messages: list) -> set[str]:
-    """
-    Return a set of 'toolname::query' keys for every tool call already made.
+def _chunk_text(content: Any) -> str:
+    """Normalise a streaming chunk's content into a plain string."""
+    if content is None:
+        return ""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts: list[str] = []
+        for block in content:
+            if isinstance(block, str):
+                parts.append(block)
+            elif isinstance(block, dict):
+                if block.get("type") == "text" or "text" in block:
+                    parts.append(str(block.get("text") or ""))
+            elif hasattr(block, "text"):
+                parts.append(str(getattr(block, "text") or ""))
+        return "".join(parts)
+    return str(content)
 
-    Covers the primary argument of each tool:
-      - search_company_documents / search_web -> 'query'
-      - summarise_document                    -> 'document_name'
-      - calculate                             -> 'expression'
+
+def _has_tool_call_chunks(token: Any) -> bool:
+    """Return True if the token contains tool-call delta chunks (not answer text)."""
+    return bool(getattr(token, "tool_call_chunks", None))
+
+
+# ---------------------------------------------------------------------------
+# LLM streaming assembler — with per-call timeout
+# ---------------------------------------------------------------------------
+
+async def _astream_complete(
+    llm,
+    messages: list,
+    config: RunnableConfig | None = None,
+) -> AIMessage:
+    """Stream the LLM and assemble chunks into a single AIMessage.
+
+    Enforces _TOOL_CALL_TIMEOUT_SECS via asyncio.wait_for so a slow or
+    rate-limited LLM cannot hang the agent loop indefinitely.
+
+    Args:
+        llm:      The LLM instance (possibly with tools bound).
+        messages: Full message list including SystemMessage.
+        config:   LangGraph RunnableConfig — forwarded to llm.astream()
+                  so tracing, callbacks, and run IDs propagate correctly.
+
+    Raises:
+        asyncio.TimeoutError: if the LLM takes longer than _TOOL_CALL_TIMEOUT_SECS.
+        RuntimeError:         if the LLM returns no content at all.
     """
-    used = set()
+    async def _stream() -> AIMessage:
+        assembled = None
+        async for chunk in llm.astream(messages, config=config):
+            assembled = chunk if assembled is None else assembled + chunk
+
+        if assembled is None:
+            raise RuntimeError(
+                "LLM returned no content. This usually means a network error, "
+                "rate-limit, or the model timed out. Check your API key and quota."
+            )
+
+        if isinstance(assembled, AIMessage) and not type(assembled).__name__.endswith("Chunk"):
+            return assembled
+
+        return AIMessage(
+            content=assembled.content,
+            tool_calls=list(getattr(assembled, "tool_calls", None) or []),
+            additional_kwargs=dict(getattr(assembled, "additional_kwargs", None) or {}),
+            response_metadata=dict(getattr(assembled, "response_metadata", None) or {}),
+            id=getattr(assembled, "id", None),
+        )
+
+    return await asyncio.wait_for(_stream(), timeout=_TOOL_CALL_TIMEOUT_SECS)
+
+
+# ---------------------------------------------------------------------------
+# Turn-scoping helper — prevents dedup from leaking across conversation turns
+# ---------------------------------------------------------------------------
+
+def _get_current_turn_messages(messages: list) -> list:
+    """Return only the messages from the latest HumanMessage onward.
+
+    This ensures that the deduplication guard only considers tool calls
+    from the *current* conversation turn, not from earlier turns in a
+    multi-turn session. Without this, the first successful search in
+    Turn 1 would permanently block searches in all subsequent turns.
+    """
+    for i in range(len(messages) - 1, -1, -1):
+        if getattr(messages[i], "type", None) == "human":
+            return messages[i:]
+    return messages
+
+
+# ---------------------------------------------------------------------------
+# Deduplication helpers — scoped to current turn via canonical keys
+# ---------------------------------------------------------------------------
+
+def _make_tool_call_key(name: str, args: dict) -> str:
+    """Create a canonical, case-insensitive dedup key for a tool call.
+
+    Uses json.dumps with sort_keys to produce a stable string regardless
+    of argument ordering. ``default=str`` handles non-JSON-serialisable
+    values (e.g. numeric types that the LLM might pass without quotes).
+    """
+    return f"{name}::{_json.dumps(args, sort_keys=True, default=str).lower()}"
+
+
+def _get_previous_tool_calls(messages: list) -> set[str]:
+    """Return canonical dedup keys for every tool call in the given messages."""
+    used: set[str] = set()
     for msg in messages:
         if msg.type == "ai" and getattr(msg, "tool_calls", None):
             for tc in msg.tool_calls:
                 name = tc.get("name", "")
                 args = tc.get("args", {})
-                # Pick the most identifying argument for this tool type
-                query = (
-                    args.get("query")
-                    or args.get("document_name")
-                    or args.get("expression")
-                    or ""
-                )
-                used.add(f"{name}::{query.lower().strip()}")
+                used.add(_make_tool_call_key(name, args))
     return used
 
 
+def _first_search_had_results(messages: list) -> bool:
+    """Return True if search_company_documents already ran AND returned content.
+
+    Only block a second search call if the first one actually found something.
+    If it returned empty results the LLM should be allowed to retry with a
+    different query rather than being forced to answer from nothing.
+    """
+    for msg in messages:
+        if (
+            msg.type == "tool"
+            and msg.name == "search_company_documents"
+            and msg.content
+            and str(msg.content).strip()
+            and "No matching" not in str(msg.content)
+        ):
+            return True
+    return False
+
+
 # ---------------------------------------------------------------------------
-# Graph construction
+# Agent node — standalone function (testable in isolation)
 #
-# Builds a compiled LangGraph StateGraph with two nodes:
-#   - "agent"  : runs the LLM, optionally producing tool_calls
-#   - "tools"  : executes whichever tool the LLM requested
-#
-# The graph loops  agent -> tools -> agent  until the LLM stops calling tools.
+# Reads system prompt from config["configurable"]["system_prompt"]
+# (LangGraph-idiomatic, safe for concurrent async requests).
+# bound_llm is passed in so .bind_tools() is called once per graph
+# compilation, not on every loop iteration.
 # ---------------------------------------------------------------------------
 
-def build_graph(dynamic_tools: list, checkpointer=None):
-    """
-    Compile and return the LangGraph agent graph.
+async def agent_node(
+    state: AgentState,
+    config: RunnableConfig,
+    *,
+    bound_llm: Any,
+) -> dict:
+    """Core LLM node with turn-scoped deduplication guard.
 
     Args:
-        dynamic_tools: Combined list of local tools + MCP database tools.
-                       MCP tools are discovered at runtime per request.
+        state:     Current LangGraph agent state.
+        config:    LangGraph RunnableConfig carrying system_prompt in
+                   config["configurable"]["system_prompt"] and propagating
+                   tracing / callback context to the LLM.
+        bound_llm: LLM already bound to the full tool list. Passed in so
+                   .bind_tools() is called once per graph compilation, not
+                   on every loop iteration.
     """
-    # ToolNode wraps all available tools and dispatches by tool name.
-    tool_node = ToolNode(dynamic_tools)
+    # Read prompt from config — safe for concurrent async requests
+    system_prompt = (config.get("configurable") or {}).get(
+        "system_prompt", ""
+    ) or _build_system_prompt()
 
-    def agent_node(state: AgentState) -> dict:
-        """
-        Core LLM node. Steps:
-          1. Bind all tools to the LLM (with parallel_tool_calls=False so
-             the model calls one tool at a time, reducing API usage).
-          2. Inject the system prompt (with live date) at the front of the
-             message list.
-          3. Invoke the LLM.
-          4. Run the deduplication guard to block repeated search calls.
-          5. If the guard blocks and the response is empty, re-invoke the
-             LLM without tools to force a direct answer.
-        """
-        # Bind tools and enforce single tool per step at the API level
-        llm = get_llm().bind_tools(dynamic_tools, parallel_tool_calls=False)
+    messages_with_system = [SystemMessage(content=system_prompt)] + state["messages"]
+    response = await _astream_complete(bound_llm, messages_with_system, config=config)
 
-        # Prepend the system prompt to the full conversation history
-        messages_with_system = [SystemMessage(content=_build_system_prompt())] + state["messages"]
+    # ── Deduplication guard (scoped to current turn only) ────────────────
+    if getattr(response, "tool_calls", None):
+        turn_messages = _get_current_turn_messages(state["messages"])
+        already_used = _get_previous_tool_calls(turn_messages)
 
-        # First LLM call — may produce tool_calls or a direct answer
-        response = llm.invoke(messages_with_system)
+        blocked = False
+        filtered_calls: list = []
 
-        # ── Deduplication guard ──────────────────────────────────────────
-        # Problem: LLMs sometimes call search_company_documents multiple
-        # times with slightly different queries ("Shivam skills", "Shivam",
-        # "Shivam profile"...). Each call burns a Groq API request, hitting
-        # the 30 RPM rate limit within seconds.
-        #
-        # Fix: track which tool+query combos have already been used this
-        # turn and block any repeats at the Python level — prompt alone is
-        # not reliable enough to stop this behaviour.
-        if getattr(response, "tool_calls", None):
+        for tc in response.tool_calls:
+            name = tc.get("name", "")
+            args = tc.get("args", {})
+            key = _make_tool_call_key(name, args)
 
-            # Count how many times search_company_documents has already run
-            already_used = _get_previous_tool_calls(state["messages"])
-            search_call_count = sum(
-                1 for k in already_used
-                if k.startswith("search_company_documents::")
+            is_redundant_search = (
+                name == "search_company_documents"
+                and _first_search_had_results(turn_messages)
             )
 
-            blocked = False
-            filtered_calls = []
-
-            for tc in response.tool_calls:
-                name = tc.get("name", "")
-                args = tc.get("args", {})
-                query = (
-                    args.get("query")
-                    or args.get("document_name")
-                    or args.get("expression")
-                    or ""
+            if key in already_used or is_redundant_search:
+                logger.warning(
+                    "Dedup guard: blocked redundant tool call %s(%s). "
+                    "Forcing direct answer.",
+                    name, _json.dumps(args, default=str),
                 )
-                key = f"{name}::{query.lower().strip()}"
+                blocked = True
+                break
 
-                # Block condition 1: exact same tool+query already ran
-                # Block condition 2: search_company_documents called > once
-                #   (regardless of query variation — one search is enough)
-                is_redundant_search = (
-                    name == "search_company_documents" and search_call_count >= 1
+            filtered_calls.append(tc)
+
+        if blocked:
+            # Construct a new AIMessage without tool_calls instead of
+            # mutating response.tool_calls — avoids leaving stale data
+            # in additional_kwargs["tool_calls"].
+            if response.content and str(response.content).strip():
+                # LLM provided answer text alongside the tool call —
+                # keep the text, drop the tool calls.
+                response = AIMessage(
+                    content=response.content,
+                    additional_kwargs={},
+                    response_metadata=dict(
+                        getattr(response, "response_metadata", None) or {}
+                    ),
+                    id=getattr(response, "id", None),
                 )
-
-                if key in already_used or is_redundant_search:
-                    logger.warning(
-                        "Dedup guard: blocked redundant tool call %s(%s). "
-                        "Forcing direct answer.",
-                        name, query
-                    )
-                    blocked = True
-                    break  # stop processing further tool calls
-
-                filtered_calls.append(tc)
-
-            if blocked:
-                # Remove all pending tool calls from the response
-                response.tool_calls = []
-
-                if not response.content or not str(response.content).strip():
-                    # The model put its "thinking" inside the tool call and
-                    # left content empty. Re-invoke without tools so it is
-                    # forced to write a real text answer instead.
-                    logger.info("Dedup guard: re-invoking LLM for direct answer")
-                    bare_llm = get_llm()  # no tools bound this time
-                    direct_messages = messages_with_system + [
-                        SystemMessage(
-                            content=(
-                                "You have already searched the documents. "
-                                "Now write your final answer directly to the user "
-                                "based on the search results in the conversation above. "
-                                "Do NOT call any more tools."
-                            )
+            else:
+                # No answer text — re-invoke the LLM for a direct answer.
+                logger.info("Dedup guard: re-invoking LLM for direct answer")
+                bare_llm = get_llm()
+                direct_messages = messages_with_system + [
+                    SystemMessage(
+                        content=(
+                            "You have already searched the documents. "
+                            "Now write your final answer directly to the user "
+                            "based on the search results in the conversation above. "
+                            "Do NOT call any more tools."
                         )
-                    ]
-                    response = bare_llm.invoke(direct_messages)
+                    )
+                ]
+                response = await _astream_complete(bare_llm, direct_messages, config=config)
 
-            elif filtered_calls != response.tool_calls:
-                # Some calls were filtered but not all — update the list
-                response.tool_calls = filtered_calls
+        elif len(filtered_calls) != len(list(response.tool_calls)):
+            # Some calls were filtered but not all — rebuild with the
+            # surviving subset.
+            response = AIMessage(
+                content=response.content,
+                tool_calls=filtered_calls,
+                additional_kwargs={},
+                response_metadata=dict(
+                    getattr(response, "response_metadata", None) or {}
+                ),
+                id=getattr(response, "id", None),
+            )
 
-        return {"messages": [response]}
+    return {"messages": [response]}
 
-    # ── Wire up the graph ────────────────────────────────────────────────
+
+# ---------------------------------------------------------------------------
+# Graph compilation — fresh per request (< 1ms for a 2-node graph)
+#
+# No global cache — eliminates race conditions, stale id() keys, and
+# memory leaks from the previous _graph_cache approach.
+# ---------------------------------------------------------------------------
+
+def _compile_graph(tools: tuple, checkpointer) -> Any:
+    """Build and compile the StateGraph.
+
+    - bound_llm is created once here so agent_node does not call
+      .bind_tools() on every loop iteration.
+    - agent_node reads the system prompt from config["configurable"]
+      — no shared mutable state on the graph object.
+    - ToolNode is configured with a timeout to prevent hanging tools.
+    """
+    bound_llm = get_llm().bind_tools(list(tools), parallel_tool_calls=False)
+    tool_node = ToolNode(list(tools))
+
+    async def _agent_node_wrapper(state: AgentState, config: RunnableConfig) -> dict:
+        return await agent_node(state, config, bound_llm=bound_llm)
+
     builder = StateGraph(AgentState)
-    builder.add_node("agent", agent_node)
+    builder.add_node("agent", _agent_node_wrapper)
     builder.add_node("tools", tool_node)
-
-    # Always start at the agent node
     builder.add_edge(START, "agent")
-
-    # After agent: go to tools if there are tool_calls, otherwise finish
     builder.add_conditional_edges(
         "agent", should_continue, {"tools": "tools", END: END}
     )
-
-    # After tool execution: always go back to the agent for the next step
     builder.add_edge("tools", "agent")
-
-    # checkpointer is injected from outside (SqliteSaver in production,
-    # None for unit tests). When a checkpointer is present, LangGraph
-    # persists the full message history keyed by thread_id — the caller
-    # passes {"configurable": {"thread_id": session_id}} at invoke time.
     return builder.compile(checkpointer=checkpointer)
 
 
 # ---------------------------------------------------------------------------
-# Result parsing
-#
-# After the graph finishes, walk the message list to extract:
-#   - The final answer text (last non-empty AI message)
-#   - Which tools were used (from ToolMessages)
-#   - Which datasource category those tools map to
-#   - Citations (file names, URLs, SQL queries)
-#   - Chart data (Plotly JSON emitted by generate_chart)
+# Shared run-preparation helper — DRY + prompt set via config
 # ---------------------------------------------------------------------------
 
-# Maps each tool name to a UI datasource label shown in the Streamlit frontend
-_TOOL_DATASOURCE = {
-    "search_company_documents": "company_docs",
-    "summarise_document":        "company_docs",
-    "extract_structured_data":   "company_docs",
-    "search_web":                "web_search",
-    "calculate":                 "calculation",
-    "generate_chart":            "chart",
-    # MCP database tools — support both naming conventions (hyphen and underscore)
-    "query_company_database":    "database",
-    "query-database":            "database",
-    "read-query":                "database",
-    "list_database_tables":      "database",
-    "list-tables":               "database",
-    "describe_database_table":   "database",
-}
+def _prepare_run(
+    question: str,
+    session_id: str,
+    checkpointer,
+    history: list | None,
+    all_tools: tuple,
+) -> tuple[Any, dict, dict]:
+    """Build the graph, initial state, and config for one agent run.
 
-
-def _extract_citations(messages: list) -> list[dict]:
-    """
-    Walk all ToolMessages and build a deduplicated list of citation dicts.
-
-    Each citation is {"source": str, "detail": str}.  Sources are extracted:
-      - search_company_documents / search_web: from [Source: <value>] markers
-        that the tools embed in their output strings
-      - query_company_database: SQL query pulled from the preceding AI message's
-        tool_call args (so we show the exact query that ran)
-      - calculate: the expression + result string
-      - summarise_document: the filename parsed from the "[Full text of ...]" prefix
-      - extract_structured_data: same [Source: ...] pattern as search tools
-      - schema tools (list_tables, describe_table): labelled as "schema lookup"
-    """
-    citations: list[dict] = []
-    seen: set[str] = set()
-
-    def _add(source: str, detail: str = "") -> None:
-        """Add a citation only if we haven't seen this source+detail pair before."""
-        key = f"{source}::{detail}"
-        if key not in seen:
-            seen.add(key)
-            citations.append({"source": source, "detail": detail})
-
-    for msg in messages:
-        # Only ToolMessages carry citation-relevant information
-        if msg.type != "tool":
-            continue
-
-        name = msg.name or ""
-        content = msg.content or ""
-
-        if name in ("search_company_documents", "search_web"):
-            # Tools embed "[Source: filename_or_url]" at the start of each snippet
-            for match in re.finditer(r"\[Source:\s*(.+?)\]", content):
-                _add(match.group(1).strip())
-
-        elif name in ("query_company_database", "query-database", "read-query"):
-            # The SQL is in the AI message's tool_call args, not in the tool output
-            for ai_msg in messages:
-                if ai_msg.type == "ai" and getattr(ai_msg, "tool_calls", None):
-                    for tc in ai_msg.tool_calls:
-                        if tc.get("name") == name:
-                            sql = (
-                                tc.get("args", {}).get("sql_query")
-                                or tc.get("args", {}).get("query")
-                                or ""
-                            )
-                            if sql:
-                                _add("company database", sql.strip())
-
-        elif name == "calculate":
-            # Tool returns "expression = result" — cite the full expression
-            _add("calculator", content.strip())
-
-        elif name == "summarise_document":
-            # Tool wraps output with "[Full text of <filename>]"
-            match = re.match(r"\[Full text of (.+?)\]", content)
-            if match:
-                _add(match.group(1).strip())
-            else:
-                _add("company documents")
-
-        elif name == "extract_structured_data":
-            # Same [Source: ...] markers as search tools
-            for match in re.finditer(r"\[Source:\s*(.+?)\]", content):
-                _add(match.group(1).strip())
-
-        elif name in ("list_database_tables", "list-tables", "describe_database_table"):
-            _add("company database", f"schema lookup via {name}")
-
-    return citations
-
-
-def _extract_chart(messages: list) -> dict | None:
-    """
-    Return the Plotly figure as a JSON dict if generate_chart was used.
-
-    generate_chart prefixes its output with "CHART_JSON::" followed by the
-    serialised Plotly figure so parse_result can detect and forward it to
-    the Streamlit frontend for inline rendering.
-    """
-    for msg in messages:
-        if msg.type == "tool" and msg.name == "generate_chart":
-            content = msg.content or ""
-            if content.startswith("CHART_JSON::"):
-                try:
-                    return json.loads(content[len("CHART_JSON::"):])
-                except json.JSONDecodeError:
-                    logger.warning("Could not parse chart JSON from generate_chart output")
-    return None
-
-
-def parse_result(result: dict) -> dict:
-    """
-    Convert the raw LangGraph output into a clean response dict for FastAPI.
+    The system prompt is injected into config["configurable"]["system_prompt"]
+    so it propagates through the LangGraph runtime to agent_node without
+    shared mutable state.
 
     Returns:
-        {
-            "generation":  str   — the final answer text
-            "datasource":  str   — which data source was used (for UI badge)
-            "tools_used":  list  — names of every tool that ran
-            "citations":   list  — list of {"source", "detail"} dicts
-            "chart_data":  dict  — Plotly figure JSON, or None
-        }
+        (graph, initial_state, config)
     """
-    messages = result["messages"]
+    system_prompt = _build_system_prompt()
 
-    # Walk backwards through messages to find the last non-empty AI response.
-    # We can't just take messages[-1] because the dedup guard might have
-    # produced an empty AI message before the re-invoked direct answer.
-    answer = ""
-    for msg in reversed(messages):
-        if msg.type == "ai" and msg.content and str(msg.content).strip():
-            answer = str(msg.content).strip()
-            break
+    graph = _compile_graph(all_tools, checkpointer)
 
-    if not answer:
-        answer = "I was unable to generate an answer. Please try rephrasing your question."
-
-    # Collect tool names and map them to datasource categories
-    tools_used: list[str] = []
-    datasources: set[str] = set()
-
-    for msg in messages:
-        if msg.type == "tool":
-            name = msg.name or ""
-            tools_used.append(name)
-            ds = _TOOL_DATASOURCE.get(name)
-            if ds:
-                datasources.add(ds)
-
-    # If multiple datasource types were used, label it "multiple"
-    if len(datasources) > 1:
-        datasource = "multiple"
-    elif datasources:
-        datasource = next(iter(datasources))
+    if checkpointer is not None:
+        initial_state: dict = {"messages": [HumanMessage(content=question)]}
     else:
-        # No tools ran — the LLM answered from its own knowledge
-        datasource = "direct_llm"
+        prior_messages = history or []
+        initial_state = {"messages": prior_messages + [HumanMessage(content=question)]}
 
-    citations  = _extract_citations(messages)
-    chart_data = _extract_chart(messages)
-
-    return {
-        "generation":  answer,
-        "datasource":  datasource,
-        "tools_used":  tools_used,
-        "citations":   citations,
-        "chart_data":  chart_data,
+    config: dict = {
+        "configurable": {
+            "thread_id": session_id,
+            "system_prompt": system_prompt,
+        },
+        "recursion_limit": _AGENT_RECURSION_LIMIT,
     }
 
+    return graph, initial_state, config
+
 
 # ---------------------------------------------------------------------------
-# Static tool list
-#
-# These tools are always available regardless of database configuration.
-# MCP tools (database query tools) are discovered dynamically per request
-# inside aask() via mcp_server_context().
+# build_graph — public wrapper kept for backwards compatibility
 # ---------------------------------------------------------------------------
 
-LOCAL_TOOLS = [
-    search_company_documents,  # vector search over indexed PDFs / DOCX / XLSX
-    search_web,                # live Tavily web search
-    summarise_document,        # read and summarise a full file by name
-    extract_structured_data,   # pull specific fields from document context
-    calculate,                 # safe arithmetic expression evaluator
-    generate_chart,            # Plotly chart generator, returns JSON for UI
-]
+def build_graph(dynamic_tools: list, checkpointer=None) -> Any:
+    """Return a compiled graph for the given tool list.
+
+    .. deprecated::
+        Use ``_compile_graph(tuple(tools), checkpointer)`` directly.
+        This wrapper is kept for backwards compatibility only and may be
+        removed in a future release.
+    """
+    warnings.warn(
+        "build_graph() is deprecated. Use _compile_graph(tuple(tools), checkpointer) "
+        "or let _prepare_run() handle graph creation.",
+        DeprecationWarning,
+        stacklevel=2,
+    )
+    return _compile_graph(tuple(dynamic_tools), checkpointer)
 
 
 # ---------------------------------------------------------------------------
 # Public entry points
 # ---------------------------------------------------------------------------
 
-async def aask(question: str, session_id: str = "default",
-               checkpointer=None, history: list | None = None) -> dict:
-    """
-    Primary async entry point — called by the FastAPI /ask endpoint.
-
-    Memory strategy:
-      - If a checkpointer is provided, LangGraph persists and reloads the full
-        message history automatically using session_id as the thread_id.
-        The caller does NOT need to pass history manually.
-      - If no checkpointer (tests / CLI), falls back to the old history list.
-
-    Args:
-        question:     The user's current message.
-        session_id:   Session identifier — used as LangGraph thread_id.
-        checkpointer: SqliteSaver (or any LangGraph checkpointer) instance.
-        history:      Legacy fallback — prior LangChain message objects.
-                      Ignored when a checkpointer is provided.
-    """
+async def aask(
+    question: str,
+    session_id: str = "default",
+    checkpointer=None,
+    history: list | None = None,
+) -> dict:
+    """Primary async entry point — called by the FastAPI /ask endpoint."""
     async with mcp_server_context() as mcp_tools:
-        all_tools = LOCAL_TOOLS + mcp_tools
-        graph = build_graph(all_tools, checkpointer=checkpointer)
-
-        # When using the checkpointer, LangGraph loads prior messages
-        # automatically from the SQLite DB — we only send the new question.
-        # Without checkpointer, prepend the manually managed history.
-        if checkpointer is not None:
-            initial_state = {"messages": [HumanMessage(content=question)]}
-        else:
-            prior_messages = history or []
-            initial_state = {"messages": prior_messages + [HumanMessage(content=question)]}
-
-        # thread_id tells the checkpointer which conversation to load/save.
-        # recursion_limit=8 caps the agent loop to prevent runaway API usage.
-        config = {
-            "configurable": {"thread_id": session_id},
-            "recursion_limit": 8,
-        }
-
+        all_tools = tuple(LOCAL_TOOLS) + tuple(mcp_tools)
+        graph, initial_state, config = _prepare_run(
+            question, session_id, checkpointer, history, all_tools
+        )
         result = await graph.ainvoke(initial_state, config=config)
         return parse_result(result)
 
 
-def ask(question: str, session_id: str = "default",
-        checkpointer=None, history: list | None = None) -> dict:
-    """
-    Synchronous wrapper around aask — used by CLI scripts and unit tests.
+def ask(
+    question: str,
+    session_id: str = "default",
+    checkpointer=None,
+    history: list | None = None,
+) -> dict:
+    """Synchronous wrapper around aask — for CLI scripts and unit tests.
 
-    Not suitable for production use inside an async web server (blocks the
-    event loop). Use aask() directly in FastAPI route handlers.
+    Detects an already-running event loop and raises a clear error
+    instead of crashing with a cryptic RuntimeError from asyncio.run().
+    Use ``await aask(...)`` directly in async contexts (FastAPI, Jupyter).
     """
-    import asyncio
-    return asyncio.run(aask(question, session_id=session_id,
-                            checkpointer=checkpointer, history=history))
+    try:
+        asyncio.get_running_loop()
+        raise RuntimeError(
+            "ask() cannot be called from inside a running event loop. "
+            "Use 'await aask(...)' instead."
+        )
+    except RuntimeError as exc:
+        if "cannot be called" in str(exc):
+            raise
+    return asyncio.run(
+        aask(question, session_id=session_id, checkpointer=checkpointer, history=history)
+    )
 
 
 class KnowledgeTransferAgent:
-    """
-    Streaming interface for the agent.
+    """Streaming interface for the agent (token + tool events for SSE)."""
 
-    Yields each graph step as it completes, which enables Server-Sent Events
-    (SSE) for real-time streaming responses in the frontend. Not yet wired
-    into the FastAPI app but ready to use.
-    """
+    def __init__(self, checkpointer=None) -> None:
+        self.checkpointer = checkpointer
 
-    def __init__(self) -> None:
-        pass
+    def __repr__(self) -> str:
+        cp_name = type(self.checkpointer).__name__ if self.checkpointer else "None"
+        return f"KnowledgeTransferAgent(checkpointer={cp_name})"
 
-    async def run(self, question: str, history: list | None = None):
-        """Stream graph steps for the given question."""
-        prior_messages = history or []
+    async def run(
+        self,
+        question: str,
+        session_id: str = "default",
+        history: list | None = None,
+    ) -> AsyncIterator[dict[str, Any]]:
+        """Yield SSE-ready events while the graph runs.
+
+        Event types:
+          - ``status``: ``{"type": "status", "stage": "thinking"}``
+          - ``token``:  ``{"type": "token",  "text": "..."}``     — answer delta
+          - ``tool``:   ``{"type": "tool",   "name": "..."}``     — tool invoked
+          - ``done``:   ``{"type": "done",   "payload": {...}}``  — final result
+          - ``error``:  ``{"type": "error",  "detail": "..."}``
+        """
+        yield {"type": "status", "stage": "thinking"}
+
         async with mcp_server_context() as mcp_tools:
-            all_tools = LOCAL_TOOLS + mcp_tools
-            graph = build_graph(all_tools)
-            async for step in graph.astream(
-                {"messages": prior_messages + [HumanMessage(content=question)]}
-            ):
-                yield step
+            all_tools = tuple(LOCAL_TOOLS) + tuple(mcp_tools)
+            graph, initial_state, config = _prepare_run(
+                question, session_id, self.checkpointer, history, all_tools
+            )
+
+            final_values: dict | None = None
+            emitted_tool_ids: set[str] = set()
+
+            try:
+                async for mode, data in graph.astream(
+                    initial_state,
+                    config=config,
+                    stream_mode=["messages", "values"],
+                ):
+                    if mode == "messages":
+                        token, metadata = data
+                        if metadata.get("langgraph_node") != "agent":
+                            continue
+                        if _has_tool_call_chunks(token):
+                            continue
+                        text = _chunk_text(getattr(token, "content", None))
+                        if text:
+                            yield {"type": "token", "text": text}
+
+                    elif mode == "values":
+                        final_values = data
+                        messages = (data or {}).get("messages") or []
+                        if not messages:
+                            continue
+                        last = messages[-1]
+                        if getattr(last, "tool_calls", None):
+                            for tc in last.tool_calls:
+                                name = tc.get("name") or ""
+                                if not name:
+                                    continue
+                                tid = tc.get("id") or str(uuid.uuid4())
+                                if tid in emitted_tool_ids:
+                                    continue
+                                emitted_tool_ids.add(tid)
+                                yield {"type": "tool", "name": name}
+
+                if not final_values:
+                    yield {"type": "error", "detail": "Agent finished without a result."}
+                    return
+
+                yield {
+                    "type": "done",
+                    "payload": serialize_parse_result(parse_result(final_values)),
+                }
+
+            except asyncio.TimeoutError:
+                logger.error("Agent timed out after %ds", _TOOL_CALL_TIMEOUT_SECS)
+                yield {
+                    "type": "error",
+                    "detail": f"Request timed out after {_TOOL_CALL_TIMEOUT_SECS}s. Try a simpler question.",
+                }
+            except Exception as exc:
+                logger.exception("Streaming agent failed")
+                yield {"type": "error", "detail": str(exc)}
