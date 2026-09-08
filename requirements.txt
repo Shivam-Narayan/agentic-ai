@@ -236,6 +236,11 @@ google-search-results==2.4.2
 langchain-tavily==0.2.18
 slowapi==0.1.9
 
+# ── Evaluation (tests/evaluate.py) ────────────────────────────────────────
+# Uses LLM-as-judge methodology (same metrics as RAGAS) with your existing
+# Groq LLM — no new API keys or packages required.
+# ragas is intentionally NOT listed — it conflicts with langchain-community>=0.4
+
 # ── PostgreSQL + pgvector ──────────────────────────────────────────────────
 # psycopg3 (not psycopg2) — required by LangGraph AsyncPostgresSaver
 psycopg[binary,pool]==3.3.4
