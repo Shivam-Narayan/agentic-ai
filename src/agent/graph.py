@@ -16,7 +16,7 @@ from langgraph.graph import END, START, StateGraph
 
 from .chains import get_llm
 from .nodes import agent_node, planner_node, reflection_node, run_tools_node
-from .prompt import _build_system_prompt
+from .prompt import build_system_prompt
 from .state import (
     AGENT_RECURSION_LIMIT,
     COMPLEX_KEYWORDS,
@@ -218,7 +218,7 @@ def _prepare_run(
     config: dict[str, Any] = {
         "configurable": {
             "thread_id": session_id,
-            "system_prompt": _build_system_prompt(),
+            "system_prompt": build_system_prompt(),
         },
         "recursion_limit": AGENT_RECURSION_LIMIT,
     }

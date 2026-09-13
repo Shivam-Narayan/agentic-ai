@@ -322,8 +322,8 @@ def test_extract_reflection_content_whitespace():
 
 def test_reflection_prompt_without_tool_context():
     """Prompt should work without tool context (backward compatible)."""
-    from src.agent.prompt import _build_reflection_prompt
-    prompt = _build_reflection_prompt("What is AI?", "AI is artificial intelligence.")
+    from src.agent.prompt import build_reflection_prompt
+    prompt = build_reflection_prompt("What is AI?", "AI is artificial intelligence.")
     assert "ORIGINAL QUESTION:" in prompt
     assert "DRAFT ANSWER:" in prompt
     assert "TOOL OUTPUTS" not in prompt
@@ -331,8 +331,8 @@ def test_reflection_prompt_without_tool_context():
 
 def test_reflection_prompt_with_tool_context():
     """Prompt should include tool outputs when provided."""
-    from src.agent.prompt import _build_reflection_prompt
-    prompt = _build_reflection_prompt(
+    from src.agent.prompt import build_reflection_prompt
+    prompt = build_reflection_prompt(
         "What is in the report?",
         "The report shows revenue of $10M.",
         tool_context="[search_company_documents]: Revenue was $10M in Q1."

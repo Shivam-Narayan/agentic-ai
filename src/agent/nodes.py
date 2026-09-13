@@ -22,9 +22,9 @@ from langgraph.prebuilt import ToolNode
 
 from .llm_helpers import _acall_plain, _astream_complete
 from .prompt import (
-    _build_planner_prompt,
-    _build_reflection_prompt,
-    _build_system_prompt,
+    build_planner_prompt,
+    build_reflection_prompt,
+    build_system_prompt,
 )
 from .state import (
     REDUNDANT_TOOL_RESULT,
@@ -61,7 +61,7 @@ async def planner_node(
 
     logger.info("planner_node: generating plan for %.80s…", question)
     try:
-        raw_plan = await _acall_plain(_build_planner_prompt(question), config=config)
+        raw_plan = await _acall_plain(build_planner_prompt(question), config=config)
     except asyncio.TimeoutError:
         logger.warning("planner_node timed out — skipping to direct agent")
         return {"plan": [], "is_complex": False}
@@ -101,7 +101,7 @@ async def agent_node(
     """Core LLM node. When a plan exists, it is appended to the system prompt."""
     system_prompt: str = (config.get("configurable") or {}).get(
         "system_prompt", ""
-    ) or _build_system_prompt()
+    ) or build_system_prompt()
 
     # Pattern 4: inject the plan so the executor knows which steps to follow.
     plan = state.get("plan") or []
@@ -260,20 +260,25 @@ async def reflection_node(
 
     # Collect tool output context so the reflector can judge completeness.
     tool_context_parts: list[str] = []
+    _MAX_TOOL_CONTEXT = 1500
     for msg in messages:
         if msg.type == "tool" and msg.content:
             content_str = str(msg.content).strip()
             if content_str and content_str != REDUNDANT_TOOL_RESULT:
                 tool_name = getattr(msg, "name", "tool")
-                # Truncate very long tool outputs to avoid prompt bloat.
-                snippet = content_str[:500] + ("…" if len(content_str) > 500 else "")
+                # Smart truncation: keep head + tail for context completeness.
+                if len(content_str) > _MAX_TOOL_CONTEXT:
+                    half = _MAX_TOOL_CONTEXT // 2
+                    snippet = content_str[:half] + "\n...[truncated]...\n" + content_str[-half:]
+                else:
+                    snippet = content_str
                 tool_context_parts.append(f"[{tool_name}]: {snippet}")
     tool_context = "\n".join(tool_context_parts) if tool_context_parts else None
 
     logger.info("reflection_node: critiquing draft (%.80s…)", draft_text)
     try:
         raw_reflection = await _acall_plain(
-            _build_reflection_prompt(question, draft_text, tool_context=tool_context),
+            build_reflection_prompt(question, draft_text, tool_context=tool_context),
             config=config,
         )
     except asyncio.TimeoutError:
