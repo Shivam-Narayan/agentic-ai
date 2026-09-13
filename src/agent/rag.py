@@ -26,7 +26,7 @@ from llama_index.core import (
 from llama_index.core.node_parser import SentenceSplitter
 from llama_index.embeddings.huggingface import HuggingFaceEmbedding
 
-from .config import DATA_DIR, INDEX_DIR, POSTGRES_URL, USE_PGVECTOR
+from .config import DATA_DIR, INDEX_DIR, POSTGRES_URL, USE_HYBRID_SEARCH, USE_PGVECTOR
 
 logger = logging.getLogger(__name__)
 
@@ -141,16 +141,49 @@ def get_vector_index():
 # Retrieval
 # ---------------------------------------------------------------------------
 
+def _get_hybrid_retriever(index: VectorStoreIndex):
+    """Build a hybrid retriever that merges semantic + BM25 keyword results.
+
+    Uses Reciprocal Rank Fusion (RRF) to combine ranked lists from both
+    retrievers into a single re-ranked result set. This is strictly better
+    than semantic-only for queries containing exact names, codes, or numbers.
+    """
+    from llama_index.core.retrievers import QueryFusionRetriever  # noqa: PLC0415
+    from llama_index.retrievers.bm25 import BM25Retriever          # noqa: PLC0415
+
+    vector_retriever = index.as_retriever(similarity_top_k=_SIMILARITY_TOP_K)
+    bm25_retriever   = BM25Retriever.from_defaults(
+        docstore=index.docstore,
+        similarity_top_k=_SIMILARITY_TOP_K,
+    )
+    return QueryFusionRetriever(
+        retrievers=[vector_retriever, bm25_retriever],
+        similarity_top_k=_SIMILARITY_TOP_K,
+        num_queries=1,     # 1 = no LLM query expansion, just fuse the two lists
+        mode="reciprocal_rerank",
+        use_async=False,
+    )
+
+
 def retrieve_documents(question: str) -> List[Document]:
     """Retrieve the top-k most relevant chunks for a question.
 
-    Returns LangChain Document objects so tools.py doesn't need to change.
-    similarity_top_k=8 (up from default 2) improves answer quality when
-    the collection has many documents.
+    When USE_HYBRID_SEARCH=true: combines semantic vector search with BM25
+    keyword search and re-ranks with Reciprocal Rank Fusion.
+    When USE_HYBRID_SEARCH=false (default): pure semantic/vector search.
+
+    Returns LangChain Document objects so tools.py needs no changes.
     """
-    nodes = get_vector_index().as_retriever(
-        similarity_top_k=_SIMILARITY_TOP_K
-    ).retrieve(question)
+    index = get_vector_index()
+
+    if USE_HYBRID_SEARCH:
+        logger.debug("Retrieval mode: hybrid (semantic + BM25)")
+        retriever = _get_hybrid_retriever(index)
+    else:
+        logger.debug("Retrieval mode: semantic only")
+        retriever = index.as_retriever(similarity_top_k=_SIMILARITY_TOP_K)
+
+    nodes = retriever.retrieve(question)
     return [
         Document(
             page_content=node.node.text,

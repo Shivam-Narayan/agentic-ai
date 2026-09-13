@@ -4,7 +4,7 @@ API integration and unit tests for FastAPI backend endpoints.
 import io
 import pytest
 from fastapi.testclient import TestClient
-from app import app
+from src.apps.api import app
 
 
 @pytest.fixture

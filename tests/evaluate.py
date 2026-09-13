@@ -32,7 +32,7 @@ if "langchain_community.chat_models.vertexai" not in sys.modules:
 
 from datasets import Dataset
 from ragas import evaluate as ragas_evaluate
-from ragas.metrics import _faithfulness, _answer_relevancy, _context_precision, _context_recall
+from ragas.metrics import faithfulness, answer_relevancy, context_precision, context_recall
 from ragas.llms import LangchainLLMWrapper
 from ragas.embeddings import LangchainEmbeddingsWrapper
 from langchain_community.embeddings import HuggingFaceEmbeddings
@@ -48,12 +48,12 @@ PASS_THRESHOLD = 0.70
 def _setup_ragas():
     llm = LangchainLLMWrapper(get_llm())
     emb = LangchainEmbeddingsWrapper(HuggingFaceEmbeddings(model_name="BAAI/bge-small-en-v1.5"))
-    for metric in [_faithfulness, _answer_relevancy, _context_precision, _context_recall]:
+    for metric in [faithfulness, answer_relevancy, context_precision, context_recall]:
         metric.llm = llm
-    _answer_relevancy.embeddings = emb
-    _answer_relevancy.strictness = 1  # Groq caps n=1; strictness=1 uses single generation
+    answer_relevancy.embeddings = emb
+    answer_relevancy.strictness = 1  # Groq caps n=1; strictness=1 uses single generation
 
-METRICS = [_faithfulness, _answer_relevancy, _context_precision, _context_recall]
+METRICS = [faithfulness, answer_relevancy, context_precision, context_recall]
 
 # ---------------------------------------------------------------------------
 # Agent runner
@@ -76,7 +76,7 @@ async def _run_agent(question: str) -> tuple:
 # Evaluation loop
 # ---------------------------------------------------------------------------
 
-def evaluate(samples: list, verbose: bool) -> list:
+async def evaluate(samples: list, verbose: bool) -> list:
     _setup_ragas()
     results = []
 
@@ -85,7 +85,7 @@ def evaluate(samples: list, verbose: bool) -> list:
         print(f"\n[{s['id']}] {q}")
 
         try:
-            answer, contexts, datasource, latency = asyncio.run(_run_agent(q))
+            answer, contexts, datasource, latency = await _run_agent(q)
         except Exception as exc:
             print(f"  ERROR: {exc}")
             results.append({**s, "error": str(exc)})
@@ -102,7 +102,7 @@ def evaluate(samples: list, verbose: bool) -> list:
         })
 
         # Use all 4 metrics if context was retrieved, else only answer_relevancy
-        metrics = METRICS if has_ctx else [_answer_relevancy]
+        metrics = METRICS if has_ctx else [answer_relevancy]
         scores  = ragas_evaluate(dataset, metrics=metrics)
 
         faith = float(scores["faithfulness"][0])      if has_ctx else None
@@ -166,7 +166,7 @@ def test_rag_pipeline():
     if sys.platform == "win32":
         asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
     samples = json.loads((Path(__file__).parent / "eval_questions.json").read_text())
-    results = evaluate(samples, verbose=False)
+    results = asyncio.run(evaluate(samples, verbose=False))
     print_report(results)
     scored  = [r for r in results if "avg" in r]
     assert scored, "No samples were scored"
@@ -189,7 +189,7 @@ def main():
     if args.datasource:
         samples = [s for s in samples if s.get("datasource") == args.datasource]
 
-    results = evaluate(samples, verbose=args.verbose)
+    results = asyncio.run(evaluate(samples, verbose=args.verbose))
     print_report(results)
 
     if args.output:

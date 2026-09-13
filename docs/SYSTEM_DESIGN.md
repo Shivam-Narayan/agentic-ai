@@ -59,7 +59,7 @@ schemas.py  (Pydantic models)                                           │
  ├── OpenClawWebhookRequest / OpenClawWebhookResponse  (OpenClaw)      │
  └── OpenClawHealthResponse                           (OpenClaw)        │
                                                                          │
-app.py  (FastAPI)                                                        │
+src/apps/api.py  (FastAPI)                                               │
  ├── GET  /stream           →  KnowledgeTransferAgent.run() SSE stream  │
  ├── POST /ask              →  aask(question, session_id, checkpointer) │
  ├── GET  /health                                                        │
@@ -70,12 +70,12 @@ app.py  (FastAPI)                                                        │
  ├── GET  /openclaw/health   →  OpenClawHealthResponse                  │
  └── POST /openclaw/webhook  →  aask() via OpenClaw session_id          │
                                                                          │
-telegram_bot.py  (Telegram channel)                                     │
+src/apps/telegram_bot.py  (Telegram channel)                             │
  ├── handle_message()        → POST /ask {session_id=telegram_<user_id>}│
  ├── start()                 → /start command handler                   │
  └── help_command()          → /help command handler                    │
                                                                          │
-streamlit_app.py  (Web UI)                                              │
+src/apps/streamlit_ui.py  (Web UI)                                       │
  ├── st.chat_input (always called — prevents disappear bug)             │
  ├── pending_question (sample question click flow)                      │
  ├── _render_assistant_message()  (badges, charts, citations)           │
@@ -89,9 +89,10 @@ streamlit_app.py  (Web UI)                                              │
 **Purpose:** Single source of truth for all file paths and environment validation.
 
 ```python
-ROOT_DIR  = Path(__file__).resolve().parent.parent.parent
-DATA_DIR  = ROOT_DIR / "data"          # where user puts their files
-INDEX_DIR = ROOT_DIR / "indexing_data" # LlamaIndex persists the vector store here
+ROOT_DIR    = Path(__file__).resolve().parent.parent.parent
+STORAGE_DIR = ROOT_DIR / ".storage"
+DATA_DIR    = STORAGE_DIR / "data"          # where user puts their files
+INDEX_DIR   = STORAGE_DIR / "indexing_data" # LlamaIndex persists the vector store here
 ```
 
 **Environment validation (`require_runtime_keys()`):**
@@ -336,7 +337,7 @@ class OpenClawHealthResponse(BaseModel):
 
 ---
 
-## `app.py` — FastAPI Backend
+## `src/apps/api.py` — FastAPI Backend
 
 ### Persistent memory via lifespan
 
@@ -350,7 +351,7 @@ async def lifespan(app: FastAPI):
         yield
 ```
 
-The `AsyncSqliteSaver` is opened once at startup and shared by all endpoints. It persists full message history per `session_id` to `memory_store/conversations.db` — sessions survive server restarts.
+The `AsyncSqliteSaver` is opened once at startup and shared by all endpoints. It persists full message history per `session_id` to `.storage/memory_store/conversations.db` — sessions survive server restarts.
 
 ### Endpoints
 
@@ -415,7 +416,7 @@ OpenClaw's `session_id` is passed directly as the LangGraph `thread_id` — conv
 
 ---
 
-## `telegram_bot.py` — Telegram Channel
+## `src/apps/telegram_bot.py` — Telegram Channel
 
 **Purpose:** A `python-telegram-bot` polling bot that bridges Telegram messages to the DataDialogue FastAPI backend. Runs as a separate process alongside FastAPI.
 
@@ -473,7 +474,7 @@ The bot uses long-polling — no webhook URL or public server required. Suitable
 
 ---
 
-## `streamlit_app.py` — Web Chat Frontend
+## `src/apps/streamlit_ui.py` — Web Chat Frontend
 
 ### Key design decisions
 
