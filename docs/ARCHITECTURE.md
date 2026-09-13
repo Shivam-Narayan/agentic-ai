@@ -16,7 +16,7 @@ The key design principle: **there is no hard-coded routing**. The LLM itself rea
 │                                                                          │
 │  ┌──────────────────────┐   ┌─────────────────┐   ┌──────────────────┐  │
 │  │   Streamlit Chat UI  │   │  Telegram Bot   │   │  OpenClaw        │  │
-│  │  (streamlit_app.py)  │   │ (telegram_bot.py│   │  Webhook         │  │
+│  │  (streamlit_ui.py)   │   │ (telegram_bot.py│   │  Webhook         │  │
 │  │  http://localhost    │   │  @shivam_llm_bot│   │  (any channel)   │  │
 │  │  :8501               │   │                 │   │                  │  │
 │  └──────────┬───────────┘   └────────┬────────┘   └────────┬─────────┘  │
@@ -29,7 +29,7 @@ The key design principle: **there is no hard-coded routing**. The LLM itself rea
                                        │
                                        ▼
 ┌──────────────────────────────────────────────────────────────────────────┐
-│                         FASTAPI BACKEND (app.py)                         │
+│                         FASTAPI BACKEND (api.py)                         │
 │                          http://localhost:8000                           │
 │                                                                          │
 │  GET  /stream             →  KnowledgeTransferAgent.run() SSE stream    │
@@ -85,13 +85,13 @@ The key design principle: **there is no hard-coded routing**. The LLM itself rea
               ▼               ▼                ▼
 ┌─────────────────┐  ┌──────────────┐  ┌───────────────────────────────┐
 │  VECTOR STORE   │  │  SQLITE DB   │  │  WEB SEARCH (fallback chain)  │
-│  indexing_data/ │  │  data/*.db   │  │  Tavily → Serper → DuckDuckGo │
-│  (LlamaIndex)   │  │  (sqlite3)   │  └───────────────────────────────┘
+│ .storage/       │  │ .storage/    │  │  Tavily → Serper → DuckDuckGo │
+│ indexing_data/  │  │ data/*.db    │  └───────────────────────────────┘
 └─────────────────┘  └──────────────┘
         ▲
         │ indexed from
 ┌───────────────────┐          ┌────────────────────────┐
-│   data/ folder    │          │  memory_store/         │
+│ .storage/data/    │          │ .storage/memory_store/ │
 │  *.pdf *.docx     │          │  conversations.db      │
 │  *.xlsx *.csv     │          │  (AsyncSqliteSaver)    │
 │  *.txt            │          │  per session_id thread │
@@ -234,9 +234,9 @@ Previously memory was in-memory (`_sessions` dict) and lost on server restart. T
 
 ---
 
-## The ReAct Agent Loop
+## The Planner-Executor Agent Loop
 
-The entire agent is a two-node LangGraph `StateGraph`. There are no other nodes — no classifier, no pre-router, no if/else logic.
+The agent is implemented as a multi-node LangGraph `StateGraph` (Pattern 3 & 4) featuring Planning and Reflection.
 
 ```
 User question (from any channel)
@@ -251,15 +251,18 @@ aask(question, session_id, checkpointer)   ← workflow.py
 build_graph(all_tools, checkpointer)
      │
      ▼
-┌────────────────────────────────────────────────────┐
-│               LangGraph StateGraph                 │
-│                                                    │
-│  START → Agent Node → tool_calls present?          │
-│              ▲               │                     │
-│              │         YES → Tool Node             │
-│              └───────────────┘                     │
-│                        NO → END                    │
-└────────────────────────────────────────────────────┘
+┌────────────────────────────────────────────────────────────────────────┐
+│               LangGraph StateGraph (graph.py)                          │
+│                                                                        │
+│  START ─► [complexity_router]                                          │
+│             ├──► Planner Node ────┐                                    │
+│             └──► Agent Node ◄─────┘                                    │
+│                     │       ▲                                          │
+│             [should_continue]                                          │
+│                     ├──► Tool Node ─┘                                  │
+│                     ├──► Reflection Node ──► END                       │
+│                     └──► END (if simple direct answer)                 │
+└────────────────────────────────────────────────────────────────────────┘
      │
      ▼
 parse_result()   → answer, datasource, tools_used, citations, chart_data
@@ -268,14 +271,12 @@ parse_result()   → answer, datasource, tools_used, citations, chart_data
 Response → channel (Streamlit / Telegram / OpenClaw)
 ```
 
-### Why two nodes?
+### Why multiple nodes?
 
-The LLM is not just the "brain" — it is also the router. It receives all tool schemas (auto-generated from their docstrings) alongside the user's question, the system prompt, and the full conversation history. It decides:
-
-- **No tools needed** → emits a final answer text → graph goes to END
-- **Tool needed** → emits a `tool_calls` list → graph executes the tool, appends results to history, loops back
-
-The loop continues until the LLM stops calling tools and produces a final answer. Most questions resolve in 1–2 loops. The `recursion_limit=8` cap prevents runaway loops.
+Instead of a basic ReAct loop, the agent uses a Planner-Executor architecture with Reflection:
+1. **Planner**: If the user's question is complex, the planner breaks it down into explicit steps before execution.
+2. **Executor (Agent Node)**: The LLM receives the plan and acts on it by calling tools.
+3. **Reflection**: Once the executor thinks it's done, the `reflection_node` reviews the tool outputs against the draft answer to catch missing info, hallucinations, or logic gaps. If the answer is lacking, it sets `reflection_status` and loops back to the executor to try again.
 
 ---
 
@@ -394,17 +395,20 @@ data/company.db                ← SQLite, read-only via SELECT
 
 | File | Layer | What it does |
 |---|---|---|
-| `streamlit_app.py` | UI | Chat UI — SSE streaming, badges, citations, Plotly charts, file upload, session controls |
-| `telegram_bot.py` | Channel | Telegram bot — polls for messages, calls `/ask`, replies with answer + citations |
-| `app.py` | API | FastAPI — `/stream` (SSE), `/ask`, `/health`, `/upload`, `/documents`, `/sessions/*`, `/openclaw/*` |
-| `workflow.py` | Agent | LangGraph graph, `KnowledgeTransferAgent` async generator, system prompt, dedup guard, citations |
-| `chains.py` | LLM + Search | LLM factory (Groq/Gemini/Cohere); `_FallbackSearchTool` (Tavily→Serper→DuckDuckGo) |
-| `tools.py` | Tools | 6 local tools: search, summarise, extract, web search, calculate, chart |
-| `rag.py` | RAG | File discovery, DocxReader, LlamaIndex vector store build/load/retrieve/incremental indexing |
-| `mcp_client.py` | DB | 3 database tools behind MCP-compatible asynccontextmanager + TTL schema caching |
-| `schemas.py` | Models | QuestionRequest/Response + OpenClawWebhookRequest/Response/HealthResponse |
-| `config.py` | Config | DATA_DIR, INDEX_DIR paths; LLM key validation; web search key warning |
-| `tests/` | Tests | Pytest test suite: `test_tools.py`, `test_workflow.py`, `test_api.py` |
+| `src/apps/streamlit_ui.py` | UI | Chat UI — SSE streaming, badges, citations, Plotly charts, file upload, session controls |
+| `src/apps/telegram_bot.py` | Channel | Telegram bot — polls for messages, calls `/ask`, replies with answer + citations |
+| `src/apps/api.py` | API | FastAPI — `/stream` (SSE), `/ask`, `/health`, `/upload`, `/openclaw/webhook`, session endpoints |
+| `src/agent/workflow.py` | Facade | Public interface wrapping internal agent functions |
+| `src/agent/graph.py` | Graph | LangGraph graph compilation, runtime wrappers, planning/reflection logic |
+| `src/agent/nodes.py` | Nodes | Pure node logic (`planner_node`, `agent_node`, `run_tools_node`, `reflection_node`) |
+| `src/agent/state.py` | State | `AgentState` TypedDict and constants |
+| `src/agent/chains.py` | LLM + Search | LLM factory (Groq/Gemini/Cohere); `_FallbackSearchTool` |
+| `src/agent/tools.py` | Tools | 6 local tools: search, summarise, extract, web search, calculate, chart |
+| `src/agent/rag.py` | RAG | File discovery, DocxReader, LlamaIndex vector store build/load/retrieve/incremental indexing |
+| `src/agent/mcp_client.py` | DB | 3 database tools behind MCP-compatible asynccontextmanager + TTL schema caching |
+| `src/agent/schemas.py` | Models | QuestionRequest/Response + OpenClawWebhookRequest/Response/HealthResponse |
+| `src/agent/config.py` | Config | Storage paths (`.storage/`); LLM key validation; web search key warning |
+| `tests/` | Tests | Pytest test suite: `test_tools.py`, `test_workflow.py`, `test_api.py`, `evaluate.py` |
 
 
 ---

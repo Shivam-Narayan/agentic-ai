@@ -67,12 +67,11 @@ python -m src.agent.rag
 
 Two terminals:
 
-```bash
 # Terminal 1
-uvicorn app:app --reload --port 8000
+uvicorn src.apps.api:app --reload --port 8000
 
 # Terminal 2
-python -m streamlit run streamlit_app.py
+streamlit run src/apps/streamlit_ui.py
 ```
 
 Open **http://localhost:8501**

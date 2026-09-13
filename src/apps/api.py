@@ -21,7 +21,7 @@ from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.errors import RateLimitExceeded
 from slowapi.util import get_remote_address
 
-from src.agent.config import DATA_DIR, POSTGRES_URL, USE_PGVECTOR, USE_POSTGRES_MEMORY, setup_logging
+from src.agent.config import DATA_DIR, STORAGE_DIR, POSTGRES_URL, USE_PGVECTOR, USE_POSTGRES_MEMORY, setup_logging
 from src.agent.rag import SUPPORTED_EXTENSIONS, _discover_documents, add_documents_to_index, rebuild_index
 from src.agent.schemas import Citation, QuestionRequest, QuestionResponse
 from src.agent.workflow import KnowledgeTransferAgent, aask
@@ -47,7 +47,7 @@ _RATE_UPLOAD = os.getenv("RATE_LIMIT_UPLOAD", "10/minute")
 
 limiter = Limiter(key_func=get_remote_address, default_limits=["60/minute"])
 
-_MEMORY_DIR = Path(__file__).parent / "memory_store"
+_MEMORY_DIR = STORAGE_DIR / "memory_store"
 _MEMORY_DIR.mkdir(exist_ok=True)
 
 # Filled in by the lifespan handler — shared across all requests

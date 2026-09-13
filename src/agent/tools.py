@@ -48,6 +48,9 @@ _VALID_CHART_TYPES: frozenset[str] = frozenset({"bar", "line", "pie", "scatter"}
 # 1. search_company_documents
 # ---------------------------------------------------------------------------
 
+EMPTY_COMPANY_SEARCH_RESULT = "No matching company documents were found."
+
+
 @tool
 def search_company_documents(query: str) -> str:
     """Search indexed company documents (PDFs, Word docs, Excel files, CSVs).
@@ -63,7 +66,7 @@ def search_company_documents(query: str) -> str:
 
     documents: list[Document] = retrieve_documents(query)
     if not documents:
-        return "No matching company documents were found."
+        return EMPTY_COMPANY_SEARCH_RESULT
 
     snippets: list[str] = []
     for doc in documents[:4]:
