@@ -7,8 +7,9 @@ from dotenv import load_dotenv
 load_dotenv()
 
 ROOT_DIR  = Path(__file__).resolve().parent.parent.parent
-INDEX_DIR = ROOT_DIR / "indexing_data"
-DATA_DIR  = ROOT_DIR / "data"
+STORAGE_DIR = ROOT_DIR / ".storage"
+INDEX_DIR = STORAGE_DIR / "indexing_data"
+DATA_DIR  = STORAGE_DIR / "data"
 
 logger = logging.getLogger(__name__)
 
@@ -26,6 +27,10 @@ POSTGRES_URL: str = os.getenv(
 # Feature flags — flip to true after running migrate_to_pgvector.py
 USE_PGVECTOR:         bool = os.getenv("USE_PGVECTOR",         "false").lower() == "true"
 USE_POSTGRES_MEMORY:  bool = os.getenv("USE_POSTGRES_MEMORY",  "false").lower() == "true"
+
+# Set to true to enable hybrid search (semantic + BM25 keyword).
+# Works with both the JSON and pgvector backends.
+USE_HYBRID_SEARCH:    bool = os.getenv("USE_HYBRID_SEARCH",    "false").lower() == "true"
 
 
 def setup_logging() -> None:
