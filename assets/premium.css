@@ -1160,3 +1160,95 @@ button[kind="headerNoPadding"],
     from { transform: translateX(-120%); }
     to   { transform: translateX(280%); }
 }
+
+/* -- ?? PREMIUM GLASSMORPHISM OVERRIDES ?? -- */
+
+/* App Header */
+.app-header {
+    background: linear-gradient(135deg, rgba(255,255,255,0.06), rgba(255,255,255,0.01)) !important;
+    backdrop-filter: blur(20px) !important;
+    -webkit-backdrop-filter: blur(20px) !important;
+    border: 1px solid rgba(255,255,255,0.12) !important;
+    box-shadow: 0 8px 32px rgba(0,0,0,0.4) !important;
+    transition: transform 0.3s ease, box-shadow 0.3s ease !important;
+}
+.app-header:hover {
+    transform: translateY(-2px) !important;
+    box-shadow: 0 12px 40px rgba(0,0,0,0.5), 0 0 20px rgba(99, 102, 241, 0.15) !important;
+}
+.app-header-title {
+    background: linear-gradient(90deg, #c084fc, #818cf8, #38bdf8);
+    -webkit-background-clip: text;
+    -webkit-text-fill-color: transparent;
+    font-weight: 700 !important;
+}
+
+/* Welcome Card */
+.welcome-card {
+    background: linear-gradient(145deg, rgba(30, 30, 35, 0.7), rgba(15, 15, 20, 0.7)) !important;
+    backdrop-filter: blur(12px) !important;
+    border: 1px solid rgba(255,255,255,0.1) !important;
+    box-shadow: 0 8px 32px rgba(0,0,0,0.4) !important;
+    animation: floating 6s ease-in-out infinite !important;
+}
+@keyframes floating {
+    0% { transform: translateY(0px); }
+    50% { transform: translateY(-6px); }
+    100% { transform: translateY(0px); }
+}
+.welcome-item {
+    background: rgba(255,255,255,0.03) !important;
+    border: 1px solid rgba(255,255,255,0.08) !important;
+    transition: all 0.3s cubic-bezier(0.25, 0.8, 0.25, 1) !important;
+    backdrop-filter: blur(8px) !important;
+}
+.welcome-item:hover {
+    transform: translateY(-4px) scale(1.02) !important;
+    background: rgba(255,255,255,0.08) !important;
+    border-color: rgba(99, 102, 241, 0.6) !important;
+    box-shadow: 0 10px 20px rgba(99, 102, 241, 0.2) !important;
+    color: #fff !important;
+}
+
+/* Chat Input Pill */
+[data-testid="stChatInput"] {
+    background: rgba(20, 22, 28, 0.7) !important;
+    backdrop-filter: blur(16px) !important;
+    border: 1px solid rgba(255,255,255,0.15) !important;
+    box-shadow: 0 4px 20px rgba(0,0,0,0.5) !important;
+    transition: all 0.3s ease !important;
+}
+[data-testid="stChatInput"]:focus-within {
+    border-color: rgba(99, 102, 241, 0.6) !important;
+    box-shadow: 0 0 0 4px rgba(99, 102, 241, 0.15), 0 4px 24px rgba(0,0,0,0.6) !important;
+}
+
+/* Chat Bubbles */
+[data-testid="stChatMessage"]:has([data-testid="stChatMessageAvatarUser"]) [data-testid="stChatMessageContent"] {
+    background: linear-gradient(135deg, rgba(40, 45, 60, 0.8), rgba(25, 30, 40, 0.8)) !important;
+    backdrop-filter: blur(10px) !important;
+    border: 1px solid rgba(255,255,255,0.1) !important;
+    box-shadow: 0 4px 15px rgba(0,0,0,0.2) !important;
+}
+
+/* Agent Thinking Orb Enhancement */
+.agent-orb {
+    box-shadow: 0 0 20px rgba(99, 102, 241, 0.6) !important;
+    animation: orb-pulse 2s ease-in-out infinite alternate !important;
+}
+@keyframes orb-pulse {
+    0% { transform: scale(0.95); box-shadow: 0 0 15px rgba(99, 102, 241, 0.4); }
+    100% { transform: scale(1.05); box-shadow: 0 0 30px rgba(99, 102, 241, 0.8), 0 0 10px rgba(56, 189, 248, 0.6); }
+}
+
+/* Sidebar Hover Glow */
+[data-testid="stSidebar"] .stButton > button:hover {
+    box-shadow: 0 0 12px rgba(255, 255, 255, 0.1) !important;
+    transform: translateX(4px) !important;
+}
+
+/* Typography Polish */
+[data-testid="stChatMessageContent"] p,
+[data-testid="stChatMessageContent"] li {
+    letter-spacing: 0.2px !important;
+}

@@ -3,7 +3,7 @@ Unit tests for LangGraph agent workflow components, parsers, and state helpers.
 """
 from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 from src.agent.parser import parse_result, serialize_parse_result
-from src.agent.tools import EMPTY_COMPANY_SEARCH_RESULT
+from src.tools.tools import EMPTY_COMPANY_SEARCH_RESULT
 from src.agent.workflow import (
     _REDUNDANT_TOOL_RESULT,
     _classify_complexity,
@@ -322,8 +322,8 @@ def test_extract_reflection_content_whitespace():
 
 def test_reflection_prompt_without_tool_context():
     """Prompt should work without tool context (backward compatible)."""
-    from src.agent.prompt import _build_reflection_prompt
-    prompt = _build_reflection_prompt("What is AI?", "AI is artificial intelligence.")
+    from src.agent.prompt import build_reflection_prompt
+    prompt = build_reflection_prompt("What is AI?", "AI is artificial intelligence.")
     assert "ORIGINAL QUESTION:" in prompt
     assert "DRAFT ANSWER:" in prompt
     assert "TOOL OUTPUTS" not in prompt
@@ -331,8 +331,8 @@ def test_reflection_prompt_without_tool_context():
 
 def test_reflection_prompt_with_tool_context():
     """Prompt should include tool outputs when provided."""
-    from src.agent.prompt import _build_reflection_prompt
-    prompt = _build_reflection_prompt(
+    from src.agent.prompt import build_reflection_prompt
+    prompt = build_reflection_prompt(
         "What is in the report?",
         "The report shows revenue of $10M.",
         tool_context="[search_company_documents]: Revenue was $10M in Q1."

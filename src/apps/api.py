@@ -11,6 +11,7 @@ import asyncio
 import json
 import logging
 import os
+import uvicorn
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
@@ -20,9 +21,10 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.errors import RateLimitExceeded
 from slowapi.util import get_remote_address
+from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
 
-from src.agent.config import DATA_DIR, STORAGE_DIR, POSTGRES_URL, USE_PGVECTOR, USE_POSTGRES_MEMORY, setup_logging
-from src.agent.rag import SUPPORTED_EXTENSIONS, _discover_documents, add_documents_to_index, rebuild_index
+from src.core.config import DATA_DIR, STORAGE_DIR, POSTGRES_URL, USE_PGVECTOR, USE_POSTGRES_MEMORY, setup_logging
+from src.retrieval.rag import SUPPORTED_EXTENSIONS, _discover_documents, add_documents_to_index, rebuild_index, _embed_model
 from src.agent.schemas import Citation, QuestionRequest, QuestionResponse
 from src.agent.workflow import KnowledgeTransferAgent, aask
 
@@ -63,13 +65,17 @@ async def lifespan(app: FastAPI):
     """
     global _checkpointer
 
+    # Pre-warm the embedding model to avoid cold-start latency
+    logger.info("Pre-warming embedding model...")
+    await asyncio.to_thread(_embed_model.get_text_embedding, "warmup")
+    logger.info("Embedding model pre-warmed.")
+
     if USE_POSTGRES_MEMORY:
         # ── PostgreSQL memory ───────────────────────────────────────────
         # AsyncPostgresSaver requires psycopg3 and langgraph-checkpoint-postgres.
         # cp.setup() creates the checkpoints / checkpoint_writes / checkpoint_blobs
         # tables automatically on first run — no manual SQL needed.
         try:
-            from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
 
             # AsyncPostgresSaver expects a plain psycopg3 URL (no +psycopg prefix)
             pg_url = POSTGRES_URL.replace("postgresql+psycopg://", "postgresql://")
@@ -451,5 +457,4 @@ async def list_documents() -> dict[str, Any]:
 
 
 if __name__ == "__main__":
-    import uvicorn
     uvicorn.run("app:app", host="0.0.0.0", port=8000, reload=True)
