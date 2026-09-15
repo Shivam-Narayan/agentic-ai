@@ -3,7 +3,7 @@ Unit tests for LangGraph agent workflow components, parsers, and state helpers.
 """
 from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 from src.agent.parser import parse_result, serialize_parse_result
-from src.agent.tools import EMPTY_COMPANY_SEARCH_RESULT
+from src.tools.tools import EMPTY_COMPANY_SEARCH_RESULT
 from src.agent.workflow import (
     _REDUNDANT_TOOL_RESULT,
     _classify_complexity,

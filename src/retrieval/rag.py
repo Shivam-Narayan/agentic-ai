@@ -26,7 +26,7 @@ from llama_index.core import (
 from llama_index.core.node_parser import SentenceSplitter
 from llama_index.embeddings.huggingface import HuggingFaceEmbedding
 
-from .config import DATA_DIR, INDEX_DIR, POSTGRES_URL, USE_HYBRID_SEARCH, USE_PGVECTOR
+from src.core.config import DATA_DIR, INDEX_DIR, POSTGRES_URL, USE_HYBRID_SEARCH, USE_PGVECTOR
 
 logger = logging.getLogger(__name__)
 

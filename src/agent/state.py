@@ -11,7 +11,7 @@ from langchain_core.tools import BaseTool
 from langgraph.graph.message import add_messages
 from typing_extensions import TypedDict
 
-from .tools import (
+from src.tools.tools import (
     EMPTY_COMPANY_SEARCH_RESULT,
     analyse_csv,
     calculate,

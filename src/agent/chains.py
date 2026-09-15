@@ -8,7 +8,7 @@ from typing import Any
 from langchain_core.language_models.chat_models import BaseChatModel
 from langchain_core.tools import BaseTool
 
-from .config import require_runtime_keys
+from src.core.config import require_runtime_keys
 
 logger = logging.getLogger(__name__)
 

@@ -9,9 +9,11 @@ from __future__ import annotations
 
 import zoneinfo
 from datetime import datetime
+from functools import lru_cache
+from typing import Optional
 
 # Bump on every meaningful prompt change — logged alongside eval metrics.
-PROMPT_VERSION = "2.0.0"
+PROMPT_VERSION = "2.1.0"
 
 # Default timezone; override via build_system_prompt(tz_name=...).
 _DEFAULT_TZ = "Asia/Kolkata"
@@ -39,7 +41,7 @@ RULES:
 QUESTION:
 {question}
 
-IMPORTANT: Output ONLY a numbered list — no other text before or after:"""
+YOUR PLAN (numbered list only — no other text before or after):"""
 
 
 # ---------------------------------------------------------------------------
@@ -47,7 +49,7 @@ IMPORTANT: Output ONLY a numbered list — no other text before or after:"""
 # ---------------------------------------------------------------------------
 
 def build_reflection_prompt(
-    question: str, draft_answer: str, *, tool_context: str | None = None
+    question: str, draft_answer: str, *, tool_context: Optional[str] = None
 ) -> str:
     """Return the prompt that asks the LLM to critique and, if needed, improve a draft.
 
@@ -107,8 +109,9 @@ YOUR REVIEW:"""
 # System prompt  (main agent persona)
 # ---------------------------------------------------------------------------
 
-def build_system_prompt(*, tz_name: str = _DEFAULT_TZ) -> str:
-    """Return the system prompt with the current date/time for the given timezone."""
+@lru_cache(maxsize=1)
+def _build_system_prompt_cached(date_key: str, tz_name: str) -> str:
+    """Cached version of the system prompt, rebuilt only when the date changes."""
     try:
         tz = zoneinfo.ZoneInfo(tz_name)
     except (KeyError, zoneinfo.ZoneInfoNotFoundError):
@@ -178,3 +181,16 @@ When answering general knowledge questions (e.g. "What is Python?", "Explain RAG
 
 [PROMPT_VERSION: {PROMPT_VERSION}]
 """
+
+def build_system_prompt(*, tz_name: str = _DEFAULT_TZ) -> str:
+    """Return the system prompt with the current date/time for the given timezone.
+    
+    The prompt is cached per day and timezone to avoid rebuilding it on every call.
+    """
+    try:
+        tz = zoneinfo.ZoneInfo(tz_name)
+    except (KeyError, zoneinfo.ZoneInfoNotFoundError):
+        tz = zoneinfo.ZoneInfo(_DEFAULT_TZ)
+        
+    date_key = datetime.now(tz).strftime("%Y-%m-%d")
+    return _build_system_prompt_cached(date_key, tz_name)

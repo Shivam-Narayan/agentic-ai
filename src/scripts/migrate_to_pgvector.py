@@ -132,7 +132,7 @@ def step_migrate_documents(pg_url: str) -> bool:
     os.environ["USE_PGVECTOR"] = "true"
 
     try:
-        from src.agent.rag import (
+        from src.retrieval.rag import (
             _discover_documents,
             _get_file_extractors,
             _get_pg_vector_store,
@@ -225,7 +225,7 @@ def step_smoke_test() -> bool:
     os.environ["USE_PGVECTOR"] = "true"
     try:
         # Clear the lru_cache so get_vector_index() uses pgvector
-        from src.agent.rag import get_vector_index, retrieve_documents
+        from src.retrieval.rag import get_vector_index, retrieve_documents
         get_vector_index.cache_clear()
 
         docs = retrieve_documents("company project knowledge")
@@ -245,7 +245,7 @@ def step_smoke_test() -> bool:
     finally:
         os.environ.pop("USE_PGVECTOR", None)
         try:
-            from src.agent.rag import get_vector_index
+            from src.retrieval.rag import get_vector_index
             get_vector_index.cache_clear()
         except Exception:
             pass

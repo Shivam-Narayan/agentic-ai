@@ -19,13 +19,14 @@ import json
 import logging
 import operator
 from pathlib import Path
+import asyncio
 from typing import Any
 
 from langchain_core.documents import Document
 from langchain_core.tools import tool
 
-from .config import DATA_DIR
-from .rag import retrieve_documents
+from src.core.config import DATA_DIR
+from src.retrieval.rag import retrieve_documents
 
 logger = logging.getLogger(__name__)
 
@@ -52,7 +53,7 @@ EMPTY_COMPANY_SEARCH_RESULT = "No matching company documents were found."
 
 
 @tool
-def search_company_documents(query: str) -> str:
+async def search_company_documents(query: str) -> str:
     """Search indexed company documents (PDFs, Word docs, Excel files, CSVs).
 
     Use this for any question about internal company knowledge, projects,
@@ -64,7 +65,7 @@ def search_company_documents(query: str) -> str:
     """
     logger.info("Tool search_company_documents: %s", query)
 
-    documents: list[Document] = retrieve_documents(query)
+    documents: list[Document] = await asyncio.to_thread(retrieve_documents, query)
     if not documents:
         return EMPTY_COMPANY_SEARCH_RESULT
 
@@ -90,7 +91,7 @@ def search_company_documents(query: str) -> str:
 # ---------------------------------------------------------------------------
 
 @tool
-def search_web(query: str) -> str:
+async def search_web(query: str) -> str:
     """Search the live web for facts the LLM does not know.
 
     Use this for current events, prices, news, weather, or any real-time
@@ -103,11 +104,11 @@ def search_web(query: str) -> str:
     """
     logger.info("Tool search_web: %s", query)
 
-    from .chains import get_web_search_tool  # lazy — avoids circular import
+    from src.agent.chains import get_web_search_tool  # lazy — avoids circular import
 
     # _FallbackSearchTool handles all provider response formats internally.
     # It cascades Tavily → Serper → DuckDuckGo and always returns a string.
-    result = get_web_search_tool().invoke(query)
+    result = await get_web_search_tool().ainvoke(query)
     return str(result)
 
 
@@ -116,7 +117,7 @@ def search_web(query: str) -> str:
 # ---------------------------------------------------------------------------
 
 @tool
-def summarise_document(filename: str) -> str:
+async def summarise_document(filename: str) -> str:
     """Summarise the full contents of a specific company document by filename.
 
     Use this when the user asks for an overview or summary of a particular
@@ -143,7 +144,10 @@ def summarise_document(filename: str) -> str:
     try:
         from llama_index.core import SimpleDirectoryReader
 
-        docs = SimpleDirectoryReader(input_files=[str(candidate)]).load_data()
+        def _load():
+            return SimpleDirectoryReader(input_files=[str(candidate)]).load_data()
+        
+        docs = await asyncio.to_thread(_load)
         if not docs:
             return f"Could not extract text from '{filename}'."
 
@@ -166,7 +170,7 @@ def summarise_document(filename: str) -> str:
 # ---------------------------------------------------------------------------
 
 @tool
-def extract_structured_data(document_query: str, fields: str) -> str:
+async def extract_structured_data(document_query: str, fields: str) -> str:
     """Extract specific fields or facts from company documents.
 
     Use this when the user wants specific values pulled from a document —
@@ -183,7 +187,7 @@ def extract_structured_data(document_query: str, fields: str) -> str:
         document_query, fields,
     )
 
-    documents: list[Document] = retrieve_documents(document_query)
+    documents: list[Document] = await asyncio.to_thread(retrieve_documents, document_query)
     if not documents:
         return json.dumps({"error": "No relevant documents found for the given query."})
 
@@ -250,7 +254,7 @@ def _safe_eval(node: ast.AST) -> float:
 
 
 @tool
-def calculate(expression: str) -> str:
+async def calculate(expression: str) -> str:
     """Evaluate a mathematical expression accurately.
 
     Use this for any calculation, arithmetic, percentage, or numeric
@@ -265,7 +269,7 @@ def calculate(expression: str) -> str:
     cleaned = expression.replace(",", "").strip()
     try:
         tree   = ast.parse(cleaned, mode="eval")
-        result = _safe_eval(tree.body)
+        result = await asyncio.to_thread(_safe_eval, tree.body)
 
         # Integer formatting if result is whole; 6 significant figures otherwise
         if result == int(result):
@@ -283,7 +287,7 @@ def calculate(expression: str) -> str:
 # ---------------------------------------------------------------------------
 
 @tool
-def generate_chart(data_json: str, chart_type: str, title: str) -> str:
+async def generate_chart(data_json: str, chart_type: str, title: str) -> str:
     """Generate an interactive chart from tabular data.
 
     Use this when the user asks to visualise data, create a chart, or when
@@ -413,7 +417,7 @@ def _basic_csv_context(df, question: str) -> str:
 
 
 @tool
-def analyse_csv(filename: str, question: str) -> str:
+async def analyse_csv(filename: str, question: str) -> str:
     """Analyse a CSV file using Pandas to answer statistical and aggregation questions.
 
     Use this tool — NOT search_company_documents — for questions that require

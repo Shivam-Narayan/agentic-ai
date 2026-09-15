@@ -62,7 +62,7 @@ METRICS = [faithfulness, answer_relevancy, context_precision, context_recall]
 async def _run_agent(question: str) -> tuple:
     """Returns (answer, contexts, datasource, latency)."""
     from src.agent.workflow import aask
-    from src.agent.rag import retrieve_documents
+    from src.retrieval.rag import retrieve_documents
     t0     = time.monotonic()
     result = await aask(question, session_id=f"eval_{int(time.time())}")
     answer     = result.get("generation", "")
