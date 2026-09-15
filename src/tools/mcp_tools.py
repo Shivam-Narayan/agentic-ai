@@ -23,7 +23,7 @@ from typing import AsyncGenerator
 
 from langchain_core.tools import BaseTool, tool
 
-from .config import DATA_DIR, POSTGRES_URL, USE_PGVECTOR
+from src.core.config import DATA_DIR, POSTGRES_URL, USE_PGVECTOR
 
 logger = logging.getLogger(__name__)
 
@@ -33,7 +33,7 @@ logger = logging.getLogger(__name__)
 
 def _get_allow_db_writes() -> bool:
     """Check if database writes are allowed (import-time snapshot from config)."""
-    from .config import require_env_var
+    from src.core.config import require_env_var
     try:
         # Check config.py first for consistency
         import os

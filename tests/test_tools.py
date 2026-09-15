@@ -3,7 +3,7 @@ Unit tests for local and database tools.
 """
 import json
 import pytest
-from src.agent.mcp_tools import (
+from src.tools.mcp_tools import (
     _sanitise_identifier,
     _is_blocked_statement,
     _classify_statement,
@@ -15,7 +15,7 @@ from src.agent.mcp_tools import (
     query_company_database,
     MAX_ROWS,
 )
-from src.agent.tools import calculate, generate_chart
+from src.tools.tools import calculate, generate_chart
 
 
 def test_sanitise_identifier_valid():

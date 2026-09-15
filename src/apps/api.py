@@ -21,8 +21,8 @@ from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.errors import RateLimitExceeded
 from slowapi.util import get_remote_address
 
-from src.agent.config import DATA_DIR, STORAGE_DIR, POSTGRES_URL, USE_PGVECTOR, USE_POSTGRES_MEMORY, setup_logging
-from src.agent.rag import SUPPORTED_EXTENSIONS, _discover_documents, add_documents_to_index, rebuild_index
+from src.core.config import DATA_DIR, STORAGE_DIR, POSTGRES_URL, USE_PGVECTOR, USE_POSTGRES_MEMORY, setup_logging
+from src.retrieval.rag import SUPPORTED_EXTENSIONS, _discover_documents, add_documents_to_index, rebuild_index
 from src.agent.schemas import Citation, QuestionRequest, QuestionResponse
 from src.agent.workflow import KnowledgeTransferAgent, aask
 
@@ -62,6 +62,13 @@ async def lifespan(app: FastAPI):
     otherwise falls back to AsyncSqliteSaver (default, no extra setup needed).
     """
     global _checkpointer
+
+    # Pre-warm the embedding model to avoid cold-start latency
+    import asyncio
+    from src.retrieval.rag import _embed_model
+    logger.info("Pre-warming embedding model...")
+    await asyncio.to_thread(_embed_model.get_text_embedding, "warmup")
+    logger.info("Embedding model pre-warmed.")
 
     if USE_POSTGRES_MEMORY:
         # ── PostgreSQL memory ───────────────────────────────────────────
