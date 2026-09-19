@@ -179,26 +179,12 @@ Set both flags back to `false` and restart. SQLite + JSON still work — no data
 
 ---
 
-## Telegram Bot
-
-```bash
-# Add to .env
-TELEGRAM_BOT_TOKEN=your_token_here
-
-# Run (FastAPI must be running first)
-python telegram_bot.py
-```
-
-Each user gets their own conversation memory automatically.
-
----
-
 ## API Endpoints
 
 | Method | Endpoint | Description |
 |---|---|---|
 | `GET` | `/stream` | Real-time SSE streaming response (`question`, `session_id`) |
-| `POST` | `/ask` | Blocking JSON response (used by Telegram and external integrations) |
+| `POST` | `/ask` | Blocking JSON response for external integrations |
 | `GET` | `/health` | Liveness check + active memory and vector backend info |
 | `POST` | `/upload` | Non-blocking incremental document upload & indexing |
 | `GET` | `/documents` | List all indexed files in `data/` |
