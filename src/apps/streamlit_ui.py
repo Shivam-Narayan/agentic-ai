@@ -88,7 +88,8 @@ st.set_page_config(
 )
 
 # ── Premium theme CSS ─────────────────────────────────────────────────────────
-st.html((Path(__file__).parent.parent.parent / "assets" / "premium.css").read_text(encoding="utf-8"))
+css_content = (Path(__file__).parent.parent.parent / "assets" / "premium.css").read_text(encoding="utf-8")
+st.html(f"<style>{css_content}</style>")
 
 # ── Agent status cards (thinking / tools / indexing) ──────────────────────────
 def _agent_status_html(title: str, subtitle: str, steps: list[str]) -> str:

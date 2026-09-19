@@ -229,13 +229,14 @@ mcp
 langchain-mcp-adapters
 openpyxl==3.1.5
 plotly==5.24.1
-python-telegram-bot==21.6
 duckduckgo-search==8.1.1
 ddgs==9.16.0
 google-search-results==2.4.2
 langchain-tavily==0.2.18
 slowapi==0.1.9
 llama-index-retrievers-bm25==0.8.0
+llama-index-postprocessor-flashrank-rerank==0.3.0
+flashrank==0.2.10
 psycopg[binary,pool]==3.3.4
 llama-index-vector-stores-postgres==0.8.1
 langgraph-checkpoint-postgres==3.1.2

@@ -132,12 +132,14 @@ def step_migrate_documents(pg_url: str) -> bool:
     os.environ["USE_PGVECTOR"] = "true"
 
     try:
-        from src.agent.rag import (
-            _discover_documents,
+        from src.retrieval.rag import (
+            discover_documents,
             _get_file_extractors,
             _get_pg_vector_store,
-            _embed_model,
+            get_embed_model,
             configure_llama_index,
+            _CHUNK_SIZE,
+            _CHUNK_OVERLAP,
             DATA_DIR,
         )
         from llama_index.core import SimpleDirectoryReader, VectorStoreIndex, StorageContext, Settings
@@ -145,7 +147,7 @@ def step_migrate_documents(pg_url: str) -> bool:
 
         configure_llama_index()
 
-        discovered = _discover_documents()
+        discovered = discover_documents()
         if not discovered:
             _warn(f"No documents found in {DATA_DIR}")
             _warn("Add PDF/DOCX/XLSX/CSV/TXT files to data/ and re-run.")
@@ -166,7 +168,7 @@ def step_migrate_documents(pg_url: str) -> bool:
         documents = loader.load_data()
         print(f"  Loaded {len(documents)} document node(s)")
 
-        text_splitter = SentenceSplitter(chunk_size=512, chunk_overlap=50)
+        text_splitter = SentenceSplitter(chunk_size=_CHUNK_SIZE, chunk_overlap=_CHUNK_OVERLAP)
         Settings.text_splitter = text_splitter
 
         vector_store    = _get_pg_vector_store()
@@ -224,19 +226,24 @@ def step_smoke_test() -> bool:
     import os
     os.environ["USE_PGVECTOR"] = "true"
     try:
-        # Clear the lru_cache so get_vector_index() uses pgvector
-        from src.agent.rag import get_vector_index, retrieve_documents
+        from src.retrieval.rag import get_vector_index, configure_llama_index
+        from langchain_core.documents import Document
         get_vector_index.cache_clear()
+        configure_llama_index()
 
-        docs = retrieve_documents("company project knowledge")
-        if docs:
-            _ok(f"Retrieved {len(docs)} chunk(s) from pgvector")
+        # Use semantic-only retriever directly — BM25 needs in-memory docstore
+        # which is not populated for the pgvector backend
+        index = get_vector_index()
+        retriever = index.as_retriever(similarity_top_k=4)
+        nodes = retriever.retrieve("company project knowledge")
+
+        if nodes:
+            _ok(f"Retrieved {len(nodes)} chunk(s) from pgvector")
             print(f"\n  Sample (first 120 chars):")
-            print(f"    {docs[0].page_content[:120].strip()}...")
+            print(f"    {nodes[0].node.text[:120].strip()}...")
         else:
             _warn("No chunks returned — index may be empty (add documents to data/ and re-run step 3)")
 
-        # Reset cache + env
         get_vector_index.cache_clear()
         return True
     except Exception as exc:
@@ -245,7 +252,7 @@ def step_smoke_test() -> bool:
     finally:
         os.environ.pop("USE_PGVECTOR", None)
         try:
-            from src.agent.rag import get_vector_index
+            from src.retrieval.rag import get_vector_index
             get_vector_index.cache_clear()
         except Exception:
             pass

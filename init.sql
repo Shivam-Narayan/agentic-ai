@@ -1,28 +1,11 @@
 -- init.sql
--- Runs once automatically when the Postgres container starts for the first time.
--- LangGraph's AsyncPostgresSaver creates its own checkpoint tables on first run
--- via cp.setup() — we only need to create the pgvector extension and embeddings table.
+-- Runs ONCE automatically when the Postgres container starts for the first time.
+-- (Docker mounts this into /docker-entrypoint-initdb.d/ — see docker-compose.yml)
+--
+-- Purpose: enable pgvector extension so LlamaIndex and the migration script work.
+-- LlamaIndex creates its own table (data_document_embeddings) at runtime.
+-- LangGraph creates its own checkpoint tables via AsyncPostgresSaver.setup().
+-- We only need to ensure the vector extension is available before they run.
 
--- Enable the pgvector extension
+-- Enable pgvector — MUST run before any vector column or index is created
 CREATE EXTENSION IF NOT EXISTS vector;
-
--- Document embeddings table
--- embed_dim=384 matches BAAI/bge-small-en-v1.5 (the project's embedding model)
-CREATE TABLE IF NOT EXISTS document_embeddings (
-    id          BIGSERIAL PRIMARY KEY,
-    text        TEXT        NOT NULL,
-    metadata    JSONB       NOT NULL DEFAULT '{}',
-    embedding   vector(384)
-);
-
--- IVFFlat index for fast approximate nearest-neighbour search
--- lists=100 is a good default for up to ~1M vectors; increase for larger collections
-CREATE INDEX IF NOT EXISTS idx_document_embeddings_ivfflat
-    ON document_embeddings
-    USING ivfflat (embedding vector_cosine_ops)
-    WITH (lists = 100);
-
--- Exact index for smaller collections (used as fallback when IVFFlat isn't probed)
-CREATE INDEX IF NOT EXISTS idx_document_embeddings_metadata
-    ON document_embeddings
-    USING GIN (metadata);

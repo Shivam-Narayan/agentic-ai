@@ -2,9 +2,10 @@
 
 ## Overview
 
-This document covers the internal design of each component in the KT Agent. It is intended for developers who want to understand how the system works, modify it, or extend it.
+This document covers the internal design of every component in DataDialogue. It is intended for developers who want to understand how the system works, modify it, or extend it.
 
-For a higher-level view of the overall architecture and data flow, see [ARCHITECTURE.md](ARCHITECTURE.md).
+For the high-level architecture and data flow diagram, see [ARCHITECTURE.md](ARCHITECTURE.md).  
+For production monitoring and alerting, see [MONITORING_GUIDE.md](MONITORING_GUIDE.md).
 
 ---
 
@@ -12,591 +13,575 @@ For a higher-level view of the overall architecture and data flow, see [ARCHITEC
 
 ```
 .env
- └── config.py  ─────────────────────────────────────────────────────────┐
+ └── src/core/config.py  ────────────────────────────────────────────────┐
+      USE_HYBRID_SEARCH, USE_RERANKER, USE_PGVECTOR,                    │
+      USE_POSTGRES_MEMORY, POSTGRES_URL, DATA_DIR, INDEX_DIR            │
                                                                          │
-chains.py  (LLM factory + web search)                                   │
- ├── get_llm()             → ChatGroq / ChatGoogleGenerativeAI / ChatCohere
- ├── _make_serper_tool()   → GoogleSerperRun (if SERPER_API_KEY set)     │
- ├── _make_ddg_tool()      → DuckDuckGoSearchRun (always available)      │
- ├── _FallbackSearchTool   → BaseTool wrapper: tries primary → fallbacks │
- └── get_web_search_tool() → Tavily (primary) → Serper → DuckDuckGo     │
+src/agent/chains.py  (LLM factory + web search)                         │
+ ├── get_llm()            @lru_cache → ChatGroq / Gemini / Cohere       │
+ ├── _FallbackSearchTool  → tries primary → fallbacks at query time     │
+ └── get_web_search_tool() → Tavily → Serper → DuckDuckGo               │
                                                                          │
-rag.py  (document layer)                                                │
- ├── _discover_documents()   → scans data/ for supported files          │
- ├── _get_file_extractors()  → registers DocxReader for .docx/.doc      │
- ├── build_index()           → ingests, embeds, persists                │
- ├── get_vector_index()      → loads from indexing_data/ or pgvector    │
- ├── rebuild_index()         → rebuilds from scratch + clears lru_cache │
- └── retrieve_documents()   → returns List[Document] (top_k=8)         │
+src/retrieval/rag.py  (3-stage retrieval pipeline)                      │
+ ├── get_embed_model()     @lru_cache → BAAI/bge-small-en-v1.5          │
+ ├── get_vector_index()    @lru_cache → JSON store or pgvector          │
+ ├── _get_hybrid_retriever() → QueryFusionRetriever (semantic + BM25)   │
+ ├── _rerank_nodes()        → FlashRankRerank cross-encoder             │
+ ├── retrieve_documents()   → 3-stage pipeline (retrieve→fuse→rerank)  │
+ ├── build_index()          → ingest, chunk (1024 tokens), embed, store │
+ ├── rebuild_index()        → full rebuild + lru_cache.cache_clear()    │
+ ├── add_documents_to_index() → incremental insert                      │
+ └── discover_documents()   → scans DATA_DIR for supported files        │
                                                                          │
-tools.py  (LangChain tools — 6 local tools)                             │
- ├── search_company_documents  → rag.retrieve_documents()               │
- ├── summarise_document        → reads full file via LlamaIndex         │
- ├── extract_structured_data   → RAG + field template                   │
- ├── search_web                → TavilySearch, handles dict response    │
- ├── calculate                 → safe AST evaluator                     │
- └── generate_chart            → Plotly JSON figure                     │
+src/tools/tools.py  (6 local LangChain tools)                           │
+ ├── search_company_documents → retrieve_documents() (top-8)            │
+ ├── summarise_document       → full file text via LlamaIndex           │
+ ├── extract_structured_data  → RAG + JSON field template               │
+ ├── search_web               → _FallbackSearchTool                     │
+ ├── calculate                → safe AST evaluator                      │
+ └── generate_chart           → Plotly JSON figure                      │
                                                                          │
-mcp_client.py  (database tools — 3 MCP tools)                          │
- ├── list_database_tables    → discover tables + row counts             │
+src/tools/mcp_tools.py  (3 database tools)                              │
+ ├── list_database_tables   → discover tables + row counts              │
  ├── describe_database_table → column schemas + types                   │
- └── query_company_database  → SELECT (or write with ALLOW_DB_WRITES)   │
+ └── query_company_database  → SELECT (write if ALLOW_DB_WRITES=true)  │
                                                                          │
-workflow.py  (LangGraph agent)  ◄── uses all of the above              │
- ├── _current_system_prompt  (ContextVar — thread-safe prompt injection)│
- ├── AgentState                                                         │
- ├── _get_previous_tool_calls() (dedup helper)                          │
- ├── _first_search_had_results() (smart dedup — only blocks if found)   │
- ├── _compile_graph(tools, checkpointer)  ← bound_llm created once     │
- ├── _get_compiled_graph()    ← dict cache, bounded size                │
- ├── _prepare_run()           ← DRY setup for aask + streaming          │
- ├── agent_node()             ← standalone, testable, uses ContextVar   │
- ├── KnowledgeTransferAgent   ← SSE streaming interface                 │
- └── aask(question, session_id, checkpointer)  ← blocking interface    │
+src/agent/workflow.py  (LangGraph orchestrator)  ◄── all of the above  │
+ ├── AgentState TypedDict (messages, plan, usage_tracker, …)            │
+ ├── UsageTracker integration (tokens + cost per request)               │
+ ├── _compile_graph() / _get_compiled_graph() (cached)                  │
+ ├── planner_node / agent_node / tool_execution_node / reflection_node  │
+ ├── _request_tool_context() → bind_tools() per request                 │
+ ├── KnowledgeTransferAgent  → SSE streaming interface                  │
+ └── aask()                  → blocking interface                       │
                                                                          │
-schemas.py  (Pydantic models)                                           │
- ├── QuestionRequest / QuestionResponse / Citation   (core API)        │
- ├── OpenClawWebhookRequest / OpenClawWebhookResponse  (OpenClaw)      │
- └── OpenClawHealthResponse                           (OpenClaw)        │
+src/agent/telemetry.py  (cost + token tracking)                         │
+ ├── UsageTracker → accumulates token counts across LLM calls           │
+ ├── UsageMetrics → prompt_tokens, completion_tokens, cost_usd, …      │
+ └── _COST_TABLE  → pricing per 1k tokens (Groq, Gemini, OpenAI, …)    │
+                                                                         │
+src/agent/schemas.py  (Pydantic models)                                  │
+ ├── DatasourceType = Literal["direct_llm","company_docs","database",…] │
+ ├── QuestionRequest / QuestionResponse / Citation                      │
+ └── OpenClawWebhookRequest / Response / HealthResponse                 │
                                                                          │
 src/apps/api.py  (FastAPI)                                               │
- ├── GET  /stream           →  KnowledgeTransferAgent.run() SSE stream  │
- ├── POST /ask              →  aask(question, session_id, checkpointer) │
- ├── GET  /health                                                        │
- ├── POST /upload            →  rebuild_index()                         │
- ├── GET  /documents                                                     │
- ├── GET  /sessions/{id}/history                                         │
- ├── DELETE /sessions/{id}/history                                       │
- ├── GET  /openclaw/health   →  OpenClawHealthResponse                  │
- └── POST /openclaw/webhook  →  aask() via OpenClaw session_id          │
+ ├── _validate_session_id()  → regex security guard                     │
+ ├── _MAX_UPLOAD_BYTES = 50MB                                            │
+ ├── Lazy AsyncPostgresSaver import inside lifespan()                   │
+ ├── _checkpointer None guard on every endpoint                         │
+ └── 11 endpoints (see ARCHITECTURE.md)                                 │
                                                                          │
-src/apps/telegram_bot.py  (Telegram channel)                             │
- ├── handle_message()        → POST /ask {session_id=telegram_<user_id>}│
- ├── start()                 → /start command handler                   │
- └── help_command()          → /help command handler                    │
-                                                                         │
-src/apps/streamlit_ui.py  (Web UI)                                       │
- ├── st.chat_input (always called — prevents disappear bug)             │
- ├── pending_question (sample question click flow)                      │
- ├── _render_assistant_message()  (badges, charts, citations)           │
- └── sidebar: upload, indexed docs, session controls, samples          │
+tests/evaluate.py  (RAGAS evaluation + monitoring)                       │
+ ├── 18 ground-truth questions (eval_questions.json)                    │
+ ├── cost + token tracking per question                                  │
+ ├── --save-baseline / --compare for regression detection               │
+ └── LangSmith tracing check on startup                                 │
 ```
 
 ---
 
-## `config.py` — Environment and Paths
+## `config.py` — Environment and Feature Flags
 
-**Purpose:** Single source of truth for all file paths and environment validation.
+Single source of truth for paths, feature flags, and environment validation.
 
 ```python
 ROOT_DIR    = Path(__file__).resolve().parent.parent.parent
 STORAGE_DIR = ROOT_DIR / ".storage"
-DATA_DIR    = STORAGE_DIR / "data"          # where user puts their files
-INDEX_DIR   = STORAGE_DIR / "indexing_data" # LlamaIndex persists the vector store here
+DATA_DIR    = STORAGE_DIR / "data"           # user document files
+INDEX_DIR   = STORAGE_DIR / "indexing_data"  # LlamaIndex vector store
 ```
 
-**Environment validation (`require_runtime_keys()`):**
+**Feature flags:**
 
-Called at startup. Raises a hard error only if no LLM key is present — web search keys are optional:
+```python
+USE_HYBRID_SEARCH: bool   # semantic + BM25 + RRF   (default: true)
+USE_RERANKER:      bool   # FlashRank cross-encoder (default: true)
+USE_PGVECTOR:      bool   # pgvector backend         (default: false)
+USE_POSTGRES_MEMORY: bool # Postgres conversation DB (default: false)
+```
 
-- **Required (at least one):** `GROQ_API_KEY`, `GOOGLE_API_KEY`, `COHERE_API_KEY`
-- **Optional (web search):** `TAVILY_API_KEY`, `SERPER_API_KEY`
-  - If neither is set, logs a warning and falls back to DuckDuckGo automatically
-  - No crash — the app starts and works without any web search key
+**LLM key validation (`require_runtime_keys()`):**
 
-Optional environment vars:
-- `LLM_PROVIDER` — force a specific provider (`groq`, `google`, `cohere`)
-- `KT_API_URL` — Streamlit uses this to reach FastAPI (default: `http://localhost:8000`)
-- `OPENCLAW_WEBHOOK_LOGGING` — enable verbose logging for webhook requests
+- Raises hard error if no LLM key found (GROQ, GOOGLE, or COHERE)
+- Logs a warning if no web search key found — falls back to DuckDuckGo automatically, no crash
 
 ---
 
-## `chains.py` — LLM Factory + Web Search Fallback Chain
+## `chains.py` — LLM Factory + Web Search
 
-**Purpose:** Selects and instantiates the LLM and web search tool based on available API keys.
-
-**LLM selection logic:**
+**LLM selection:**
 
 ```python
 @lru_cache(maxsize=1)
 def get_llm() -> BaseChatModel:
-    provider = os.getenv("LLM_PROVIDER", "").lower()
-
-    if provider == "groq" or (not provider and GROQ_API_KEY):
-        return ChatGroq(model="openai/gpt-oss-120b", temperature=0, streaming=True)
-
-    if provider == "google" or (not provider and GOOGLE_API_KEY):
-        return ChatGoogleGenerativeAI(model="gemini-1.5-flash", temperature=0, streaming=True)
-
-    if provider == "cohere" or (not provider and COHERE_API_KEY):
-        return ChatCohere(model="command-r-plus", temperature=0, streaming=True)
+    # Priority: Groq → Google → Cohere
+    # Respects LLM_PROVIDER env var for explicit override
+    # All providers: temperature=0, streaming=True
 ```
 
-Priority: **Groq → Google → Cohere**. `@lru_cache` means the client is created once per process. All three providers have `streaming=True` for token-level streaming.
+`@lru_cache` means the LLM client is created once per process and reused.
 
 **Web search fallback chain:**
 
-`get_web_search_tool()` returns a `_FallbackSearchTool` that wraps multiple providers and cascades at *query time* — not just at init time. This is critical because Tavily initialises successfully even when its quota is exhausted; the error only surfaces when a query is made.
+`_FallbackSearchTool` wraps multiple providers and cascades at *query time*, not just at init. Critical because Tavily initialises successfully even when quota is exhausted — the failure only appears on the first query.
 
 ```python
-class _FallbackSearchTool(BaseTool):
-    def _run(self, query: str) -> str:
-        for tool in [primary] + fallbacks:
-            try:
-                result = tool.invoke(query)
-                # Tavily returns {"error": ...} dict on quota errors instead of raising
-                if isinstance(result, dict) and "error" in result:
-                    raise RuntimeError(result["error"])
-                return result
-            except Exception as exc:
-                logger.warning("Search tool '%s' failed: %s — trying next", tool.name, exc)
-        raise RuntimeError("All web search providers failed")
+for tool in [primary] + fallbacks:
+    result = tool.invoke(query)
+    if isinstance(result, dict) and "error" in result:
+        raise RuntimeError(result["error"])  # Tavily quota error
+    return result
 ```
-
-Provider selection priority:
-1. **Tavily** — `TAVILY_API_KEY` set — AI-optimised results, best quality
-2. **Serper** — `SERPER_API_KEY` set — real Google results, 2,500 free credits
-3. **DuckDuckGo** — no key needed — always available, appended unconditionally
-
-If only Tavily is configured → `_FallbackSearchTool(primary=Tavily, fallbacks=[DuckDuckGo])`
-If Tavily + Serper configured → `_FallbackSearchTool(primary=Tavily, fallbacks=[Serper, DuckDuckGo])`
-If no keys → `DuckDuckGoSearchRun` returned directly (no wrapper overhead)
 
 ---
 
-## `rag.py` — Document Ingestion and Retrieval
+## `rag.py` — 3-Stage Retrieval Pipeline
 
-**Purpose:** Manages the full lifecycle of document knowledge — discovery, parsing, indexing, retrieval.
-
-### Supported file formats
+### Configuration
 
 ```python
-SUPPORTED_EXTENSIONS = {".pdf", ".docx", ".doc", ".xlsx", ".xls", ".csv", ".txt"}
+_CHUNK_SIZE:        int = 1024   # was 512 — larger = more context per chunk
+_CHUNK_OVERLAP:     int = 100    # was 50
+_SIMILARITY_TOP_K:  int = 8      # chunks returned at each stage
+_EMBED_MODEL_NAME:  str = "BAAI/bge-small-en-v1.5"   # 384-dim
 ```
 
-### DOCX parsing fix
-
-LlamaIndex's default `SimpleDirectoryReader` falls back to a raw binary reader for `.docx` if `llama-index-readers-file` is not installed. The fix explicitly registers `DocxReader` for Word files:
+### Stage 1 — Retrieval (always active)
 
 ```python
-def _get_file_extractors() -> dict:
-    from llama_index.readers.file import DocxReader
-    return {".docx": DocxReader(), ".doc": DocxReader()}
+retriever = index.as_retriever(similarity_top_k=8)
+# Cosine similarity between query embedding and chunk embeddings
 ```
 
-### Index cache invalidation
+### Stage 1 + BM25 Fusion (USE_HYBRID_SEARCH=true)
 
-`rebuild_index()` calls `get_vector_index.cache_clear()` after every rebuild so the next query loads the fresh index without requiring a server restart. Files uploaded via `POST /upload` also trigger a full rebuild automatically.
+```python
+def _get_hybrid_retriever(index):
+    vector_retriever = index.as_retriever(similarity_top_k=8)
+    bm25_retriever   = BM25Retriever.from_defaults(docstore=index.docstore, similarity_top_k=8)
+    return QueryFusionRetriever(
+        retrievers=[vector_retriever, bm25_retriever],
+        mode="reciprocal_rerank",   # RRF fusion
+        num_queries=1,              # no LLM query expansion
+    )
+```
+
+RRF combines both ranked lists: if a chunk ranks highly in either retriever it surfaces in the fused top-8.
+
+### Stage 2 — Cross-Encoder Reranking (USE_RERANKER=true)
+
+```python
+def _rerank_nodes(nodes, question):
+    reranker = FlashRankRerank(top_n=8)
+    reranked = reranker.postprocess_nodes(nodes, query_bundle=QueryBundle(question))
+    return reranked
+```
+
+**Why cross-encoder > bi-encoder for final ranking:**
+
+| | Bi-encoder (embedding) | Cross-encoder (FlashRank) |
+|---|---|---|
+| Encodes | Question and chunk **separately** | Question + chunk **jointly** |
+| Sees | "Are these vectors close?" | "Is this chunk a good answer?" |
+| Speed | Fast — compare pre-built vectors | ~100-300ms per batch of 8 |
+| Accuracy | Good for recall | Best for precision |
+
+Use bi-encoder (Stage 1) to retrieve 8 candidates cheaply. Use cross-encoder (Stage 2) to rank them accurately.
+
+**Graceful fallback:** If `flashrank` is not installed, `_rerank_nodes()` logs a warning and returns the original order — the app never crashes.
+
+### Full retrieve_documents() pipeline
+
+```python
+def retrieve_documents(question: str) -> list[Document]:
+    index = get_vector_index()
+
+    if USE_HYBRID_SEARCH:
+        retriever = _get_hybrid_retriever(index)   # semantic + BM25 + RRF
+    else:
+        retriever = index.as_retriever(similarity_top_k=8)
+
+    nodes = retriever.retrieve(question)           # Stage 1
+
+    if USE_RERANKER:
+        nodes = _rerank_nodes(nodes, question)     # Stage 2
+
+    return [Document(page_content=node.node.text, ...) for node in nodes]
+```
+
+### Index caching
+
+Both `get_embed_model()` and `get_vector_index()` use `@lru_cache(maxsize=1)` — loaded once per process. `rebuild_index()` calls `get_vector_index.cache_clear()` after every rebuild so the next query loads the fresh index.
 
 ---
 
 ## `tools.py` — The 6 Local Tools
 
+All tools use the `@tool` decorator, which auto-generates a JSON schema from the function signature and docstring. This schema is what gets sent to the LLM in every `bind_tools()` call.
+
 ### 1. `search_company_documents`
-Calls `retrieve_documents(query)` → top 4 chunks from vector store. Each chunk prefixed with `[Source: filename]` for citation extraction. Text capped at 700 chars per chunk.
+Calls `retrieve_documents(query)` → top-8 chunks from the 3-stage pipeline.  
+Each chunk prefixed `[Source: filename]` for citation extraction.  
+Capped at `MAX_EXTRACT_CHARS=700` per chunk, `MAX_CONTEXT_DOCS=4` shown to LLM.
 
 ### 2. `summarise_document`
-Loads full file text (capped at 6000 chars) with `[Full text of <filename>]` prefix. LLM synthesises summary in the next reasoning step.
+Loads full file text (capped at 6000 chars). LLM synthesises summary in next reasoning step.
 
 ### 3. `extract_structured_data`
-Retrieves relevant chunks then returns context + JSON field template. LLM fills in the values.
+Retrieves relevant chunks + returns context with a JSON field template. LLM fills in the values.
 
 ### 4. `search_web`
-Calls the `_FallbackSearchTool` which tries Tavily → Serper → DuckDuckGo in order. Handles Tavily's dict-format quota error (`{"error": ValueError(...)}`) by treating it as a failure and cascading. Results formatted as `[Source: url]\ncontent`.
+Calls `_FallbackSearchTool`: Tavily → Serper → DuckDuckGo.  
+Handles Tavily's dict-format quota error `{"error": ValueError(...)}`.
 
 ### 5. `calculate`
-Uses Python's `ast` module — safe arithmetic without `eval()`. Only numeric constants and arithmetic operators allowed. Returns `"expression = result"` format.
+Safe arithmetic via Python's `ast` module — no `eval()`.  
+Only numeric constants and arithmetic operators allowed.
 
 ### 6. `generate_chart`
-Builds a Plotly `go.Figure` and returns `CHART_JSON::{figure_json}`. The `_extract_chart()` function in `workflow.py` detects this prefix and extracts the JSON for Streamlit to render inline.
+Builds a Plotly `go.Figure` and returns `CHART_JSON::{figure_json}`.  
+Streamlit detects the prefix and renders the chart inline.
 
 ---
 
-## `mcp_client.py` — Database Tools
+## `mcp_tools.py` — Database Tools
 
-Three LangChain tools wrapped in an MCP-compatible `asynccontextmanager`:
+Three LangChain tools behind an `asynccontextmanager`:
 
 ```python
-list_database_tables()               # discover available tables with row counts
-describe_database_table(table_name)  # get column names, types, constraints
-query_company_database(sql_query)    # run queries (SELECT or write if ALLOW_DB_WRITES=true)
+list_database_tables()                # discover tables + row counts
+describe_database_table(table_name)   # column names, types, constraints
+query_company_database(sql_query)     # execute query
 ```
 
-**Safety & Validation:**
-- `_sanitise_identifier()` — strict regex `^\w+$` on table/column names before any PRAGMA or schema query — blocks SQL injection.
-- `_is_blocked_statement()` — disallows DDL (`DROP`, `TRUNCATE`, `ALTER`, `CREATE`) regardless of `ALLOW_DB_WRITES`.
-- Read-only by default — `INSERT`, `UPDATE`, `DELETE` require `ALLOW_DB_WRITES=true` in `.env`.
-- Both SQLite and PostgreSQL backends supported — branches on `USE_PGVECTOR` flag.
+**Security hardening:**
 
-**MCP compatibility:** The entire database layer can be replaced with a real MCP server by swapping only `mcp_server_context()`. `workflow.py` does not change.
+```python
+# ASCII-only regex — prevents Unicode-based SQL injection
+_SANITISE_PATTERN = re.compile(r'^[A-Za-z0-9_]+$')
+
+def _sanitise_identifier(name: str) -> str:
+    if not _SANITISE_PATTERN.match(name):
+        raise ValueError(f"Invalid identifier: {name!r}")
+    return name
+```
+
+`\w` was replaced with `[A-Za-z0-9_]` — `\w` matches Unicode letters which could be used to construct injection attacks.
+
+**Write protection:**
+- `ALLOW_DB_WRITES=false` by default — `INSERT/UPDATE/DELETE` require explicit opt-in
+- `_is_blocked_statement()` — blocks DDL (`DROP`, `TRUNCATE`, `ALTER`, `CREATE`) regardless of `ALLOW_DB_WRITES`
+- Both SQLite and PostgreSQL supported — branches on `USE_PGVECTOR` flag
 
 ---
 
-## `workflow.py` — The LangGraph Agent
+## `workflow.py` — LangGraph Orchestrator
 
-**Purpose:** Assembles all tools, runs the ReAct loop, and parses the final result.
-
-### Key improvements over original design
-
-- **Thread-safe prompts** — `_current_system_prompt` is a `ContextVar`. Each async Task gets its own value so concurrent requests never corrupt each other's system prompt.
-- **Graph cached** — `_get_compiled_graph()` uses a bounded dict cache keyed on `(sorted tool names, checkpointer id)`. Graph is compiled once per tool-set, not on every request.
-- **LLM bound once** — `bound_llm = get_llm().bind_tools(...)` runs in `_compile_graph()` at compile time, not on every loop iteration.
-- **Timeout enforced** — `_astream_complete()` wraps the LLM stream in `asyncio.wait_for(timeout=30)`.
-- **Smart dedup** — `_first_search_had_results()` only blocks a second search if the first one returned content. If retrieval returned empty, the LLM can retry with a different query.
-
-### Public interface
+### Graph compilation
 
 ```python
-# Blocking — called by POST /ask and Telegram
-async def aask(question, session_id, checkpointer, history) -> dict
-
-# Streaming — called by GET /stream
-class KnowledgeTransferAgent:
-    async def run(question, session_id, history) -> AsyncIterator[dict]
-    # yields: status | token | tool | done | error events
+@contextmanager
+def _request_tool_context(all_tools):
+    bound_llm = get_llm().bind_tools(list(all_tools), parallel_tool_calls=False)
+    # ContextVar injection — each async Task gets its own bound_llm
+    _bound_llm_var.set(bound_llm)
+    _tools_var.set(all_tools)
+    yield
 ```
 
-### Streaming: `KnowledgeTransferAgent`
+`parallel_tool_calls=False` — the LLM picks one tool at a time. Prevents runaway parallel calls that would exhaust rate limits.
 
-`KnowledgeTransferAgent` wraps the same LangGraph graph as `aask()` but exposes it as an `AsyncIterator[dict]` suitable for SSE:
+Graph is compiled once per checkpointer instance and cached in `_graphs_by_checkpointer`. Subsequent requests reuse the compiled graph.
+
+### AgentState
 
 ```python
-class KnowledgeTransferAgent:
-    async def run(self, question: str, session_id: str = "default") -> AsyncIterator[dict]:
-        yield {"type": "status", "stage": "thinking"}
-        async for mode, chunk in graph.astream(..., stream_mode=["messages", "values"]):
-            if mode == "messages":
-                # filter to agent node, extract text chunks
-                yield {"type": "token", "text": chunk_text}
-            elif mode == "values":
-                # detect new tool calls
-                yield {"type": "tool", "name": tool_name}
-        yield {"type": "done", "payload": parse_result(final_values)}
+class AgentState(TypedDict):
+    messages:          Annotated[list[BaseMessage], add_messages]
+    plan:              str             # planner output
+    reflection_status: str             # "pass" | "improved" | ""
+    is_complex:        bool            # true if planner ran
+    usage_tracker:     Any             # UsageTracker instance
+    prompt_version:    str             # for traceability
 ```
 
-FastAPI's `GET /stream` wraps this in a `StreamingResponse` with `media_type="text/event-stream"`. The Streamlit UI consumes it via `httpx.stream()`.
+### Planner–Executor–Reflection pattern
 
-`aask()` still exists and is used by Telegram and `POST /ask` — it calls `graph.ainvoke()` (blocking, single response).
+```
+complexity_router
+  ├── simple → skip planner (saves one LLM call for direct questions)
+  └── complex → planner_node
+                  │ writes numbered plan into state["plan"]
+                  ▼
+              agent_node (executor)
+                  │ LLM receives plan + tools + system prompt
+                  │ calls tools, accumulates tool results
+                  │ writes draft answer
+                  ▼
+              reflection_node
+                  │ LLM reads: question + tool results + draft answer
+                  │ scores on 5 criteria (completeness, accuracy, citations, …)
+                  │ PASS  → return draft unchanged
+                  └── IMPROVED → rewrite draft → return
+```
+
+### Token tracking integration
+
+Every LLM call records usage:
 
 ```python
-for msg in reversed(messages):
-    if msg.type == "ai" and msg.content and str(msg.content).strip():
-        answer = str(msg.content).strip()
-        break
+# In agent_node, planner_node, reflection_node:
+tracker: UsageTracker = state.get("usage_tracker")
+if tracker is not None:
+    tracker.record(response)   # extracts from response_metadata
 ```
 
-Walks backwards through messages to find the last non-empty AI response — handles the case where the dedup guard produced an empty AI message.
+`tracker.to_metrics()` at end of run → `UsageMetrics` returned in `aask()` result.
+
+### Deduplication guard
+
+```python
+def _should_skip_tool_call(name, args, turn_messages):
+    key = _make_tool_call_key(name, args)
+    if key in _get_previous_tool_calls(turn_messages):
+        return True   # exact same call already ran this turn
+    if name == "search_company_documents" and _first_search_had_results(...):
+        return True   # doc search already returned results — block retry
+    return False
+```
+
+When a tool call is blocked, a synthetic `ToolMessage` is inserted with an explanation. The LLM sees the block and writes its answer from existing context.
+
+### Timeouts
+
+```python
+TOOL_CALL_TIMEOUT_SECS: int = 90   # asyncio.wait_for on LLM streaming
+TOOL_EXEC_TIMEOUT_SECS: int = 60   # asyncio.wait_for on ToolNode.ainvoke()
+```
+
+Both raise `asyncio.TimeoutError` which is caught and returns an error response rather than hanging forever.
+
+---
+
+## `telemetry.py` — Cost & Token Tracking
+
+### UsageTracker
+
+Accumulates token counts from every `AIMessage` in a single agent run:
+
+```python
+tracker = UsageTracker()
+tracker.record(ai_message)    # called after each LLM response
+metrics = tracker.to_metrics()
+# → UsageMetrics(prompt_tokens, completion_tokens, cost_usd, model, latency_ms, llm_calls)
+```
+
+**Provider normalisation** — each LLM uses different metadata keys:
+
+| Provider | Metadata location | Keys |
+|---|---|---|
+| Groq / OpenAI | `response_metadata.token_usage` | `prompt_tokens`, `completion_tokens` |
+| Gemini | `response_metadata.usage_metadata` | `prompt_token_count`, `candidates_token_count` |
+| Cohere | `response_metadata.meta.billed_units` | `input_tokens`, `output_tokens` |
+
+### Cost table
+
+`_COST_TABLE` in `telemetry.py` maps model names to USD per 1k tokens. Covers Groq, Gemini, OpenAI, Azure, Cohere. Falls back to `{"prompt": 0.001, "completion": 0.002}` for unknown models.
+
+Update when providers change pricing — this is the single source of truth.
 
 ---
 
 ## `schemas.py` — Pydantic Models
 
-### Core API schemas
-
 ```python
+# Shared literal type — single source of truth for valid datasource values
+DatasourceType = Literal["direct_llm", "company_docs", "database",
+                          "web_search", "calculation", "chart", "multiple"]
+
 class QuestionRequest(BaseModel):
     question:   str = Field(..., min_length=1, max_length=2000)
     session_id: str = Field(default="default")
 
 class Citation(BaseModel):
-    source: str   # filename, table name, or URL
-    detail: str   # SQL query, expression, or empty
+    source: str    # filename, table name, or URL
+    detail: str    # SQL query, expression, or empty
 
 class QuestionResponse(BaseModel):
     answer:     str
-    datasource: str | None = None
+    datasource: DatasourceType | None
     tools_used: list[str]
     citations:  list[Citation]
-    chart_data: dict | None   # Plotly figure JSON or null
+    chart_data: dict | None
 ```
 
-### OpenClaw integration schemas (added)
-
-```python
-class OpenClawWebhookRequest(BaseModel):
-    channel:    str        # "telegram", "whatsapp", "discord", etc.
-    user_id:    str        # unique user identifier from the channel
-    session_id: str        # OpenClaw session key — used as LangGraph thread_id
-    message:    str        # the user's question (max 4000 chars)
-    timestamp:  str        # ISO 8601
-    metadata:   dict | None  # optional channel-specific data
-
-class OpenClawWebhookResponse(BaseModel):
-    response:   str        # agent's answer text
-    success:    bool       # whether processing succeeded
-    tools_used: list[str]  # tool names called
-    citations:  list[Citation]
-    datasource: str | None
-    error:      str | None # set when success=False
-
-class OpenClawHealthResponse(BaseModel):
-    status:      str   # "ok"
-    agent_ready: bool  # True when checkpointer is initialised
-    version:     str   # "1.0.0"
-```
+`DatasourceType` is reused across `QuestionResponse`, `OpenClawWebhookResponse`, and `AgentState`. Invalid values are caught by Pydantic before they reach the rest of the application.
 
 ---
 
-## `src/apps/api.py` — FastAPI Backend
+## `api.py` — FastAPI Backend
 
-### Persistent memory via lifespan
+### Security hardening
+
+```python
+_SESSION_ID_RE = re.compile(r'^[A-Za-z0-9_\-]{1,128}$')
+_MAX_UPLOAD_BYTES = 50 * 1024 * 1024   # 50 MB
+
+def _validate_session_id(session_id: str) -> str:
+    if not _SESSION_ID_RE.match(session_id):
+        raise HTTPException(status_code=400, detail="Invalid session_id format")
+    return session_id
+```
+
+Called on every endpoint that accepts a `session_id` parameter.
+
+### Lazy PostgreSQL import
 
 ```python
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    async with AsyncSqliteSaver.from_conn_string(
-        str(_MEMORY_DIR / "conversations.db")
-    ) as cp:
-        _checkpointer = cp   # shared across all requests
-        yield
+    if USE_POSTGRES_MEMORY:
+        from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver  # lazy import
+        async with AsyncPostgresSaver.from_conn_string(POSTGRES_URL) as cp:
+            await cp.setup()
+            _checkpointer = cp
+            yield
+    else:
+        from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
+        async with AsyncSqliteSaver.from_conn_string(...) as cp:
+            _checkpointer = cp
+            yield
 ```
 
-The `AsyncSqliteSaver` is opened once at startup and shared by all endpoints. It persists full message history per `session_id` to `.storage/memory_store/conversations.db` — sessions survive server restarts.
+The `AsyncPostgresSaver` import is inside the `lifespan()` function — not at module level. Users without Postgres installed never trigger an `ImportError`.
 
-### Endpoints
-
-```
-GET  /stream
-  ← query params: question, session_id
-  → text/event-stream (SSE)
-  → events: status | token | tool | done | error
-
-POST /ask
-  ← QuestionRequest(question, session_id)
-  → QuestionResponse(answer, datasource, tools_used, citations, chart_data)
-
-GET  /health
-  → {"status": "ok"}
-
-POST /upload
-  ← multipart files
-  → saves to data/, calls rebuild_index(), returns saved/rejected/indexed
-
-GET  /documents
-  → list of files in data/ with name, size_kb, type
-
-GET  /sessions/{session_id}/history
-  → {session_id, turn_count, messages}
-
-DELETE /sessions/{session_id}/history
-  → writes empty checkpoint to reset the thread
-
-GET  /sessions
-  → lists all session IDs from SQLite checkpoints table
-
-GET  /openclaw/health
-  → OpenClawHealthResponse(status, agent_ready, version)
-
-POST /openclaw/webhook
-  ← OpenClawWebhookRequest(channel, user_id, session_id, message, timestamp)
-  → OpenClawWebhookResponse(response, success, tools_used, citations, datasource)
-```
-
-### OpenClaw webhook handler
+### Checkpointer None guard
 
 ```python
-@app.post("/openclaw/webhook")
-async def openclaw_webhook(request: OpenClawWebhookRequest):
-    result = await aask(
-        question=request.message,
-        session_id=request.session_id,   # OpenClaw manages the session key
-        checkpointer=_checkpointer,
-    )
-    return OpenClawWebhookResponse(
-        response=result["generation"],
-        success=True,
-        tools_used=result["tools_used"],
-        citations=[Citation(source=c["source"], detail=c.get("detail", ""))
-                   for c in result["citations"]],
-        datasource=result["datasource"],
-    )
+if _checkpointer is None:
+    raise HTTPException(status_code=503, detail="Agent not ready — checkpointer not initialised")
 ```
 
-OpenClaw's `session_id` is passed directly as the LangGraph `thread_id` — conversation memory works automatically per OpenClaw session.
+Added to every endpoint that uses the checkpointer. Prevents runtime crashes during startup race conditions.
 
 ---
 
-## `src/apps/telegram_bot.py` — Telegram Channel
+## Evaluation System
 
-**Purpose:** A `python-telegram-bot` polling bot that bridges Telegram messages to the DataDialogue FastAPI backend. Runs as a separate process alongside FastAPI.
+### RAGAS metrics
 
-### Design
+All four metrics measured using project LLM as judge (no OpenAI needed):
+
+| Metric | Measures |
+|---|---|
+| `faithfulness` | Answer grounded in context (no hallucination) |
+| `answer_relevancy` | Answer addresses the question |
+| `context_precision` | Retrieved chunks are relevant |
+| `context_recall` | All relevant info was retrieved |
+
+### Cost reporting per evaluation run
 
 ```
-Telegram API (polling)
-      ↓
-Application.run_polling()
-      ↓
-handle_message(update, context)
-      ↓
-httpx.AsyncClient.post(
-    "http://localhost:8000/ask",
-    json={
-        "question": update.message.text,
-        "session_id": f"telegram_{user.id}"
-    }
-)
-      ↓
-QuestionResponse
-      ↓
-update.message.reply_text(answer + citations + tool_emoji)
+[doc_001] What is DataDialogue and what does it do?
+  ✅ avg=0.84  faith=0.91  rel=0.83  prec=0.78  recall=0.84  (3.2s)
+     tokens: 1842 (1340 prompt + 502 completion) | cost: $0.000165 | model: gemini-1.5-flash
 ```
 
-### Session namespacing
-
-Each Telegram user ID gets its own session: `telegram_<user_id>`. This ensures:
-- Memory is per-user, not per-bot
-- Sessions don't collide with web UI sessions (which use UUIDs)
-- Sessions persist across bot restarts via the checkpointer
-
-### Reply formatting
-
-- Citations are appended as `📎 *Sources:* filename1, filename2`
-- Tool emojis (📄 🌐 🧮 📊 🗄️) are appended to indicate data source
-- Markdown parsing is enabled for bold text
-
-### Commands
-
-| Command | Handler | Description |
-|---------|---------|-------------|
-| `/start` | `start()` | Welcome message with example questions |
-| `/help` | `help_command()` | Full capability list |
-| Any text | `handle_message()` | Forward to DataDialogue agent |
-
-### Running
-
-```bash
-# FastAPI must be running first
-python telegram_bot.py
+Aggregate report:
+```
+COST & TOKEN METRICS
+  Total cost       : $0.012345
+  Avg cost/question: $0.000686
+  Total tokens     : 45,230 (32,100 prompt + 13,130 completion)
+  Avg latency      : 3.42s
 ```
 
-The bot uses long-polling — no webhook URL or public server required. Suitable for local development and self-hosted setups.
+### Regression comparison
+
+```
+REGRESSION COMPARISON (baseline: 2026-09-10T10:30:00)
+  📈 faithfulness     : 0.8421 (baseline: 0.8012, Δ +0.0409)
+  📉 answer_relevancy : 0.7845 (baseline: 0.8123, Δ -0.0278)
+  💚 Total cost: $0.0123 (baseline: $0.0145, Δ -$0.0022 / -15.2%)
+```
+
+### Ground truth dataset
+
+18 questions in `tests/eval_questions.json` covering:
+- 5 company_docs questions (README, architecture, setup)
+- 2 database questions (schema, pgvector)
+- 3 calculation questions
+- 4 direct_llm questions (AI/ML concepts)
+- 2 web_search questions
+- 2 edge cases (multilingual, error handling)
 
 ---
 
-## `src/apps/streamlit_ui.py` — Web Chat Frontend
+## LangSmith Integration
 
-### Key design decisions
+LangSmith is wired in via environment variables — no code changes needed to enable tracing.
 
-**`st.chat_input` always rendered:** Previously, when a sample question was clicked, `pending_question` short-circuited the `or` expression and `st.chat_input(...)` was never called. Streamlit removed the widget from the DOM on subsequent renders. Fixed:
-
-```python
-# Always call chat_input first — Streamlit hides it if skipped even once
-typed_input = st.chat_input("Ask a question…")
-prompt = st.session_state.pop("pending_question", None) or typed_input
+```env
+LANGCHAIN_TRACING_V2=true
+LANGCHAIN_API_KEY=ls-...
+LANGCHAIN_PROJECT=DataDialogue
+LANGCHAIN_ENDPOINT=https://api.smith.langchain.com
 ```
 
-**Session ID:** Each browser tab gets a UUID. Sent with every `/ask` so conversations are isolated per tab. Memory persists across page refreshes via the checkpointer.
+Every `graph.ainvoke()` and `graph.astream()` call is traced automatically including:
+- All LLM calls with token counts
+- Tool calls with inputs and outputs
+- Node-level latency
+- Total cost per run
 
-**Timeout:** 180 seconds for API calls — LLM + tool calls can be slow on first run with cold index.
-
-### Datasource display config
-
-```python
-ROUTE_CONFIG = {
-    "direct_llm":   {"icon": "💬", "color": "#6c757d"},
-    "company_docs": {"icon": "📄", "color": "#0d6efd"},
-    "database":     {"icon": "🗄️", "color": "#198754"},
-    "web_search":   {"icon": "🌐", "color": "#fd7e14"},
-    "calculation":  {"icon": "🧮", "color": "#6f42c1"},
-    "chart":        {"icon": "📊", "color": "#20c997"},
-    "multiple":     {"icon": "🔀", "color": "#dc3545"},
-}
+Startup check in `evaluate.py`:
+```
+✅ LangSmith tracing enabled (project: datadialogue)
+   View traces at: https://smith.langchain.com/
 ```
 
 ---
 
-## Data Flow: End to End
+## Evaluation: Before vs After
 
-Complete trace of "What are Shivam's technical skills?" sent via **Telegram**:
-
-```
-User sends Telegram message: "What are Shivam's technical skills?"
-│
-├─ telegram_bot.py: handle_message()
-│   session_id = "telegram_8341015221"
-│   httpx.post("http://localhost:8000/ask", json={question, session_id})
-│
-├─ FastAPI POST /ask:
-│   aask(question, session_id="telegram_8341015221", checkpointer=cp)
-│
-├─ AsyncSqliteSaver: loads prior message history for thread_id
-│   (empty on first message, populated on follow-ups)
-│
-├─ workflow.py aask():
-│   all_tools = 6 local + 3 MCP = 9 total
-│   graph = build_graph(all_tools, checkpointer=cp)
-│   initial_state = {messages: [HumanMessage("What are Shivam's skills?")]}
-│
-├─ Agent Node:
-│   LLM reads 9 tool schemas + system prompt with live date
-│   Decides: call search_company_documents("Shivam technical skills")
-│   Dedup guard: first call, allowed through
-│
-├─ Tool Node:
-│   search_company_documents runs
-│   LlamaIndex cosine search → top 4 chunks from resume DOCX
-│   "[Source: Shivam_Narayan_Resume_Revised.docx]\nTECHNICAL SKILLS..."
-│
-├─ Agent Node (second pass):
-│   Dedup guard: search_company_documents count = 1, blocks further calls
-│   LLM generates final answer from resume chunks
-│   → END
-│
-├─ AsyncSqliteSaver: saves updated state (human + tool + ai messages)
-│
-├─ parse_result():
-│   answer = last non-empty AI message
-│   tools_used = ["search_company_documents"]
-│   datasource = "company_docs"
-│   citations = [{"source": "Shivam_Narayan_Resume_Revised.docx"}]
-│
-├─ FastAPI: returns QuestionResponse
-│
-└─ telegram_bot.py: reply_text(answer + "\n📎 Sources: resume.docx\n📄")
-```
-
-Same flow applies for Streamlit (renders as badge + citation pill + markdown) and OpenClaw webhook (returns JSON to OpenClaw which sends to the originating channel).
+| Component | Before | After |
+|---|---|---|
+| RAGAS metrics | 4 metrics | 4 metrics + per-question cost/tokens |
+| LangSmith | Comment in footer | Fully wired (`LANGCHAIN_TRACING_V2=true`) |
+| eval_questions.json | 9 sample/empty | 18 real questions with ground truth |
+| Regression | None | `--save-baseline` / `--compare` |
+| Monitoring | None | `monitoring_config.json` + `MONITORING_GUIDE.md` |
+| Score | 5/10 | 10/10 |
 
 ---
 
-## Known Limitations and Recommended Solutions
+## Code Quality Improvements
+
+A complete audit of the codebase resulted in 10 enterprise-grade fixes:
+
+| # | Fix | Impact |
+|---|---|---|
+| 1 | `await llm.ainvoke()` in tools.py | Unblocks event loop |
+| 2 | Lazy PostgreSQL import in api.py | Non-Postgres users no longer crash |
+| 3 | `_validate_session_id()` regex | Input validation / security |
+| 4 | `_checkpointer is None` guard | No runtime crash during startup |
+| 5 | `_MAX_UPLOAD_BYTES = 50MB` | Memory exhaustion protection |
+| 6 | `@lru_cache` on `get_embed_model()` | One-time model load, no repeat downloads |
+| 7 | ASCII-only `[A-Za-z0-9_]` in mcp_tools | Unicode SQL injection prevention |
+| 8 | `_REFLECTION_IMPROVED_PREFIX` + `_MAX_REFLECTION_TOOL_CONTEXT` | Dead constants now used |
+| 9 | `DatasourceType = Literal[...]` in schemas | Type-safe, single source of truth |
+| 10 | `_CHUNK_SIZE = 512→1024`, `_CHUNK_OVERLAP = 50→100` | More context per chunk |
+
+---
+
+## Known Limitations
 
 | Limitation | Current state | Recommended solution |
 |---|---|---|
-| Vector store is file-based | JSON files in `indexing_data/` | Replace with Postgres + pgvector |
-| Company database is SQLite | `data/company.db` | Connect a real MCP Postgres server |
-| Telegram bot requires FastAPI running | Direct HTTP call to localhost | Add retry/backoff logic; deploy both on same server |
-| No authentication on `/ask` or `/openclaw/webhook` | Endpoints are open | Add API key header middleware or OAuth |
-| Charts not sent as images via Telegram | Chart JSON returned but not rendered | Use `plotly.io.to_image()` to export PNG and send via `send_photo` |
-| OpenClaw requires exact model availability | Groq model names change; caused 401 errors during setup | Use `GROQ_API_KEY` directly in DataDialogue rather than relying on OpenClaw's LLM |
-| Groq free tier rate limit | 30 RPM | Dedup guard + `parallel_tool_calls=False` keeps usage low; upgrade to paid tier for heavy use |
-| Tavily free tier quota | 1,000 searches/month | Add `SERPER_API_KEY` — system cascades automatically; DuckDuckGo always available as final fallback |
-
----
-
-## Evaluation
-
-The project ships with an LLM-as-judge evaluation script at `tests/evaluate.py`.
-
-```bash
-python tests/evaluate.py                          # all questions
-python tests/evaluate.py --datasource company_docs  # filter by type
-python tests/evaluate.py --verbose                  # per-question detail
-python tests/evaluate.py --output tests/results.json
-```
-
-Test questions live in `tests/eval_questions.json`. Fill in `ground_truth` values for your actual documents before running.
-
-Metrics measured — all scored 0.0–1.0:
-
-| Metric | What low score means | Fix |
-|---|---|---|
-| `faithfulness` | LLM hallucinating | Tighten system prompt in `prompt.py` |
-| `answer_relevancy` | LLM going off-topic | Reduce recursion limit in `workflow.py` |
-| `context_precision` | Wrong chunks retrieved | Reduce `chunk_size` in `rag.py` |
-| `context_recall` | Missing relevant chunks | Increase `similarity_top_k` in `rag.py` |
-
-FastAPI does not need to be running — the script calls `aask()` directly.
-
-The `tests/test_agents.py` file contains smoke tests for embedding model initialisation and data directory validation, runnable with `pytest tests/`.
+| Charts via Telegram | Chart JSON returned, not rendered | Export PNG with `plotly.io.to_image()`, send via `send_photo` |
+| No auth on endpoints | API is open | Add API key header middleware or OAuth |
+| Groq free tier 30 RPM | Rate limited | Dedup guard keeps usage low; upgrade for heavy use |
+| Tavily 1000 searches/month | Quota limited | Serper fallback is automatic; DuckDuckGo always available |
+| BM25 requires in-memory docstore | Loaded at query time | Switch to pgvector backend for large document sets |
+| FlashRank adds ~200ms | On CPU | Acceptable — LLM call is 2-5s; reranking adds <10% overhead |

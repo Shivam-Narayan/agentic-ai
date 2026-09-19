@@ -68,3 +68,22 @@ def test_upload_unsupported_format(client):
     )
     assert response.status_code == 400
     assert "Unsupported format" in response.json()["detail"]
+
+
+def test_invalid_session_id_rejected(client):
+    response = client.get("/sessions/bad@id/history")
+    assert response.status_code == 400
+    assert "Invalid session_id" in response.json()["detail"]
+
+
+def test_upload_rejects_oversized_file(client, monkeypatch):
+    import src.apps.api as api
+
+    monkeypatch.setattr(api, "_MAX_UPLOAD_BYTES", 8)
+    fake_file = io.BytesIO(b"0123456789")
+    response = client.post(
+        "/upload",
+        files={"files": ("tiny.txt", fake_file, "text/plain")},
+    )
+    assert response.status_code == 413
+    assert "File too large" in response.json()["detail"]

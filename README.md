@@ -151,7 +151,7 @@ docker compose up -d
 
 **2. Run the migration script (once):**
 ```bash
-python migrate_to_pgvector.py
+python src/scripts/migrate_to_pgvector.py
 ```
 
 This embeds all your documents and inserts them into pgvector, and creates the LangGraph checkpoint tables. Takes a few minutes depending on document count.

@@ -11,9 +11,12 @@ import asyncio
 import json
 import logging
 import os
+import uvicorn
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
+
+import re
 
 from fastapi import FastAPI, File, HTTPException, Request, UploadFile
 from fastapi.responses import JSONResponse, StreamingResponse
@@ -21,9 +24,12 @@ from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.errors import RateLimitExceeded
 from slowapi.util import get_remote_address
 
-from src.agent.config import DATA_DIR, STORAGE_DIR, POSTGRES_URL, USE_PGVECTOR, USE_POSTGRES_MEMORY, setup_logging
-from src.agent.rag import SUPPORTED_EXTENSIONS, _discover_documents, add_documents_to_index, rebuild_index
-from src.agent.schemas import Citation, QuestionRequest, QuestionResponse
+# AsyncPostgresSaver is imported lazily inside lifespan() so deployments
+# that don't use Postgres don't require langgraph-checkpoint-postgres installed.
+
+from src.core.config import DATA_DIR, STORAGE_DIR, POSTGRES_URL, USE_PGVECTOR, USE_POSTGRES_MEMORY, setup_logging
+from src.retrieval.rag import SUPPORTED_EXTENSIONS, discover_documents, add_documents_to_index, rebuild_index, get_embed_model
+from src.agent.schemas import Citation, QuestionRequest, QuestionResponse, UsageMetrics
 from src.agent.workflow import KnowledgeTransferAgent, aask
 
 setup_logging()
@@ -45,6 +51,38 @@ _RATE_ASK    = os.getenv("RATE_LIMIT_ASK",    "20/minute")
 _RATE_STREAM = os.getenv("RATE_LIMIT_STREAM", "20/minute")
 _RATE_UPLOAD = os.getenv("RATE_LIMIT_UPLOAD", "10/minute")
 
+# Maximum upload size per file (50 MB) — prevents memory exhaustion.
+_MAX_UPLOAD_BYTES: int = int(os.getenv("MAX_UPLOAD_BYTES", str(50 * 1024 * 1024)))
+
+# session_id validation — alphanumeric, hyphens, underscores, max 64 chars.
+_SESSION_ID_RE = re.compile(r"^[a-zA-Z0-9_-]{1,64}$")
+
+
+def _validate_session_id(session_id: str) -> str:
+    """Validate session_id format and raise HTTP 400 if invalid.
+
+    Prevents path traversal, SQL metacharacters, and oversized keys
+    from reaching the LangGraph checkpointer as thread_id.
+
+    Args:
+        session_id: Raw session_id string from the request.
+
+    Returns:
+        The validated session_id unchanged.
+
+    Raises:
+        HTTPException: 400 if the session_id fails validation.
+    """
+    if not _SESSION_ID_RE.match(session_id):
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Invalid session_id. Use 1–64 characters: "
+                "letters, digits, hyphens, or underscores only."
+            ),
+        )
+    return session_id
+
 limiter = Limiter(key_func=get_remote_address, default_limits=["60/minute"])
 
 _MEMORY_DIR = STORAGE_DIR / "memory_store"
@@ -63,13 +101,20 @@ async def lifespan(app: FastAPI):
     """
     global _checkpointer
 
+    # Pre-warm the embedding model to avoid cold-start latency on first query.
+    logger.info("Pre-warming embedding model...")
+    await asyncio.to_thread(get_embed_model().get_text_embedding, "warmup")
+    logger.info("Embedding model pre-warmed.")
+
     if USE_POSTGRES_MEMORY:
+        # Lazy import — only required when USE_POSTGRES_MEMORY=true so
+        # deployments without langgraph-checkpoint-postgres still start cleanly.
+        from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver  # noqa: PLC0415
         # ── PostgreSQL memory ───────────────────────────────────────────
         # AsyncPostgresSaver requires psycopg3 and langgraph-checkpoint-postgres.
         # cp.setup() creates the checkpoints / checkpoint_writes / checkpoint_blobs
         # tables automatically on first run — no manual SQL needed.
         try:
-            from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
 
             # AsyncPostgresSaver expects a plain psycopg3 URL (no +psycopg prefix)
             pg_url = POSTGRES_URL.replace("postgresql+psycopg://", "postgresql://")
@@ -131,13 +176,14 @@ app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 # ---------------------------------------------------------------------------
 
 @app.get("/", tags=["system"])
-async def root() -> dict:
+async def root(request: Request) -> dict[str, str]:
     """Root endpoint — confirms the API is running."""
+    base = str(request.base_url).rstrip("/")
     return {
-        "status": "running",
+        "status":  "running",
         "message": "KT Knowledge Transfer Assistant API is running successfully! 🚀",
-        "docs": "http://localhost:8000/docs",
-        "health": "http://localhost:8000/health",
+        "docs":    f"{base}/docs",
+        "health":  f"{base}/health",
     }
 
 
@@ -154,19 +200,14 @@ async def health() -> dict[str, Any]:
 @app.get("/stream", tags=["agent"])
 @limiter.limit(_RATE_STREAM)
 async def stream_question(request: Request, question: str, session_id: str = "default"):
-    """Stream a question to the KT agent using Server-Sent Events.
-
-    Each SSE event is a JSON object with a `type` field:
-    - `{"type": "status", "stage": "thinking"}` — agent started
-    - `{"type": "token",  "text": "..."}` — incremental answer token
-    - `{"type": "tool",   "name": "..."}` — tool being invoked
-    - `{"type": "done",   "payload": {...}}` — final structured result
-    - `{"type": "error",  "detail": "..."}` — unrecoverable error
-    """
+    """Stream a question to the KT agent using Server-Sent Events."""
     question = question.strip()
     if not question:
         raise HTTPException(status_code=400, detail="question must not be empty.")
+    if len(question) > 2000:
+        raise HTTPException(status_code=400, detail="question must be 2000 characters or fewer.")
 
+    session_id = _validate_session_id(session_id)
     logger.info("[stream][session=%s] question: %s", session_id, question)
 
     agent = KnowledgeTransferAgent(checkpointer=_checkpointer)
@@ -199,7 +240,7 @@ async def ask_question(request: Request, body: QuestionRequest) -> QuestionRespo
       Use the same session_id across requests to maintain context.
       Defaults to `"default"`.
     """
-    session_id = body.session_id or "default"
+    session_id = _validate_session_id(body.session_id or "default")
     question   = body.question.strip()
 
     logger.info("[session=%s] question: %s", session_id, question)
@@ -219,15 +260,32 @@ async def ask_question(request: Request, body: QuestionRequest) -> QuestionRespo
     tools_used = result.get("tools_used") or []
     raw_cits   = result.get("citations") or []
     chart_data = result.get("chart_data")
+    raw_usage  = result.get("usage") or {}
+    prompt_ver = result.get("prompt_version")
 
     citations = [
         Citation(source=c["source"], detail=c.get("detail", ""))
         for c in raw_cits
     ]
 
+    usage = UsageMetrics(
+        prompt_tokens=raw_usage.get("prompt_tokens", 0),
+        completion_tokens=raw_usage.get("completion_tokens", 0),
+        total_tokens=raw_usage.get("total_tokens", 0),
+        cost_usd=raw_usage.get("cost_usd", 0.0),
+        model=raw_usage.get("model", ""),
+        latency_ms=raw_usage.get("latency_ms", 0),
+        llm_calls=raw_usage.get("llm_calls", 0),
+    ) if raw_usage else None
+
     logger.info(
-        "[session=%s] datasource=%s tools=%s citations=%d chart=%s",
-        session_id, datasource, tools_used, len(citations), chart_data is not None,
+        "[session=%s] datasource=%s tools=%s citations=%d chart=%s "
+        "tokens=%d cost=$%.6f latency=%dms",
+        session_id, datasource, tools_used, len(citations),
+        chart_data is not None,
+        raw_usage.get("total_tokens", 0),
+        raw_usage.get("cost_usd", 0.0),
+        raw_usage.get("latency_ms", 0),
     )
 
     return QuestionResponse(
@@ -236,12 +294,19 @@ async def ask_question(request: Request, body: QuestionRequest) -> QuestionRespo
         tools_used=tools_used,
         citations=citations,
         chart_data=chart_data,
+        usage=usage,
+        prompt_version=prompt_ver,
     )
 
 
 @app.get("/sessions/{session_id}/history", tags=["memory"])
 async def get_session_history(session_id: str) -> dict[str, Any]:
-    """Return the conversation history for a session from the SQLite checkpointer."""
+    """Return the conversation history for a session from the checkpointer."""
+    session_id = _validate_session_id(session_id)
+
+    if _checkpointer is None:
+        return {"session_id": session_id, "turn_count": 0, "messages": []}
+
     try:
         config = {"configurable": {"thread_id": session_id}}
         checkpoint_tuple = await _checkpointer.aget_tuple(config)
@@ -265,6 +330,7 @@ async def get_session_history(session_id: str) -> dict[str, Any]:
 @app.delete("/sessions/{session_id}/history", tags=["memory"])
 async def clear_session_history(session_id: str) -> dict[str, str]:
     """Clear the conversation history for a session by writing an empty checkpoint."""
+    session_id = _validate_session_id(session_id)
     try:
         # Write a blank checkpoint to effectively reset the thread
         from langgraph.checkpoint.base import CheckpointMetadata
@@ -362,7 +428,14 @@ async def upload_documents(request: Request, files: list[UploadFile] = File(...)
             continue
 
         content = await upload.read()
-        dest    = DATA_DIR / upload.filename
+
+        if len(content) > _MAX_UPLOAD_BYTES:
+            raise HTTPException(
+                status_code=413,
+                detail=f"File too large: {upload.filename}",
+            )
+
+        dest = DATA_DIR / upload.filename
 
         if dest.exists():
             existing_hash = hashlib.md5(dest.read_bytes()).hexdigest()
@@ -436,7 +509,7 @@ async def upload_documents(request: Request, files: list[UploadFile] = File(...)
 @app.get("/documents", tags=["documents"])
 async def list_documents() -> dict[str, Any]:
     """List all documents currently in the data/ folder."""
-    docs = _discover_documents()
+    docs = discover_documents()  # public function — no leading underscore
     return {
         "count":     len(docs),
         "documents": [
@@ -451,5 +524,4 @@ async def list_documents() -> dict[str, Any]:
 
 
 if __name__ == "__main__":
-    import uvicorn
     uvicorn.run("app:app", host="0.0.0.0", port=8000, reload=True)
