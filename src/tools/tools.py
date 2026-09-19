@@ -37,12 +37,68 @@ logger = logging.getLogger(__name__)
 # Characters returned per document chunk in search / extract tools.
 MAX_CHUNK_CHARS: int = 700
 
+# Maximum number of document chunks passed to the LLM per tool call.
+# Applies to search_company_documents and extract_structured_data.
+MAX_CONTEXT_DOCS: int = 4
+
 # Maximum characters loaded for full-document summarisation.
 # Increase for longer documents — stays within most LLM context windows at 8000.
 MAX_SUMMARY_CHARS: int = 8_000
 
+# Maximum characters per chunk in extract_structured_data.
+# Kept consistent with MAX_CHUNK_CHARS to avoid sending more context than search.
+MAX_EXTRACT_CHARS: int = 700
+
 # Allowed chart types for generate_chart input validation.
 _VALID_CHART_TYPES: frozenset[str] = frozenset({"bar", "line", "pie", "scatter"})
+
+# Restricted builtins for LLM-generated Pandas code — no import/open/exec.
+_SAFE_EXEC_BUILTINS: dict[str, Any] = {
+    "True": True,
+    "False": False,
+    "None": None,
+    "abs": abs,
+    "min": min,
+    "max": max,
+    "sum": sum,
+    "len": len,
+    "range": range,
+    "enumerate": enumerate,
+    "zip": zip,
+    "map": map,
+    "filter": filter,
+    "round": round,
+    "sorted": sorted,
+    "reversed": reversed,
+    "list": list,
+    "dict": dict,
+    "str": str,
+    "int": int,
+    "float": float,
+    "bool": bool,
+    "tuple": tuple,
+    "set": set,
+    "frozenset": frozenset,
+    "isinstance": isinstance,
+}
+
+# Pandas / DataFrame methods that can touch the filesystem or network.
+_BLOCKED_PANDAS_IO: frozenset[str] = frozenset({
+    "read_csv", "read_table", "read_fwf", "read_clipboard", "read_excel",
+    "read_json", "read_html", "read_xml", "read_hdf", "read_feather",
+    "read_parquet", "read_orc", "read_sas", "read_spss", "read_sql",
+    "read_sql_table", "read_sql_query", "read_gbq", "read_stata", "read_pickle",
+    "to_csv", "to_excel", "to_html", "to_xml", "to_hdf", "to_feather",
+    "to_parquet", "to_orc", "to_sql", "to_gbq", "to_stata", "to_pickle",
+    "to_clipboard",
+})
+
+_BLOCKED_CALL_NAMES: frozenset[str] = frozenset({
+    "open", "exec", "eval", "compile", "__import__", "getattr", "setattr",
+    "delattr", "globals", "locals", "vars", "input", "breakpoint", "type",
+    "classmethod", "staticmethod", "super", "memoryview", "print",
+    "help", "exit", "quit", "copyright", "credits", "license",
+})
 
 
 # ---------------------------------------------------------------------------
@@ -70,7 +126,7 @@ async def search_company_documents(query: str) -> str:
         return EMPTY_COMPANY_SEARCH_RESULT
 
     snippets: list[str] = []
-    for doc in documents[:4]:
+    for doc in documents[:MAX_CONTEXT_DOCS]:
         text = " ".join(doc.page_content.split())
         if len(text) > MAX_CHUNK_CHARS:
             text = text[:MAX_CHUNK_CHARS].rsplit(" ", 1)[0] + "..."
@@ -191,7 +247,7 @@ async def extract_structured_data(document_query: str, fields: str) -> str:
     if not documents:
         return json.dumps({"error": "No relevant documents found for the given query."})
 
-    context = "\n\n".join(doc.page_content[:800] for doc in documents[:4])
+    context = "\n\n".join(doc.page_content[:MAX_EXTRACT_CHARS] for doc in documents[:MAX_CONTEXT_DOCS])
     field_list = [f.strip() for f in fields.split(",") if f.strip()]
     field_template = json.dumps(
         {f: "<extracted value or null>" for f in field_list},
@@ -400,8 +456,19 @@ async def generate_chart(data_json: str, chart_type: str, title: str) -> str:
 # 7. analyse_csv
 # ---------------------------------------------------------------------------
 
-def _basic_csv_context(df, question: str) -> str:
-    """Fallback basic context if LLM code generation fails."""
+def _basic_csv_context(df: "pd.DataFrame", question: str) -> str:
+    """Return a basic schema + statistics summary when LLM code generation fails.
+
+    Used as a fallback in analyse_csv when the LLM is unavailable or its
+    generated code fails to execute.
+
+    Args:
+        df:       Loaded pandas DataFrame.
+        question: Original user question (unused but kept for future use).
+
+    Returns:
+        Multi-line string with shape, column names, and numeric statistics.
+    """
     import io
     lines: list[str] = []
     lines.append(f"Shape: {df.shape[0]:,} rows, {df.shape[1]} columns")
@@ -414,6 +481,74 @@ def _basic_csv_context(df, question: str) -> str:
         lines.append(f"\nNumeric summary:\n{buf.getvalue()}")
         
     return "\n".join(lines)
+
+
+def _validate_generated_pandas_code(code: str) -> ast.Module:
+    """Reject LLM-generated code that can reach the filesystem or interpreter.
+
+    Allows Pandas analytics on the pre-loaded `df` while blocking imports,
+    dunder access, file I/O methods, and dangerous builtins.
+
+    Raises:
+        ValueError: if the code uses a disallowed construct.
+    """
+    try:
+        tree = ast.parse(code, mode="exec")
+    except SyntaxError as exc:
+        raise ValueError(f"Generated code is not valid Python: {exc}") from exc
+
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.Import, ast.ImportFrom)):
+            raise ValueError("Imports are not allowed in generated analysis code.")
+        if isinstance(node, (ast.Global, ast.Nonlocal)):
+            raise ValueError("global/nonlocal is not allowed in generated analysis code.")
+        if isinstance(node, ast.Attribute):
+            if node.attr.startswith("_") or node.attr in _BLOCKED_PANDAS_IO:
+                raise ValueError(f"Access to '{node.attr}' is not allowed.")
+        if isinstance(node, ast.Name) and node.id in _BLOCKED_CALL_NAMES:
+            raise ValueError(f"Use of '{node.id}' is not allowed.")
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
+            if node.func.id in _BLOCKED_CALL_NAMES:
+                raise ValueError(f"Call to '{node.func.id}' is not allowed.")
+    return tree
+
+
+class _SafePandas:
+    """Proxy around pandas that hides filesystem and network I/O helpers."""
+
+    def __init__(self, pandas_module: Any) -> None:
+        object.__setattr__(self, "_pandas", pandas_module)
+
+    def __getattr__(self, name: str) -> Any:
+        if name.startswith("_") or name in _BLOCKED_PANDAS_IO or name == "io":
+            raise AttributeError(f"pandas.{name} is disabled in analyse_csv.")
+        return getattr(object.__getattribute__(self, "_pandas"), name)
+
+
+def _exec_generated_pandas(code: str, df: Any, pd_module: Any) -> Any:
+    """Compile and run validated Pandas code in a restricted namespace.
+
+    Args:
+        code:      LLM-generated Python (must assign `result`).
+        df:        Pre-loaded DataFrame — the only dataset the code may use.
+        pd_module: The pandas module, wrapped to hide I/O helpers.
+
+    Returns:
+        The value assigned to `result`.
+
+    Raises:
+        ValueError: if the code is unsafe or does not assign `result`.
+    """
+    tree = _validate_generated_pandas_code(code)
+    compiled = compile(tree, "<analyse_csv>", "exec")
+    local_vars: dict[str, Any] = {
+        "df": df,
+        "pd": _SafePandas(pd_module),
+    }
+    exec(compiled, {"__builtins__": _SAFE_EXEC_BUILTINS}, local_vars)  # noqa: S102
+    if "result" not in local_vars:
+        raise ValueError("Generated analysis code did not assign to 'result'.")
+    return local_vars["result"]
 
 
 @tool
@@ -468,7 +603,7 @@ async def analyse_csv(filename: str, question: str) -> str:
         return f"'{filename}' is empty — no data to analyse."
 
     try:
-        from .chains import get_llm
+        from src.agent.chains import get_llm
         from langchain_core.messages import HumanMessage
         llm = get_llm()
     except Exception as exc:
@@ -515,7 +650,7 @@ result = trend.to_json(orient='records')
 """
 
     try:
-        response = llm.invoke([HumanMessage(content=prompt)])
+        response = await llm.ainvoke([HumanMessage(content=prompt)])
         code = response.content
 
         # Extract code from markdown
@@ -524,22 +659,19 @@ result = trend.to_json(orient='records')
         elif "```" in code:
             code = code.split("```")[1].split("```")[0].strip()
 
-        # Execute code in restricted local environment
-        local_vars = {"df": df, "pd": pd}
-        exec(code, {}, local_vars)
-
-        if "result" in local_vars:
-            ans = local_vars["result"]
+        try:
+            ans = _exec_generated_pandas(code, df, pd)
+        except ValueError as exc:
             return (
-                f"[CSV Analysis Result for '{candidate.name}']\n"
-                f"Question: {question}\n\n"
-                f"{ans}"
-            )
-        else:
-            return (
-                f"Error: Generated analysis code did not assign to 'result' variable.\n"
+                f"Error: Generated analysis code was rejected or incomplete: {exc}\n"
                 f"Generated code:\n{code}"
             )
+
+        return (
+            f"[CSV Analysis Result for '{candidate.name}']\n"
+            f"Question: {question}\n\n"
+            f"{ans}"
+        )
 
     except Exception as exc:
         logger.exception("Error executing generated Pandas code in analyse_csv.")

@@ -30,6 +30,11 @@ def test_sanitise_identifier_invalid():
         _sanitise_identifier("users table")
     with pytest.raises(ValueError):
         _sanitise_identifier("users'--")
+    # \w would allow Unicode letters; identifiers must be ASCII-only
+    with pytest.raises(ValueError):
+        _sanitise_identifier("café")
+    with pytest.raises(ValueError):
+        _sanitise_identifier("usersα")
 
 
 def test_is_blocked_statement():
@@ -164,3 +169,35 @@ async def test_query_company_database_blocks_stacked():
 async def test_query_company_database_blocks_excessive_limit():
     res = await query_company_database.ainvoke({"sql": f"SELECT * FROM users LIMIT {MAX_ROWS + 1000}"})
     assert "exceeds maximum" in res or "rejected" in res
+
+
+def test_generated_pandas_code_allows_aggregation():
+    pandas = pytest.importorskip("pandas")
+    from src.tools.tools import _exec_generated_pandas
+
+    df = pandas.DataFrame({"Department": ["A", "A", "B"], "Absenteeism": [1, 3, 2]})
+    result = _exec_generated_pandas(
+        "result = df.groupby('Department')['Absenteeism'].mean().to_dict()",
+        df,
+        pandas,
+    )
+    assert result["A"] == 2.0
+    assert result["B"] == 2.0
+
+
+def test_generated_pandas_code_blocks_filesystem_io():
+    pandas = pytest.importorskip("pandas")
+    from src.tools.tools import _exec_generated_pandas, _validate_generated_pandas_code
+
+    with pytest.raises(ValueError, match="not allowed"):
+        _validate_generated_pandas_code("result = pd.read_csv('/etc/passwd')")
+    with pytest.raises(ValueError, match="not allowed"):
+        _validate_generated_pandas_code("result = df.to_csv('/tmp/out.csv')")
+    with pytest.raises(ValueError, match="Imports"):
+        _validate_generated_pandas_code("import os\nresult = os.listdir('.')")
+    with pytest.raises(ValueError, match="not allowed"):
+        _validate_generated_pandas_code("result = open('/etc/passwd').read()")
+
+    df = pandas.DataFrame({"x": [1]})
+    with pytest.raises(ValueError):
+        _exec_generated_pandas("result = pd.read_csv('/etc/passwd')", df, pandas)

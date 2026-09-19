@@ -32,6 +32,12 @@ USE_POSTGRES_MEMORY:  bool = os.getenv("USE_POSTGRES_MEMORY",  "false").lower() 
 # Works with both the JSON and pgvector backends.
 USE_HYBRID_SEARCH:    bool = os.getenv("USE_HYBRID_SEARCH",    "false").lower() == "true"
 
+# Set to true to enable FlashRank cross-encoder reranking after retrieval.
+# Reranking re-scores each retrieved chunk against the full query using a
+# small local cross-encoder model — no API key or GPU required.
+# Requires: pip install llama-index-postprocessor-rankgpt-rerank flashrank
+USE_RERANKER:         bool = os.getenv("USE_RERANKER",         "false").lower() == "true"
+
 
 def setup_logging() -> None:
     logging.basicConfig(
