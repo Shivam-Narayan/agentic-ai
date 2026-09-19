@@ -14,18 +14,17 @@ The key design principle: **there is no hard-coded routing**. The LLM reads the 
 ┌──────────────────────────────────────────────────────────────────────────┐
 │                          ACCESS CHANNELS                                 │
 │                                                                          │
-│  ┌──────────────────────┐   ┌─────────────────┐   ┌──────────────────┐  │
-│  │   Streamlit Chat UI  │   │  Telegram Bot   │   │  OpenClaw        │  │
-│  │  (streamlit_ui.py)   │   │ (telegram_bot.py│   │  Webhook         │  │
-│  │  http://localhost    │   │  @your_bot      │   │  (any channel)   │  │
-│  │  :8501               │   │                 │   │                  │  │
-│  └──────────┬───────────┘   └────────┬────────┘   └────────┬─────────┘  │
-└─────────────│────────────────────────│────────────────────│─────────────┘
-              │ GET /stream (SSE)      │ POST /ask           │ POST /openclaw
-              │ session_id=<uuid>      │ session_id=         │ /webhook
-              │ (token-by-token)       │ telegram_<user_id>  │ session_id=
-              │                        │                     │ <oc_session>
-              └────────────────────────┴─────────────────────┘
+│  ┌──────────────────────┐   ┌──────────────────────────────────────────┐ │
+│  │   Streamlit Chat UI  │   │  OpenClaw Webhook                        │ │
+│  │  (streamlit_ui.py)   │   │  (any channel: WhatsApp, Discord, Slack) │ │
+│  │  http://localhost    │   │                                          │ │
+│  │  :8501               │   │                                          │ │
+│  └──────────┬───────────┘   └────────────────────┬─────────────────────┘ │
+└─────────────│────────────────────────────────────│────────────────────────┘
+              │ GET /stream (SSE)                  │ POST /openclaw/webhook
+              │ session_id=<uuid>                  │ session_id=<oc_session>
+              │ (token-by-token)                   │
+              └────────────────────────────────────┘
                                        │
                                        ▼
 ┌──────────────────────────────────────────────────────────────────────────┐
@@ -161,17 +160,7 @@ Browser → streamlit_ui.py
 - Interactive Plotly charts inline on `done` event
 - Datasource badges: 📄 🌐 🧮 📊 🗄️
 
-### Channel 2 — Telegram Bot
-
-```
-Telegram user → python-telegram-bot polling
-             → telegram_bot.py handle_message()
-             → POST /ask {question, session_id=telegram_<user_id>}
-             → aask() → LangGraph agent
-             → reply with answer + citations + tool emoji
-```
-
-### Channel 3 — OpenClaw Webhook
+### Channel 2 — OpenClaw Webhook
 
 ```
 WhatsApp / Discord / Slack
@@ -373,7 +362,6 @@ Optional Postgres backends (set `USE_PGVECTOR=true`, `USE_POSTGRES_MEMORY=true`)
 | **FlashRankRerank** | Local cross-encoder reranking (no API key, no GPU) |
 | **FastAPI** | Async HTTP API with SSE streaming |
 | **Streamlit** | Web chat UI — live token streaming, Plotly, upload |
-| **python-telegram-bot** | Telegram channel |
 | **Groq** | Default LLM — `openai/gpt-oss-120b`, streaming |
 | **Google Gemini** | Alternative LLM — `gemini-1.5-flash`, streaming |
 | **Cohere** | Alternative LLM — `command-r-plus`, streaming |

@@ -579,7 +579,6 @@ A complete audit of the codebase resulted in 10 enterprise-grade fixes:
 
 | Limitation | Current state | Recommended solution |
 |---|---|---|
-| Charts via Telegram | Chart JSON returned, not rendered | Export PNG with `plotly.io.to_image()`, send via `send_photo` |
 | No auth on endpoints | API is open | Add API key header middleware or OAuth |
 | Groq free tier 30 RPM | Rate limited | Dedup guard keeps usage low; upgrade for heavy use |
 | Tavily 1000 searches/month | Quota limited | Serper fallback is automatic; DuckDuckGo always available |

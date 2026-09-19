@@ -50,10 +50,11 @@ import json
 import logging
 import re
 import threading
+import time
 import uuid
 from contextlib import contextmanager
 from contextvars import ContextVar
-from typing import Annotated, Any, AsyncIterator, Literal
+from typing import Annotated, Any, AsyncGenerator, AsyncIterator, Literal
 from weakref import WeakKeyDictionary
 
 from langchain_core.language_models.chat_models import BaseChatModel
@@ -935,7 +936,7 @@ class KnowledgeTransferAgent:
         question: str,
         session_id: str = "default",
         history: list[BaseMessage] | None = None,
-    ) -> AsyncIterator[dict[str, Any]]:
+    ) -> AsyncGenerator[dict[str, Any], None]:
         """Yield SSE-ready events while the graph runs.
 
         Event types:
@@ -950,8 +951,7 @@ class KnowledgeTransferAgent:
         """
         yield {"type": "status", "stage": "thinking"}
 
-        import time as _time
-        start_ms = int(_time.monotonic() * 1000)
+        start_ms = int(time.monotonic() * 1000)
 
         async with mcp_server_context() as mcp_tools:
             all_tools = tuple(LOCAL_TOOLS) + tuple(mcp_tools)
@@ -1033,7 +1033,7 @@ class KnowledgeTransferAgent:
                     yield {"type": "reflection", "status": ref_status}
 
                 # Build usage metrics and attach to the done payload
-                latency_ms = int(_time.monotonic() * 1000) - start_ms
+                latency_ms = int(time.monotonic() * 1000) - start_ms
                 metrics = tracker.to_metrics(latency_ms=latency_ms)
                 metrics.log_summary(session_id)
 
