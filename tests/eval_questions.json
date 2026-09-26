@@ -1,65 +1,128 @@
 [
   {
     "id": "doc_001",
-    "question": "What is the KT agent project about?",
-    "ground_truth": "The KT agent is a knowledge transfer assistant that answers questions about company documents, databases, and the web using an agentic AI system.",
+    "question": "What is DataDialogue and what does it do?",
+    "ground_truth": "DataDialogue is a conversational AI agent that answers questions about company files, databases, and the live web with real-time streaming responses. It is built with LangGraph, LlamaIndex, FastAPI, and Streamlit.",
     "datasource": "company_docs",
-    "notes": "Basic project overview from KT design document"
+    "notes": "Project overview from README"
   },
   {
     "id": "doc_002",
-    "question": "What tech stack is used in the Knowledge Transfer Agent?",
-    "ground_truth": "The project uses LangGraph, LlamaIndex, FastAPI, Streamlit, and supports multiple LLMs including Groq, Google Gemini, and Cohere.",
+    "question": "What tech stack is used in DataDialogue?",
+    "ground_truth": "DataDialogue is built with LangGraph for agentic workflows, LlamaIndex for document indexing, FastAPI for the backend API, and Streamlit for the web UI. It supports multiple LLMs including Groq and Google Gemini.",
     "datasource": "company_docs",
-    "notes": "Tech stack question from KT document"
+    "notes": "Tech stack from README"
   },
   {
     "id": "doc_003",
-    "question": "Summarise the Knowledge Transfer Agent Design Plans document",
-    "ground_truth": "The document describes an agentic AI system for knowledge transfer, covering architecture, tools, memory management, and deployment plans.",
+    "question": "What tools does the DataDialogue agent have access to?",
+    "ground_truth": "The agent can read uploaded PDF/DOCX documents, query company databases, run calculations, generate Plotly charts, and search the live web using Tavily, Serper, or DuckDuckGo.",
     "datasource": "company_docs",
-    "notes": "Full document summary — update ground_truth after reading the actual PDF"
+    "notes": "Tools listed in README table"
   },
   {
     "id": "doc_004",
-    "question": "What are Shivam Narayan's technical skills?",
-    "ground_truth": "Python, FastAPI, LangChain, LangGraph, LlamaIndex, SQL, and AI/ML development.",
+    "question": "How do I set up DataDialogue for the first time?",
+    "ground_truth": "Install dependencies with pip install -r requirements.txt, create a .env file with at least one LLM API key (GROQ_API_KEY or GOOGLE_API_KEY), optionally add web search keys, index documents with python -m src.agent.rag, then run the API with uvicorn and the UI with streamlit.",
     "datasource": "company_docs",
-    "notes": "Resume document — update ground_truth with actual skills from the DOCX"
+    "notes": "Quick start from README"
+  },
+  {
+    "id": "doc_005",
+    "question": "What evaluation metrics does DataDialogue use?",
+    "ground_truth": "DataDialogue uses four RAGAS metrics: faithfulness (no hallucination), answer relevancy (addresses the question), context precision (retrieved chunks are relevant), and context recall (all relevant information retrieved).",
+    "datasource": "company_docs",
+    "notes": "Evaluation section from README"
   },
   {
     "id": "db_001",
-    "question": "List all tables in the database",
-    "ground_truth": "The database contains tables available in company.db.",
+    "question": "What database tables are available in the PostgreSQL schema?",
+    "ground_truth": "The PostgreSQL schema includes the document_embeddings table with columns id, text, metadata, and embedding (vector 384 dimensions), along with LangGraph checkpoint tables created automatically.",
     "datasource": "database",
-    "notes": "Update ground_truth with actual table names from your company.db"
+    "notes": "Based on init.sql schema"
+  },
+  {
+    "id": "db_002",
+    "question": "What is the pgvector extension used for?",
+    "ground_truth": "The pgvector extension enables vector similarity search in PostgreSQL by storing high-dimensional embeddings and providing fast approximate nearest-neighbor search using IVFFlat indexing.",
+    "datasource": "database",
+    "notes": "Database architecture question"
   },
   {
     "id": "calc_001",
     "question": "What is 15% of 85000?",
-    "ground_truth": "15% of 85000 is 12750.",
+    "ground_truth": "12750",
     "datasource": "calculation",
     "notes": "Pure calculation — deterministic"
   },
   {
     "id": "calc_002",
     "question": "Calculate (250 + 300) * 12 / 100",
-    "ground_truth": "(250 + 300) * 12 / 100 = 66.0",
+    "ground_truth": "66.0",
     "datasource": "calculation",
     "notes": "Pure calculation — deterministic"
   },
   {
+    "id": "calc_003",
+    "question": "If a product costs $120 and is discounted by 25%, what is the final price?",
+    "ground_truth": "90.0",
+    "datasource": "calculation",
+    "notes": "Practical calculation scenario"
+  },
+  {
     "id": "llm_001",
     "question": "What is a vector database?",
-    "ground_truth": "A vector database stores data as high-dimensional vectors and enables fast similarity search, commonly used in AI applications for semantic search and RAG systems.",
+    "ground_truth": "A vector database stores data as high-dimensional vectors and enables fast similarity search using distance metrics like cosine similarity. It is commonly used in AI applications for semantic search, recommendation systems, and RAG pipelines.",
     "datasource": "direct_llm",
-    "notes": "General knowledge — no tools needed"
+    "notes": "General AI/ML knowledge"
   },
   {
     "id": "llm_002",
-    "question": "What is the difference between SQL and NoSQL?",
-    "ground_truth": "SQL databases are relational and use structured schemas with tables, while NoSQL databases are non-relational and support flexible schemas including documents, key-value pairs, and graphs.",
+    "question": "Explain the difference between SQL and NoSQL databases",
+    "ground_truth": "SQL databases are relational with structured schemas, tables, and ACID transactions, using SQL for queries. NoSQL databases are non-relational with flexible schemas, supporting documents, key-value pairs, graphs, or wide-column stores, optimized for horizontal scaling and unstructured data.",
     "datasource": "direct_llm",
-    "notes": "General knowledge — no tools needed"
+    "notes": "Database fundamentals"
+  },
+  {
+    "id": "llm_003",
+    "question": "What is RAG in AI systems?",
+    "ground_truth": "RAG (Retrieval-Augmented Generation) combines information retrieval with language generation. It retrieves relevant documents from a knowledge base and uses them as context for the LLM to generate accurate, grounded answers, reducing hallucinations.",
+    "datasource": "direct_llm",
+    "notes": "Core AI concept"
+  },
+  {
+    "id": "web_001",
+    "question": "What is the current USD to INR exchange rate?",
+    "ground_truth": "The current USD to INR exchange rate is approximately 83-84 INR per USD (as of 2024).",
+    "datasource": "web_search",
+    "notes": "Live data — ground truth is approximate"
+  },
+  {
+    "id": "web_002",
+    "question": "What are the latest features in Python 3.12?",
+    "ground_truth": "Python 3.12 includes improved error messages with better tracebacks, per-interpreter GIL for better subinterpreter support, faster comprehensions, type parameter syntax for generics, and performance improvements.",
+    "datasource": "web_search",
+    "notes": "Recent tech information"
+  },
+  {
+    "id": "multi_001",
+    "question": "Compare LangGraph and LangChain",
+    "ground_truth": "LangChain is a framework for building LLM applications with chains and tools. LangGraph extends LangChain with stateful, graph-based workflows for complex agentic systems with cycles, conditional routing, and checkpointing for human-in-the-loop scenarios.",
+    "datasource": "direct_llm",
+    "notes": "Framework comparison — may use web search as fallback"
+  },
+  {
+    "id": "multi_002",
+    "question": "How does DataDialogue handle document indexing?",
+    "ground_truth": "DataDialogue uses LlamaIndex to chunk documents, generates embeddings with BAAI/bge-small-en-v1.5, and stores them in either pgvector (PostgreSQL) or JSON-based vector storage. Documents are indexed by running python -m src.agent.rag.",
+    "datasource": "company_docs",
+    "notes": "Technical architecture — combines docs and general knowledge"
+  },
+  {
+    "id": "edge_001",
+    "question": "What happens if I ask a question in Hindi?",
+    "ground_truth": "The agent should attempt to understand and respond in Hindi if the LLM supports multilingual capabilities, though performance may vary. The system is primarily optimized for English queries.",
+    "datasource": "direct_llm",
+    "notes": "Edge case — multilingual handling"
   }
 ]

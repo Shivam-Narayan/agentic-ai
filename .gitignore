@@ -48,6 +48,11 @@ logs/
 htmlcov/
 .tox/
 
+# Evaluation results and baselines (commit baseline, ignore dated results)
+tests/eval_*.json
+!tests/eval_baseline.json
+!tests/eval_questions.json
+
 # ── Type checking ─────────────────────────────────────────────────────────
 .mypy_cache/
 .pytype/

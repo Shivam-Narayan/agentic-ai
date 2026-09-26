@@ -152,9 +152,9 @@ def _sanitise_identifier(name: str) -> str:
         ValueError: if the name contains any other characters, preventing
                     SQL injection via PRAGMA or unparameterised table names.
     """
-    if not re.match(r"^\w+$", name):
+    if not re.match(r"^[A-Za-z0-9_]+$", name):
         raise ValueError(
-            f"Invalid identifier {name!r} — only letters, digits, "
+            f"Invalid identifier {name!r} — only ASCII letters, digits, "
             "and underscores are allowed."
         )
     return name

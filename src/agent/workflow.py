@@ -50,10 +50,11 @@ import json
 import logging
 import re
 import threading
+import time
 import uuid
 from contextlib import contextmanager
 from contextvars import ContextVar
-from typing import Annotated, Any, AsyncIterator, Literal
+from typing import Annotated, Any, AsyncGenerator, AsyncIterator, Literal
 from weakref import WeakKeyDictionary
 
 from langchain_core.language_models.chat_models import BaseChatModel
@@ -87,10 +88,12 @@ from src.tools.tools import (
 from .chains import get_llm
 from .parser import parse_result, serialize_parse_result
 from .prompt import (
+    PROMPT_VERSION,
     build_planner_prompt,
     build_reflection_prompt,
     build_system_prompt,
 )
+from .telemetry import UsageTracker
 
 logger = logging.getLogger(__name__)
 
@@ -126,6 +129,11 @@ COMPLEX_KEYWORDS = (
 # Questions shorter than this word count skip the planner even with a keyword.
 MIN_WORDS_FOR_PLANNER: int = 8
 
+# Maximum characters of tool output passed to the reflection prompt.
+# Head + tail are preserved so the reflector sees both the start and end
+# of long tool results without exceeding the LLM context window.
+_MAX_REFLECTION_TOOL_CONTEXT: int = 1500
+
 # Static tool list — tuple prevents accidental mutation
 LOCAL_TOOLS: tuple[BaseTool, ...] = (
     search_company_documents,
@@ -140,6 +148,7 @@ LOCAL_TOOLS: tuple[BaseTool, ...] = (
 # Per-request injection. Not stored on the compiled graph or checkpointer config.
 _bound_llm_var: ContextVar[Any] = ContextVar("kt_bound_llm")
 _tools_var: ContextVar[tuple[BaseTool, ...]] = ContextVar("kt_tools")
+_usage_tracker_var: ContextVar[UsageTracker | None] = ContextVar("kt_usage_tracker", default=None)
 
 _graph_lock = threading.Lock()
 _graph_without_checkpointer: Any = None
@@ -151,18 +160,20 @@ _graphs_by_checkpointer: WeakKeyDictionary[Any, Any] = WeakKeyDictionary()
 # ===========================================================================
 
 class AgentState(TypedDict):
-    """Extended state that carries plan and reflection outcome alongside messages.
-    
+    """Extended state that carries plan, reflection, usage metrics, and messages.
+
     Fields:
-      - messages: Full conversation (uses add_messages reducer)
-      - plan: List of step strings from planner node (Pattern 4)
+      - messages:        Full conversation (uses add_messages reducer)
+      - plan:            List of step strings from planner node (Pattern 4)
       - reflection_status: "pass", "improved", or "" (Pattern 1)
-      - is_complex: True if planner ran for this request
+      - is_complex:      True if planner ran for this request
+      - prompt_version:  Prompt version tag at request time (for traceability)
     """
-    messages: Annotated[list[BaseMessage], add_messages]
-    plan: list[str]
+    messages:          Annotated[list[BaseMessage], add_messages]
+    plan:              list[str]
     reflection_status: str
-    is_complex: bool
+    is_complex:        bool
+    prompt_version:    str
 
 
 # ===========================================================================
@@ -244,17 +255,6 @@ def _get_previous_tool_calls(messages: list[BaseMessage]) -> set[str]:
     return used
 
 
-def _first_search_had_results(messages: list[BaseMessage]) -> bool:
-    """True if search_company_documents already returned a non-empty hit."""
-    for msg in messages:
-        if msg.type != "tool" or msg.name != "search_company_documents":
-            continue
-        text = str(msg.content or "").strip()
-        if text and text != EMPTY_COMPANY_SEARCH_RESULT:
-            return True
-    return False
-
-
 def _is_redundant_tool_call(
     name: str,
     args: dict[str, Any],
@@ -262,11 +262,7 @@ def _is_redundant_tool_call(
 ) -> bool:
     """True if this call should be skipped and answered from prior results."""
     key = _make_tool_call_key(name, args)
-    if key in _get_previous_tool_calls(turn_messages):
-        return True
-    return name == "search_company_documents" and _first_search_had_results(
-        turn_messages
-    )
+    return key in _get_previous_tool_calls(turn_messages)
 
 
 def _synthetic_tool_message(name: str, tool_call_id: str, content: str) -> ToolMessage:
@@ -326,8 +322,11 @@ async def _astream_complete(
 async def _acall_plain(
     prompt: str,
     config: RunnableConfig | None = None,
-) -> str:
-    """Call the base LLM (no tools bound) and return the response as plain text."""
+) -> tuple[str, Any]:
+    """Call the base LLM (no tools bound) and return (text, raw_response).
+
+    Returning the raw response lets callers record token usage via UsageTracker.
+    """
     base_llm = get_llm()
     response = await asyncio.wait_for(
         base_llm.ainvoke([HumanMessage(content=prompt)], config=config),
@@ -338,7 +337,7 @@ async def _acall_plain(
         content = " ".join(
             str(b.get("text", "") if isinstance(b, dict) else b) for b in content
         )
-    return str(content).strip()
+    return str(content).strip(), response
 
 
 # ===========================================================================
@@ -366,14 +365,19 @@ async def planner_node(
 
     logger.info("planner_node: generating plan for %.80s…", question)
     try:
-        raw_plan = await _acall_plain(build_planner_prompt(question), config=config)
+        raw_plan, raw_response = await _acall_plain(
+            build_planner_prompt(question), config=config
+        )
+        # Record planner token usage
+        tracker: UsageTracker | None = _usage_tracker_var.get(None)
+        if tracker is not None:
+            tracker.record(raw_response)
     except asyncio.TimeoutError:
         logger.warning("planner_node timed out — skipping to direct agent")
         return {"plan": [], "is_complex": False}
     except Exception:
         logger.exception("planner_node failed — skipping")
         return {"plan": [], "is_complex": False}
-
     # Parse the numbered list into individual step strings.
     steps: list[str] = []
     for line in raw_plan.splitlines():
@@ -420,6 +424,12 @@ async def agent_node(
     ] + list(state["messages"])
 
     response = await _astream_complete(bound_llm, messages_with_system, config=config)
+
+    # Token tracking — record usage from this LLM call
+    tracker: UsageTracker | None = _usage_tracker_var.get(None)
+    if tracker is not None:
+        tracker.record(response)
+
     return {"messages": [response]}
 
 
@@ -523,8 +533,10 @@ async def _tools_node_runtime(
 # Pattern 1 — Reflection node
 # ---------------------------------------------------------------------------
 
-_REFLECTION_IMPROVED_PREFIX = "REFLECTION_IMPROVED:"
-_REFLECTION_PASS_PREFIX = "REFLECTION_PASS:"
+# Reflection protocol prefix strings — single source of truth used by
+# both reflection_node (prompt building) and _extract_reflection_content (parsing).
+_REFLECTION_IMPROVED_PREFIX: str = "REFLECTION_IMPROVED:"
+_REFLECTION_PASS_PREFIX:     str = "REFLECTION_PASS:"
 
 
 def _extract_reflection_content(raw: str) -> tuple[str, str]:
@@ -534,11 +546,11 @@ def _extract_reflection_content(raw: str) -> tuple[str, str]:
         (status, answer) where status is "improved", "pass", or "pass" (fallback).
     """
     stripped = raw.strip()
-    if stripped.upper().startswith("REFLECTION_IMPROVED:"):
-        answer = stripped[len("REFLECTION_IMPROVED:"):].strip()
+    if stripped.upper().startswith(_REFLECTION_IMPROVED_PREFIX):
+        answer = stripped[len(_REFLECTION_IMPROVED_PREFIX):].strip()
         return "improved", answer
-    if stripped.upper().startswith("REFLECTION_PASS:"):
-        answer = stripped[len("REFLECTION_PASS:"):].strip()
+    if stripped.upper().startswith(_REFLECTION_PASS_PREFIX):
+        answer = stripped[len(_REFLECTION_PASS_PREFIX):].strip()
         return "pass", answer
     # Fallback: the LLM didn't follow the protocol — keep the original draft.
     logger.warning(
@@ -582,15 +594,13 @@ async def reflection_node(
 
     # Collect tool output context so the reflector can judge completeness.
     tool_context_parts: list[str] = []
-    _MAX_TOOL_CONTEXT = 1500
     for msg in messages:
         if msg.type == "tool" and msg.content:
             content_str = str(msg.content).strip()
             if content_str and content_str != REDUNDANT_TOOL_RESULT:
                 tool_name = getattr(msg, "name", "tool")
-                # Smart truncation: keep head + tail for context completeness.
-                if len(content_str) > _MAX_TOOL_CONTEXT:
-                    half = _MAX_TOOL_CONTEXT // 2
+                if len(content_str) > _MAX_REFLECTION_TOOL_CONTEXT:
+                    half = _MAX_REFLECTION_TOOL_CONTEXT // 2
                     snippet = content_str[:half] + "\n...[truncated]...\n" + content_str[-half:]
                 else:
                     snippet = content_str
@@ -599,10 +609,14 @@ async def reflection_node(
 
     logger.info("reflection_node: critiquing draft (%.80s…)", draft_text)
     try:
-        raw_reflection = await _acall_plain(
+        raw_reflection, raw_response = await _acall_plain(
             build_reflection_prompt(question, draft_text, tool_context=tool_context),
             config=config,
         )
+        # Record reflection token usage
+        tracker: UsageTracker | None = _usage_tracker_var.get(None)
+        if tracker is not None:
+            tracker.record(raw_response)
     except asyncio.TimeoutError:
         logger.warning("reflection_node timed out — keeping draft.")
         return {"reflection_status": "pass"}
@@ -737,16 +751,18 @@ def _get_compiled_graph(checkpointer: Any = None) -> Any:
 
 
 @contextmanager
-def _request_tool_context(all_tools: tuple[BaseTool, ...]):
+def _request_tool_context(all_tools: tuple[BaseTool, ...], tracker: UsageTracker | None = None):
     """Bind tools + LLM for one invoke without storing them on the graph."""
     bound_llm = get_llm().bind_tools(list(all_tools), parallel_tool_calls=False)
     t_tools = _tools_var.set(all_tools)
     t_llm = _bound_llm_var.set(bound_llm)
+    t_tracker = _usage_tracker_var.set(tracker)
     try:
         yield
     finally:
         _bound_llm_var.reset(t_llm)
         _tools_var.reset(t_tools)
+        _usage_tracker_var.reset(t_tracker)
 
 
 def _prepare_run(
@@ -754,34 +770,56 @@ def _prepare_run(
     session_id: str,
     checkpointer: Any,
     history: list[BaseMessage] | None,
-) -> tuple[Any, dict[str, Any], dict[str, Any]]:
-    """Build initial state and config. Caller must enter _request_tool_context."""
+) -> tuple[Any, dict[str, Any], dict[str, Any], "UsageTracker"]:
+    """Build the initial graph state, run config, and usage tracker for one request.
+
+    This helper is the single place where per-request state is constructed.
+    The caller is responsible for entering ``_request_tool_context`` before
+    invoking the graph.
+
+    Args:
+        question:     The user's question text.
+        session_id:   LangGraph thread_id — used by the checkpointer to
+                      persist and resume conversation history.
+        checkpointer: Active LangGraph checkpointer, or None for stateless mode.
+        history:      Prior messages to prepend when running without a checkpointer.
+
+    Returns:
+        (graph, initial_state, config, tracker) where:
+          - graph:         Compiled LangGraph StateGraph.
+          - initial_state: Dict matching AgentState TypedDict.
+          - config:        RunnableConfig with thread_id and system_prompt.
+          - tracker:       Fresh UsageTracker to accumulate token counts.
+    """
     graph = _get_compiled_graph(checkpointer)
+    tracker = UsageTracker()
 
     if checkpointer is not None:
         initial_state: dict[str, Any] = {
-            "messages": [HumanMessage(content=question)],
-            "plan": [],
+            "messages":          [HumanMessage(content=question)],
+            "plan":              [],
             "reflection_status": "",
-            "is_complex": False,
+            "is_complex":        False,
+            "prompt_version":    PROMPT_VERSION,
         }
     else:
         prior_messages = list(history or [])
         initial_state = {
-            "messages": prior_messages + [HumanMessage(content=question)],
-            "plan": [],
+            "messages":          prior_messages + [HumanMessage(content=question)],
+            "plan":              [],
             "reflection_status": "",
-            "is_complex": False,
+            "is_complex":        False,
+            "prompt_version":    PROMPT_VERSION,
         }
 
     config: dict[str, Any] = {
         "configurable": {
-            "thread_id": session_id,
+            "thread_id":    session_id,
             "system_prompt": build_system_prompt(),
         },
         "recursion_limit": AGENT_RECURSION_LIMIT,
     }
-    return graph, initial_state, config
+    return graph, initial_state, config, tracker
 
 
 def build_graph(_dynamic_tools: list | None = None, checkpointer: Any = None) -> Any:
@@ -806,10 +844,10 @@ async def aask(
     """Primary async entry point — called by the FastAPI /ask endpoint."""
     async with mcp_server_context() as mcp_tools:
         all_tools = tuple(LOCAL_TOOLS) + tuple(mcp_tools)
-        graph, initial_state, config = _prepare_run(
+        graph, initial_state, config, tracker = _prepare_run(
             question, session_id, checkpointer, history
         )
-        with _request_tool_context(all_tools):
+        with _request_tool_context(all_tools, tracker):
             try:
                 result = await graph.ainvoke(initial_state, config=config)
             except asyncio.TimeoutError:
@@ -819,13 +857,18 @@ async def aask(
                     "Try a simpler question."
                 )
             except GraphRecursionError:
-                logger.error(
-                    "Agent hit recursion_limit=%s", AGENT_RECURSION_LIMIT
-                )
+                logger.error("Agent hit recursion_limit=%s", AGENT_RECURSION_LIMIT)
                 return _error_payload(
                     "Stopped after too many steps. Try a more specific question."
                 )
-            return parse_result(result)
+
+            metrics = tracker.to_metrics()
+            metrics.log_summary(session_id)
+
+            parsed = parse_result(result)
+            parsed["usage"]          = metrics.as_dict()
+            parsed["prompt_version"] = PROMPT_VERSION
+            return parsed
 
 
 def ask(
@@ -874,7 +917,7 @@ class KnowledgeTransferAgent:
         question: str,
         session_id: str = "default",
         history: list[BaseMessage] | None = None,
-    ) -> AsyncIterator[dict[str, Any]]:
+    ) -> AsyncGenerator[dict[str, Any], None]:
         """Yield SSE-ready events while the graph runs.
 
         Event types:
@@ -883,6 +926,7 @@ class KnowledgeTransferAgent:
           - token:      {"type": "token",      "text": "..."}
           - tool:       {"type": "tool",       "name": "..."}
           - reflection: {"type": "reflection", "status": "pass"|"improved"}
+          - usage:      {"type": "usage",      "payload": {"total_tokens": ..., "cost_usd": ...}}
           - done:       {"type": "done",       "payload": {...}}
           - error:      {"type": "error",      "detail": "..."}
         """
@@ -890,7 +934,7 @@ class KnowledgeTransferAgent:
 
         async with mcp_server_context() as mcp_tools:
             all_tools = tuple(LOCAL_TOOLS) + tuple(mcp_tools)
-            graph, initial_state, config = _prepare_run(
+            graph, initial_state, config, tracker = _prepare_run(
                 question, session_id, self.checkpointer, history
             )
 
@@ -900,7 +944,7 @@ class KnowledgeTransferAgent:
             reflection_emitted: bool = False
 
             try:
-                with _request_tool_context(all_tools):
+                with _request_tool_context(all_tools, tracker):
                     async for mode, data in graph.astream(
                         initial_state,
                         config=config,
@@ -967,9 +1011,23 @@ class KnowledgeTransferAgent:
                 if ref_status and not reflection_emitted:
                     yield {"type": "reflection", "status": ref_status}
 
+                # Build usage metrics and attach to the done payload
+                metrics = tracker.to_metrics()
+                metrics.log_summary(session_id)
+
+                # Emit dedicated usage event for streaming API consumers
+                yield {
+                    "type": "usage",
+                    "payload": metrics.as_dict(),
+                }
+
+                parsed = parse_result(final_values)
+                parsed["usage"]          = metrics.as_dict()
+                parsed["prompt_version"] = PROMPT_VERSION
+
                 yield {
                     "type": "done",
-                    "payload": serialize_parse_result(parse_result(final_values)),
+                    "payload": serialize_parse_result(parsed),
                 }
 
             except asyncio.TimeoutError:

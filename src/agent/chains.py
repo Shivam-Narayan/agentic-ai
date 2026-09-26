@@ -1,5 +1,6 @@
 """LangChain layer: LLM instance and web search tool with fallback chain."""
 
+import asyncio
 import logging
 import os
 from functools import lru_cache
@@ -13,8 +14,13 @@ from src.core.config import require_runtime_keys
 logger = logging.getLogger(__name__)
 
 
-def _make_serper_tool():
-    """Build a Serper (Google) search tool. Returns None if unavailable."""
+def _make_serper_tool() -> BaseTool | None:
+    """Build a Serper (Google Search) tool.
+
+    Returns:
+        GoogleSerperRun instance, or None if the package is unavailable
+        or initialisation fails.
+    """
     try:
         from langchain_community.utilities import GoogleSerperAPIWrapper
         from langchain_community.tools import GoogleSerperRun
@@ -25,18 +31,29 @@ def _make_serper_tool():
         return None
 
 
-def _make_ddg_tool():
-    """Build a DuckDuckGo search tool. Always available — no key needed."""
+def _make_ddg_tool() -> BaseTool:
+    """Build a DuckDuckGo search tool.
+
+    Always available — no API key required.
+
+    Returns:
+        DuckDuckGoSearchRun instance.
+    """
     from langchain_community.tools import DuckDuckGoSearchRun
     logger.info("Web search: using DuckDuckGo (no key required)")
     return DuckDuckGoSearchRun()
 
 
 class _FallbackSearchTool(BaseTool):
-    """Wraps Tavily and falls back to Serper → DuckDuckGo on quota/runtime errors.
+    """Web search tool with automatic provider cascade.
 
-    This is needed because Tavily initialises fine even when the monthly quota is
-    exhausted — the error only surfaces on the actual search call.
+    Wraps a primary search provider and falls back to one or more
+    alternatives when the primary raises an exception or returns an
+    error payload (e.g. Tavily quota exhaustion returns {"error": ...}
+    rather than raising, so we handle that explicitly).
+
+    Cascade order (first available wins as primary):
+        Tavily → Serper → DuckDuckGo
     """
 
     name: str = "web_search"
@@ -44,8 +61,8 @@ class _FallbackSearchTool(BaseTool):
         "Search the live web for current information, news, prices, and real-time data. "
         "Input should be a search query string."
     )
-    # Tools stored as Any to avoid Pydantic field issues with arbitrary objects
-    _primary: Any = None
+    # Stored as Any to avoid Pydantic field issues with arbitrary tool objects.
+    _primary:   Any  = None
     _fallbacks: list = []
 
     def __init__(self, primary, fallbacks: list):
@@ -72,9 +89,10 @@ class _FallbackSearchTool(BaseTool):
         raise RuntimeError(f"All web search providers failed. Last error: {last_exc}")
 
     async def _arun(self, query: str) -> str:
-        # Run sync version in the default executor — all three providers are sync-only
-        import asyncio
-        loop = asyncio.get_event_loop()
+        # Run the sync _run() in the default thread-pool executor so the
+        # event loop is never blocked. Uses get_running_loop() which is
+        # correct for Python 3.10+ (get_event_loop() is deprecated there).
+        loop = asyncio.get_running_loop()
         return await loop.run_in_executor(None, self._run, query)
 
 
