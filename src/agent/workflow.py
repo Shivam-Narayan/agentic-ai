@@ -255,17 +255,6 @@ def _get_previous_tool_calls(messages: list[BaseMessage]) -> set[str]:
     return used
 
 
-def _first_search_had_results(messages: list[BaseMessage]) -> bool:
-    """True if search_company_documents already returned a non-empty hit."""
-    for msg in messages:
-        if msg.type != "tool" or msg.name != "search_company_documents":
-            continue
-        text = str(msg.content or "").strip()
-        if text and text != EMPTY_COMPANY_SEARCH_RESULT:
-            return True
-    return False
-
-
 def _is_redundant_tool_call(
     name: str,
     args: dict[str, Any],
@@ -273,11 +262,7 @@ def _is_redundant_tool_call(
 ) -> bool:
     """True if this call should be skipped and answered from prior results."""
     key = _make_tool_call_key(name, args)
-    if key in _get_previous_tool_calls(turn_messages):
-        return True
-    return name == "search_company_documents" and _first_search_had_results(
-        turn_messages
-    )
+    return key in _get_previous_tool_calls(turn_messages)
 
 
 def _synthetic_tool_message(name: str, tool_call_id: str, content: str) -> ToolMessage:
@@ -857,9 +842,6 @@ async def aask(
     history: list[BaseMessage] | None = None,
 ) -> dict[str, Any]:
     """Primary async entry point — called by the FastAPI /ask endpoint."""
-    import time
-    start_ms = int(time.monotonic() * 1000)
-
     async with mcp_server_context() as mcp_tools:
         all_tools = tuple(LOCAL_TOOLS) + tuple(mcp_tools)
         graph, initial_state, config, tracker = _prepare_run(
@@ -880,8 +862,7 @@ async def aask(
                     "Stopped after too many steps. Try a more specific question."
                 )
 
-            latency_ms = int(time.monotonic() * 1000) - start_ms
-            metrics = tracker.to_metrics(latency_ms=latency_ms)
+            metrics = tracker.to_metrics()
             metrics.log_summary(session_id)
 
             parsed = parse_result(result)
@@ -950,8 +931,6 @@ class KnowledgeTransferAgent:
           - error:      {"type": "error",      "detail": "..."}
         """
         yield {"type": "status", "stage": "thinking"}
-
-        start_ms = int(time.monotonic() * 1000)
 
         async with mcp_server_context() as mcp_tools:
             all_tools = tuple(LOCAL_TOOLS) + tuple(mcp_tools)
@@ -1033,8 +1012,7 @@ class KnowledgeTransferAgent:
                     yield {"type": "reflection", "status": ref_status}
 
                 # Build usage metrics and attach to the done payload
-                latency_ms = int(time.monotonic() * 1000) - start_ms
-                metrics = tracker.to_metrics(latency_ms=latency_ms)
+                metrics = tracker.to_metrics()
                 metrics.log_summary(session_id)
 
                 # Emit dedicated usage event for streaming API consumers

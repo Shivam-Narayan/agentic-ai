@@ -65,7 +65,7 @@ def _cost_per_1k(model: str) -> dict[str, float]:
     # Substring match — handles versioned names like "gemini-1.5-flash-001"
     model_lower = model.lower()
     for key, prices in _COST_TABLE.items():
-        if key in model_lower or model_lower in key:
+        if key in model_lower:
             return prices
     logger.debug("Model '%s' not in cost table — using fallback price", model)
     return _FALLBACK_COST

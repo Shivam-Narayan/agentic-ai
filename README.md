@@ -164,7 +164,7 @@ USE_POSTGRES_MEMORY=true
 
 **4. Restart FastAPI:**
 ```bash
-uvicorn app:app --reload --port 8000
+uvicorn src.apps.api:app --reload --port 8000
 ```
 
 **5. Verify:**
