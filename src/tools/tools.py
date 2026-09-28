@@ -1,8 +1,9 @@
 """LangChain tools for the KT Agent.
 
-Six local tools covering document search, web search, calculation, charting,
-document summarisation, and structured data extraction. Database tools live
-in mcp_tools.py.
+Eleven local tools covering document search, comparison, web search, web
+crawling, REST API calls, calculation, charting, document summarisation,
+structured data extraction, CSV analysis, and PDF report generation.
+Database tools live in mcp_tools.py.
 
 Quality improvements vs original:
   - Full type annotations on all functions and helpers
@@ -11,6 +12,10 @@ Quality improvements vs original:
   - summarise_document: configurable MAX_SUMMARY_CHARS constant (was hardcoded 6000)
   - generate_chart: validates chart_type and data before calling Plotly
   - _safe_eval: explicit return type annotation; ValueError message improved
+  - crawl_website: async aiohttp + BeautifulSoup with sandboxed text extraction
+  - compare_documents: stdlib difflib unified diff between two company documents
+  - generate_pdf_report: reportlab PDF renderer saving to data/reports/
+  - query_api: SSRF-hardened aiohttp GET/POST caller for external REST APIs
   - Unused imports removed (base64, io)
 """
 
@@ -21,6 +26,8 @@ import operator
 from pathlib import Path
 import asyncio
 from typing import Any
+import aiohttp
+from bs4 import BeautifulSoup
 
 from langchain_core.documents import Document
 from langchain_core.tools import tool
@@ -48,6 +55,30 @@ MAX_SUMMARY_CHARS: int = 8_000
 # Maximum characters per chunk in extract_structured_data.
 # Kept consistent with MAX_CHUNK_CHARS to avoid sending more context than search.
 MAX_EXTRACT_CHARS: int = 700
+
+# Maximum characters extracted from a crawled web page.
+# Keeps the LLM context within safe bounds for most models (128k+ at 10k chars).
+MAX_CRAWL_CHARS: int = 10_000
+
+# Maximum characters returned from a REST API response.
+MAX_API_RESPONSE_CHARS: int = 5_000
+
+# Maximum characters of diff output returned by compare_documents.
+MAX_DIFF_CHARS: int = 6_000
+
+# Blocked private/loopback CIDR prefixes — prevents SSRF in query_api.
+_SSRF_BLOCKED_PREFIXES: tuple[str, ...] = (
+    "127.", "0.", "10.", "172.16.", "172.17.", "172.18.", "172.19.",
+    "172.20.", "172.21.", "172.22.", "172.23.", "172.24.", "172.25.",
+    "172.26.", "172.27.", "172.28.", "172.29.", "172.30.", "172.31.",
+    "192.168.", "169.254.", "::1", "fc", "fd",
+)
+
+# Reports output subdirectory (created on first use).
+_REPORTS_SUBDIR: str = "reports"
+
+# Allowed HTTP methods for query_api.
+_ALLOWED_HTTP_METHODS: frozenset[str] = frozenset({"GET", "POST"})
 
 # Allowed chart types for generate_chart input validation.
 _VALID_CHART_TYPES: frozenset[str] = frozenset({"bar", "line", "pie", "scatter"})
@@ -160,7 +191,11 @@ async def search_web(query: str) -> str:
     """
     logger.info("Tool search_web: %s", query)
 
-    from src.agent.chains import get_web_search_tool  # lazy — avoids circular import
+    # Lazy import to break the tools → chains → tools circular dependency.
+    # get_web_search_tool() is only resolved at call-time, not module-load-time.
+    # Long-term fix: extract the web-search provider into a shared src/providers/
+    # module so neither chains.py nor tools.py need to import each other.
+    from src.agent.chains import get_web_search_tool  # noqa: PLC0415
 
     # _FallbackSearchTool handles all provider response formats internally.
     # It cascades Tavily → Serper → DuckDuckGo and always returns a string.
@@ -676,3 +711,290 @@ result = trend.to_json(orient='records')
     except Exception as exc:
         logger.exception("Error executing generated Pandas code in analyse_csv.")
         return f"Error executing data analysis: {exc}"
+
+
+# ---------------------------------------------------------------------------
+# 8. crawl_website
+# ---------------------------------------------------------------------------
+
+@tool
+async def crawl_website(url: str) -> str:
+    """Crawl a specific website URL and extract its main text content.
+    
+    Use this tool when you have a specific URL and need to read the actual 
+    content of that page. It strips away HTML, ads, and navigation to 
+    give you just the readable text.
+    
+    Args:
+        url: The full URL of the website to crawl (e.g., 'https://example.com/article').
+    """
+    logger.info("Tool crawl_website: %s", url)
+    
+    headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
+    try:
+        async with aiohttp.ClientSession(headers=headers) as session:
+            async with session.get(url, timeout=10) as response:
+                if response.status != 200:
+                    return f"Error: Failed to fetch {url}. Status code: {response.status}"
+                
+                html_content = await response.text()
+                
+        soup = BeautifulSoup(html_content, "lxml")
+        
+        for script_or_style in soup(["script", "style", "header", "footer", "nav"]):
+            script_or_style.decompose()
+            
+        text = soup.get_text(separator=' ')
+        lines = (line.strip() for line in text.splitlines())
+        chunks = (phrase.strip() for line in lines for phrase in line.split("  "))
+        text = '\n'.join(chunk for chunk in chunks if chunk)
+        
+        if len(text) > MAX_CRAWL_CHARS:
+            return text[:MAX_CRAWL_CHARS] + f"\n\n[... content truncated at {MAX_CRAWL_CHARS:,} characters ...]"
+            
+        return text
+        
+    except Exception as exc:
+        logger.exception("crawl_website failed for %s", url)
+        return f"Error crawling '{url}': {exc}"
+
+
+# ---------------------------------------------------------------------------
+# 9. compare_documents
+# ---------------------------------------------------------------------------
+
+@tool
+async def compare_documents(filename_a: str, filename_b: str) -> str:
+    """Compare two company documents and return a structured diff of their contents.
+
+    Use this when the user asks how two documents differ, what changed between
+    versions, or wants a side-by-side comparison of two files.
+
+    Args:
+        filename_a: First document filename (e.g. 'policy_v1.pdf').
+        filename_b: Second document filename to compare against (e.g. 'policy_v2.pdf').
+    """
+    import difflib
+
+    logger.info("Tool compare_documents: %s vs %s", filename_a, filename_b)
+
+    async def _load_text(filename: str) -> str | None:
+        """Load and extract text from a file in DATA_DIR."""
+        candidate = DATA_DIR / filename
+        if not candidate.exists():
+            matches = [p for p in DATA_DIR.iterdir() if p.name.lower() == filename.lower()]
+            if not matches:
+                return None
+            candidate = matches[0]
+        try:
+            from llama_index.core import SimpleDirectoryReader
+            docs = await asyncio.to_thread(
+                lambda: SimpleDirectoryReader(input_files=[str(candidate)]).load_data()
+            )
+            return "\n".join(d.text for d in docs)
+        except Exception as exc:
+            logger.warning("compare_documents: could not load %s: %s", filename, exc)
+            return None
+
+    text_a, text_b = await asyncio.gather(_load_text(filename_a), _load_text(filename_b))
+
+    if text_a is None:
+        return f"Error: File '{filename_a}' not found in the data directory."
+    if text_b is None:
+        return f"Error: File '{filename_b}' not found in the data directory."
+
+    lines_a = text_a.splitlines(keepends=True)
+    lines_b = text_b.splitlines(keepends=True)
+
+    diff = list(difflib.unified_diff(
+        lines_a, lines_b,
+        fromfile=filename_a,
+        tofile=filename_b,
+        lineterm="",
+    ))
+
+    if not diff:
+        return f"No differences found between '{filename_a}' and '{filename_b}'."
+
+    diff_text = "\n".join(diff)
+    if len(diff_text) > MAX_DIFF_CHARS:
+        diff_text = (
+            diff_text[:MAX_DIFF_CHARS]
+            + f"\n\n[... diff truncated at {MAX_DIFF_CHARS:,} characters ...]"
+        )
+
+    total_added   = sum(1 for line in diff if line.startswith("+") and not line.startswith("+++"))
+    total_removed = sum(1 for line in diff if line.startswith("-") and not line.startswith("---"))
+
+    return (
+        f"Comparison: {filename_a}  →  {filename_b}\n"
+        f"Lines added: {total_added} | Lines removed: {total_removed}\n\n"
+        f"{diff_text}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# 10. generate_pdf_report
+# ---------------------------------------------------------------------------
+
+@tool
+async def generate_pdf_report(content: str, title: str, output_filename: str) -> str:
+    """Generate a formatted PDF report from text content and save it to disk.
+
+    Use this when the user asks to export, save, or download an analysis as
+    a PDF document. The file is saved to the data/reports/ directory.
+
+    Args:
+        content:         The report body text (markdown-style bullets and newlines work).
+        title:           The report title shown at the top of the PDF.
+        output_filename: Desired filename without extension (e.g. 'q3_analysis').
+    """
+    logger.info("Tool generate_pdf_report: title=%s file=%s", title, output_filename)
+
+    # Sanitize filename — alphanumerics, hyphens, underscores only
+    import re as _re
+    safe_name = _re.sub(r"[^\w\-]", "_", output_filename.strip()) or "report"
+    if not safe_name.endswith(".pdf"):
+        safe_name += ".pdf"
+
+    reports_dir = DATA_DIR / _REPORTS_SUBDIR
+
+    def _render() -> str:
+        """Blocking reportlab render — run in a thread to keep the event loop free."""
+        try:
+            from reportlab.lib.pagesizes import A4
+            from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+            from reportlab.lib.units import cm
+            from reportlab.lib import colors
+            from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, HRFlowable
+            from reportlab.lib.enums import TA_LEFT
+        except ImportError:
+            return "Error: reportlab is not installed. Run: pip install reportlab"
+
+        reports_dir.mkdir(parents=True, exist_ok=True)
+        output_path = reports_dir / safe_name
+
+        doc = SimpleDocTemplate(
+            str(output_path),
+            pagesize=A4,
+            rightMargin=2 * cm,
+            leftMargin=2 * cm,
+            topMargin=2.5 * cm,
+            bottomMargin=2 * cm,
+        )
+
+        styles = getSampleStyleSheet()
+        title_style = ParagraphStyle(
+            "ReportTitle",
+            parent=styles["Title"],
+            fontSize=18,
+            textColor=colors.HexColor("#1a1a2e"),
+            spaceAfter=6,
+        )
+        body_style = ParagraphStyle(
+            "ReportBody",
+            parent=styles["Normal"],
+            fontSize=11,
+            leading=16,
+            textColor=colors.HexColor("#2c2c2c"),
+            spaceAfter=4,
+        )
+
+        story = [
+            Paragraph(title.strip(), title_style),
+            HRFlowable(width="100%", thickness=1, color=colors.HexColor("#4a90d9")),
+            Spacer(1, 0.4 * cm),
+        ]
+
+        for line in content.splitlines():
+            line = line.strip()
+            if not line:
+                story.append(Spacer(1, 0.2 * cm))
+                continue
+            # Simple bullet detection
+            if line.startswith(("- ", "* ", "• ")):
+                line = "&bull;&nbsp;" + line[2:]
+            story.append(Paragraph(line, body_style))
+
+        doc.build(story)
+        return str(output_path)
+
+    try:
+        saved_path = await asyncio.to_thread(_render)
+        if saved_path.startswith("Error"):
+            return saved_path
+        return f"PDF report saved successfully -> {saved_path}"
+    except Exception as exc:
+        logger.exception("generate_pdf_report failed")
+        return f"Error generating PDF report: {exc}"
+
+
+# ---------------------------------------------------------------------------
+# 11. query_api
+# ---------------------------------------------------------------------------
+
+@tool
+async def query_api(url: str, method: str = "GET", params_json: str = "{}") -> str:
+    """Call an external REST API and return the response as formatted text.
+
+    Use this when the user asks for live data from a public API endpoint —
+    e.g. currency rates, weather, stock prices, or any external service.
+    Internal/private network addresses are blocked for security.
+
+    Args:
+        url:         The full API endpoint URL (e.g. 'https://api.exchangerate.host/latest').
+        method:      HTTP method — 'GET' (default) or 'POST'.
+        params_json: Optional JSON string of query params or POST body
+                     (e.g. '{"base": "USD", "symbols": "INR"}').
+    """
+    logger.info("Tool query_api: %s %s", method, url)
+
+    method = method.upper().strip()
+    if method not in _ALLOWED_HTTP_METHODS:
+        return f"Error: method '{method}' is not allowed. Use GET or POST."
+
+    # SSRF guard — block requests to private/loopback address ranges
+    from urllib.parse import urlparse
+    parsed_host = urlparse(url).hostname or ""
+    if any(parsed_host.startswith(prefix) for prefix in _SSRF_BLOCKED_PREFIXES):
+        return f"Error: requests to private network address '{parsed_host}' are blocked."
+
+    try:
+        params: dict[str, Any] = json.loads(params_json) if params_json.strip() else {}
+    except json.JSONDecodeError as exc:
+        return f"Error: could not parse params_json — {exc}"
+
+    headers = {"User-Agent": "DataDialogue-Agent/1.0", "Accept": "application/json"}
+
+    try:
+        async with aiohttp.ClientSession(headers=headers) as session:
+            if method == "GET":
+                async with session.get(url, params=params, timeout=15) as resp:
+                    status = resp.status
+                    raw = await resp.text()
+            else:  # POST
+                async with session.post(url, json=params, timeout=15) as resp:
+                    status = resp.status
+                    raw = await resp.text()
+
+        if status >= 400:
+            return f"Error: API returned HTTP {status}. Response: {raw[:500]}"
+
+        # Pretty-print JSON if possible; fall back to raw text
+        try:
+            parsed = json.loads(raw)
+            formatted = json.dumps(parsed, indent=2, ensure_ascii=False)
+        except json.JSONDecodeError:
+            formatted = raw
+
+        if len(formatted) > MAX_API_RESPONSE_CHARS:
+            formatted = (
+                formatted[:MAX_API_RESPONSE_CHARS]
+                + f"\n\n[... response truncated at {MAX_API_RESPONSE_CHARS:,} characters ...]"
+            )
+
+        return f"[API Response — {method} {url} — HTTP {status}]\n\n{formatted}"
+
+    except Exception as exc:
+        logger.exception("query_api failed for %s", url)
+        return f"Error calling API '{url}': {exc}"
