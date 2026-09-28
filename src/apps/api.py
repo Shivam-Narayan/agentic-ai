@@ -11,8 +11,10 @@ import asyncio
 import json
 import logging
 import os
+import time
 import uvicorn
 from contextlib import asynccontextmanager
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -90,6 +92,9 @@ _MEMORY_DIR.mkdir(exist_ok=True)
 
 # Filled in by the lifespan handler — shared across all requests
 _checkpointer = None
+
+# Process start time — used to compute uptime in /health/ready
+_startup_time: float = time.monotonic()
 
 
 @asynccontextmanager
@@ -176,25 +181,82 @@ app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 # ---------------------------------------------------------------------------
 
 @app.get("/", tags=["system"])
-async def root(request: Request) -> dict[str, str]:
-    """Root endpoint — confirms the API is running."""
+async def root(request: Request) -> dict[str, Any]:
+    """Root endpoint — returns API identity and navigation links."""
     base = str(request.base_url).rstrip("/")
     return {
-        "status":  "running",
-        "message": "KT Knowledge Transfer Assistant API is running successfully! 🚀",
-        "docs":    f"{base}/docs",
-        "health":  f"{base}/health",
+        "name":        "DataDialogue API",
+        "version":     app.version,
+        "status":      "running",
+        "environment": os.getenv("APP_ENV", "development"),
+        "docs":        f"{base}/docs",
+        "health":      f"{base}/health",
     }
 
 
 @app.get("/health", tags=["system"])
-async def health() -> dict[str, Any]:
-    """Liveness check — reports active backend."""
-    return {
-        "status":         "ok",
-        "memory_backend": "postgres" if USE_POSTGRES_MEMORY else "sqlite",
-        "vector_backend": "pgvector" if USE_PGVECTOR else "json",
+async def health() -> JSONResponse:
+    """Health check — verifies all critical dependencies are reachable.
+
+    Returns 200 with status 'ok' when the database, vector store, and
+    LLM are all healthy. Returns 503 with status 'degraded' if any
+    dependency fails, so load balancers stop routing traffic.
+    """
+    checks: dict[str, str] = {}
+    overall_ok = True
+
+    # --- 1. Memory backend (SQLite or Postgres) ---
+    try:
+        if _checkpointer is not None:
+            checks["memory_backend"] = "ok"
+        else:
+            checks["memory_backend"] = "not_initialized"
+            overall_ok = False
+    except Exception as exc:
+        checks["memory_backend"] = f"error: {exc}"
+        overall_ok = False
+
+    # --- 2. Vector store (index file / pgvector) ---
+    try:
+        from src.retrieval.rag import get_embed_model
+        model = get_embed_model()
+        if model is not None:
+            checks["vector_store"] = "ok"
+        else:
+            checks["vector_store"] = "not_loaded"
+            overall_ok = False
+    except Exception as exc:
+        checks["vector_store"] = f"error: {exc}"
+        overall_ok = False
+
+    # --- 3. LLM reachability (import check — avoids billing a real token) ---
+    try:
+        from src.agent.chains import get_llm
+        llm = get_llm()
+        if llm is not None:
+            checks["llm"] = "ok"
+        else:
+            checks["llm"] = "not_configured"
+            overall_ok = False
+    except Exception as exc:
+        checks["llm"] = f"error: {exc}"
+        overall_ok = False
+
+    uptime_seconds = round(time.monotonic() - _startup_time)
+
+    payload: dict[str, Any] = {
+        "status":          "ok" if overall_ok else "degraded",
+        "timestamp":       datetime.now(timezone.utc).isoformat(),
+        "uptime_seconds":  uptime_seconds,
+        "version":         app.version,
+        "environment":     os.getenv("APP_ENV", "development"),
+        "memory_backend":  "postgres" if USE_POSTGRES_MEMORY else "sqlite",
+        "vector_backend":  "pgvector" if USE_PGVECTOR else "json",
+        "checks":          checks,
     }
+
+    status_code = 200 if overall_ok else 503
+    return JSONResponse(content=payload, status_code=status_code)
 
 
 @app.get("/stream", tags=["agent"])

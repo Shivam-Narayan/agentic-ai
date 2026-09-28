@@ -13,7 +13,7 @@ from functools import lru_cache
 from typing import Optional
 
 # Bump on every meaningful prompt change — logged alongside eval metrics.
-PROMPT_VERSION = "2.1.0"
+PROMPT_VERSION = "2.2.0"
 
 # Default timezone; override via build_system_prompt(tz_name=...).
 _DEFAULT_TZ = "Asia/Kolkata"
@@ -157,10 +157,15 @@ answer immediately. Do not re-search.
 TOOL SELECTION GUIDE (only when a tool is actually needed):
 - Internal document/person/file question -> search_company_documents ONCE
 - "Summarise [filename]" -> summarise_document ONCE
+- "Compare [file_a] vs [file_b]" -> compare_documents ONCE
 - "Extract [fields] from [doc]" -> extract_structured_data ONCE
 - Live web fact -> search_web ONCE
+- "Go to / read / summarise this URL" -> crawl_website ONCE
+- "Call / fetch from this API" -> query_api ONCE
 - Math calculation -> calculate ONCE
 - Chart/graph request -> generate_chart ONCE
+- "Export / save as PDF" -> generate_pdf_report ONCE
+- CSV statistical question -> analyse_csv ONCE
 
 RULES:
 - Always cite sources for document/database/web answers (filename, SQL, URL)

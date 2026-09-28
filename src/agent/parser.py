@@ -11,9 +11,13 @@ _TOOL_DATASOURCE = {
     "search_company_documents": "company_docs",
     "summarise_document":        "company_docs",
     "extract_structured_data":   "company_docs",
+    "compare_documents":         "company_docs",
     "search_web":                "web_search",
+    "crawl_website":             "web_search",
+    "query_api":                 "web_search",
     "calculate":                 "calculation",
     "generate_chart":            "chart",
+    "generate_pdf_report":       "export",
     # MCP database tools — support both naming conventions (hyphen and underscore)
     "query_company_database":    "database",
     "query-database":            "database",

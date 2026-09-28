@@ -241,3 +241,4 @@ psycopg[binary,pool]==3.3.4
 llama-index-vector-stores-postgres==0.8.1
 langgraph-checkpoint-postgres==3.1.2
 pgvector==0.3.6
+reportlab==5.0.1

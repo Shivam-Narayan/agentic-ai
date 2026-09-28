@@ -78,8 +78,12 @@ from src.tools.tools import (
     EMPTY_COMPANY_SEARCH_RESULT,
     analyse_csv,
     calculate,
+    compare_documents,
+    crawl_website,
     extract_structured_data,
     generate_chart,
+    generate_pdf_report,
+    query_api,
     search_company_documents,
     search_web,
     summarise_document,
@@ -138,10 +142,14 @@ _MAX_REFLECTION_TOOL_CONTEXT: int = 1500
 LOCAL_TOOLS: tuple[BaseTool, ...] = (
     search_company_documents,
     search_web,
+    crawl_website,
     summarise_document,
+    compare_documents,
     extract_structured_data,
     calculate,
     generate_chart,
+    generate_pdf_report,
+    query_api,
     analyse_csv,
 )
 
